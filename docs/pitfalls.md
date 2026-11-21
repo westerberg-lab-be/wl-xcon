@@ -29,6 +29,7 @@ the moment it becomes someone's active job. Review this file at every milestone 
 | **P22** | **A browser page that can write is a page any site can try to make write** | **High** | Spec §2's four checks on every write, the `Host` check on every request, the rig's own validation behind them — see expanded note |
 | **P23** | **A coordinate read as a distance** | Medium | The angles the engine measures between positions are true visual angle, measured where they are, and what is still per axis is named (STE-27); a mean pixels per degree is used by no drawing, window or check by name — see expanded note |
 | **P24** | **A condition true as a state begins, read as an edge** | Medium | A guard derived from a signal judged in every state says what holds as its state begins, not only what changed on its frame; a test setup that steers round a behavior asks whether it is meant — see expanded note |
+| **P30** | **The last message of a lossy stream, thrown away at the close** | Medium | "Latest wins, the next frame supersedes it" is true of every frame but the last, so the close of a stream says what becomes of what is still queued: `ZmqLink.close` closes its PUB with a bounded linger (`PUBLISH_LINGER_S`), not `linger=0`, so the frame that says how a session ended reaches the console; and a test helper that holds a socket open (a grace) is asked which paths it does not cover -- see expanded note |
 
 ## Expanded notes
 
@@ -392,3 +393,31 @@ point until it was drawn, "since a pointer already on the point as it appears ne
 window" -- the defect written down in a harness as a fact about the world, and steered round.
 Mitigation: `Entered` fires on a state's first judged frame on being inside (EYE-30), and a test
 whose setup avoids a behavior says why, so a reader can ask whether the behavior is meant.
+
+**P30 — The last message of a lossy stream, thrown away at the close.** Telemetry is lossy by
+design (S9a §9): `ZmqLink.publish` never blocks, and a frame lost costs nothing because the next
+boundary's supersedes it. The last frame a session publishes has no next: it is the one that says
+how the session ended. `wlx run` closes its link right after it, and the PUB socket was closed with
+`linger=0`, which discards whatever libzmq's I/O thread has not yet written to the connection
+("Pending messages shall be discarded immediately", zmq_setsockopt(3), `ZMQ_LINGER`, read
+2026-11-20). On a loaded runner, where that thread had not run in time, the console was left
+holding a frame of a session still running, for one that had ended on its out-of-cage limit or a
+scheduled stop: main's nightly CI failed so on four nights (2026-11-17 to 2026-11-20, run
+`44731148524` the last), in `wlx serve`'s end-to-end tests of the limit and of a clock-time stop,
+each saying "wlx run had ended, exit code 0" with `stop_kind` `None` on the console. Reproduced in
+six two-CPU Linux containers on one loaded development host: 7 of 960 runs of those tests (the
+limit 4 of 240, a fluid-total stop 2, a clock-time stop 1, a trial-count stop none), and none of
+1,920 with the fix below. **The pattern named the cause before any probe did**: a session stopped by a command just before its close never
+lost the frame, because XC-429's reply grace (`REPLY_GRACE_S`) held every socket open, the PUB too,
+for 100 ms after the last reply; only the endings no command precedes lost it. So the grace had
+been masking this in every operator-stop test, and the tests that could see it were the ones that
+flaked. Mitigation: `close` closes the PUB with a linger bounded by `PUBLISH_LINGER_S` (the
+finalizer keeps `linger=0`, since it may run in the cyclic collector), and
+`test_the_frames_published_just_before_close_reach_the_console` publishes a burst and closes at
+once, twenty rounds over: with the linger undone it failed in all 30 of its runs in those
+containers, by its 17th round at the latest, and with it passed 300 of 300. **What the
+linger does not do**, read in libzmq 4.3.5's `src/session_base.cpp`: it holds the connection until
+the socket's queue has been taken by the connection's engine, not until the engine has written it,
+so a console so far behind that the connection's buffers are full still loses the tail (a probe
+with the console's socket made to hold one message lost the last of 160 frames of 64 KB with a 10 s
+linger). A console that reads keeps up; the record, not the console, is the session's truth.

@@ -3699,6 +3699,34 @@ def _release(ctx, sockets) -> None:
 #: longer than this still loses the reply. Closing that is the console's side, XC-429.
 REPLY_GRACE_S = 0.1
 
+#: How long `ZmqLink.close` lets the frames its PUB socket has not yet sent go on to a
+#: console, at most (main's nightly CI, 2026-11-17 to 2026-11-20). **The last frame a
+#: session publishes is the one that says how it ended**, its `stop_kind` and
+#: `stopped_because`, and `wlx run` closes its link right after it. Closed with
+#: `linger=0`, the PUB threw away whatever libzmq's I/O thread had not yet written to the
+#: connection: "Pending messages shall be discarded immediately after a call to ...
+#: zmq_close()" (zmq_setsockopt(3), `ZMQ_LINGER`, libzmq.readthedocs.io, read
+#: 2026-11-20). So a console could be left showing a session still running that had
+#: ended on its out-of-cage limit, as two `wlx serve` end-to-end tests did on CI. Only a
+#: close with no reply in the last `REPLY_GRACE_S` lost it, since that grace held the PUB
+#: open too: a session that ends on a limit, a scheduled clock time or fluid total, never
+#: on a stop pressed just before.
+#:
+#: **A bound, not a wait**: "Positive values specify an upper bound for the linger period
+#: in milliseconds ... `zmq_ctx_term()` shall block until either all pending messages have
+#: been sent to a peer, or the linger period expires" (the same page), so a close with
+#: nothing queued, or with no console subscribed, returns as soon as it would have. It
+#: waits the whole bound only for a console connected and not reading, which then misses
+#: the frame, as it would have; and a console so far behind that the connection's
+#: buffers are full can still lose the tail, since libzmq holds the connection until its
+#: queue is taken, not written (`docs/pitfalls.md` P30). A whole second is chosen as a
+#: bound, not from a measurement of a rig: in six two-CPU Linux containers on one loaded development host
+#: (2026-11-20), the end-to-end tests that lost the frame lost it in 7 of 960 runs at
+#: `linger=0` and in none of 1,920 with this bound (counts, not a measurement of this system's
+#: timing). Only `close` lingers: the finalizer keeps `linger=0`, since it may run inside
+#: the cyclic collector (`_release`).
+PUBLISH_LINGER_S = 1.0
+
 
 class ZmqLink:
     """The `taskd` side of the console link, live on a real socket (S9a §7:
@@ -3840,8 +3868,9 @@ class ZmqLink:
             self._pub = self._ctx.socket(zmq.PUB)
             self._sockets.append(self._pub)
             # LINGER=0 from creation, not only passed at close time: whenever this
-            # socket is closed -- by close(), or by the finalizer above -- it cannot
-            # block flushing a queued message, regardless of which path closed it.
+            # socket is closed by the finalizer above, it cannot block flushing a
+            # queued message. `close()` alone gives it a bounded linger, so the frames
+            # published before it still go out (`PUBLISH_LINGER_S`).
             self._pub.setsockopt(zmq.LINGER, 0)
             self._pub.bind(pub_endpoint)
             self.pub_endpoint = self._pub.getsockopt_string(zmq.LAST_ENDPOINT)
@@ -3933,7 +3962,10 @@ class ZmqLink:
         PUB drops rather than blocks, because latest-wins telemetry must never stall
         a frame"): sent with `zmq.DONTWAIT`, and a full send queue -- `zmq.Again` --
         is swallowed rather than raised. The next boundary's frame supersedes this
-        one regardless, so losing it costs nothing a working console would notice."""
+        one regardless, so losing it costs nothing a working console would notice.
+        **Except the last, which nothing supersedes**: it says how the session ended,
+        and `close` lets it go on to a console rather than discard it
+        (`PUBLISH_LINGER_S`)."""
         import zmq
 
         try:
@@ -4128,7 +4160,12 @@ class ZmqLink:
         nothing. An interruption during the wait still releases, in the `finally`, and
         leaves the finalizer armed, as below.
 
-        Runs `_release`: each socket is closed with `linger=0`, then
+        **Then it closes the PUB socket with a linger of `PUBLISH_LINGER_S`**, so the
+        frames it has published and not yet sent, the last of which says how the session
+        ended, still reach a console (main's nightly CI, 2026-11-20); the context's
+        termination waits for them, at most that long. Only on this path, as the grace.
+
+        Runs `_release`: each socket still open is closed with `linger=0`, then
         `Context.destroy(linger=0)` terminates the context. Then it detaches this
         link's finalizer, so the finalizer never runs `_release` again. A second call
         runs `_release` again, and that does nothing: it skips closed sockets, and
@@ -4210,7 +4247,18 @@ class ZmqLink:
                     # Clamped: on a clock stepped back, `left` could be anything.
                     time.sleep(min(left, REPLY_GRACE_S))
         finally:
-            _release(self._ctx, self._sockets)
+            try:
+                # **The frames already published go on first** (`PUBLISH_LINGER_S`): the
+                # last says how the session ended. Closed here with a linger, so the
+                # `destroy` in `_release` skips it and its `term` waits, at most that
+                # long, for the connection to take them (pitfall P30 has what that does
+                # not cover). `getattr`: a constructor that failed before its PUB
+                # existed closes through here too.
+                pub = getattr(self, "_pub", None)
+                if pub is not None and not pub.closed:
+                    pub.close(linger=round(PUBLISH_LINGER_S * 1000))
+            finally:
+                _release(self._ctx, self._sockets)
         self._finalizer.detach()
 
     def __enter__(self) -> "ZmqLink":

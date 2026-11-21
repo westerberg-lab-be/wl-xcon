@@ -2325,6 +2325,94 @@ def test_close_waits_only_after_a_recent_reply_and_never_past_the_grace(
     assert clock.slept == [
         pytest.approx(link_module.REPLY_GRACE_S) for _ in expected
     ], case
+
+
+#: How many times over `test_the_frames_published_just_before_close_reach_the_console`
+#: publishes and closes, and how many frames each time before the last: about 34 KB, a
+#: test frame being under 2 KB. Enough that libzmq's I/O thread has not sent them all
+#: when the close comes straight after (a scratchpad probe of this shape with
+#: `linger=0`, 2026-11-20, lost some in 52 of 60 rounds, and none of 40 with 4 frames),
+#: and well inside the connection's buffers (macOS's `net.inet.tcp.sendspace` is 128
+#: KiB), so the linger lets every frame go (none of 400 rounds lost in that probe).
+#: Counts, not a measurement of this system's timing.
+CLOSE_ROUNDS, CLOSE_BURST = 20, 20
+
+
+def test_the_frames_published_just_before_close_reach_the_console(zmq_cleanup, monkeypatch):
+    """**The last frame a session publishes is the one that says how it ended**, and
+    `wlx run` closes its link right after it. The PUB socket used to be closed with
+    `linger=0`, which discards what libzmq's I/O thread has not yet written to the
+    connection, so a console whose rig ended on the out-of-cage limit or a scheduled
+    clock time could be left showing a session still running (main's nightly CI,
+    2026-11-17 to 2026-11-20: two `wlx serve` end-to-end tests, "wlx run had ended, exit
+    code 0" with `stop_kind` `None` on the console). `close` now lets the PUB's frames
+    go on for up to `PUBLISH_LINGER_S`.
+
+    **Each round closes the link the moment its last frame is published**, as `wlx
+    run` does with nothing between, so the frames are still queued at the close however
+    fast the machine; and the console reads only after it, every frame, in order. The
+    bound is set long here: it is a bound on a wait, and this test is about what is
+    delivered, not how fast.
+
+    **What the linger does not do** (libzmq 4.3.5's `src/session_base.cpp`, read
+    2026-11-20): it holds the connection until every queued message has been taken
+    from the socket's pipe, not until it is written, so a console so far behind that
+    the connection's buffers are full still loses what had not been written by then.
+    This test keeps its frames well inside those buffers."""
+    import zmq
+
+    import wl_xcon.link as link_module
+
+    monkeypatch.setattr(link_module, "PUBLISH_LINGER_S", 10.0)
+    frame = _telemetry()
+    last = replace(frame, stop_kind="limit")
+    burst = [encode(replace(frame, trial_index=index + 1)) for index in range(CLOSE_BURST)]
+    for round_ in range(CLOSE_ROUNDS):
+        link = zmq_cleanup(
+            ZmqLink(pub_endpoint="tcp://127.0.0.1:0", rep_endpoint="tcp://127.0.0.1:0")
+        )
+        console = zmq_cleanup(
+            ZmqConsole(link.pub_endpoint, None, settle_s=0, receive_timeout_s=0.01)
+        )
+        try:
+            # A SUB hears only what is published after its subscription joins.
+            deadline = time.monotonic() + 10.0
+            while True:
+                link.publish(frame)
+                try:
+                    console.receive()
+                    break
+                except TimeoutError:
+                    assert time.monotonic() < deadline, "the console's subscription never joined"
+            # Encoded beforehand and sent back to back, so the I/O thread cannot keep
+            # up by sending each while the next is encoded; the last through `publish`.
+            for raw in burst:
+                link._pub.send(raw)
+            link.publish(last)
+            link.close()
+
+            console._sub.setsockopt(zmq.RCVTIMEO, 5000)
+            got = []
+            while True:
+                try:
+                    received = console.receive()
+                except TimeoutError:
+                    break
+                if received.trial_index or received.stop_kind:
+                    got.append((received.trial_index, received.stop_kind))
+                if received.stop_kind == "limit":
+                    break
+        finally:
+            link.close()
+            console.close()
+        assert got == [(index + 1, None) for index in range(CLOSE_BURST)] + [(0, "limit")], (
+            f"round {round_ + 1}: the link closed and the console got "
+            f"{len(got)} of the {CLOSE_BURST + 1} frames published just before, "
+            f"{'the last among them' if got and got[-1][1] else 'not the last'}"
+        )
+        assert link._ctx.closed, "close() left the link's context unterminated"
+
+
 #: Every wait a `Zmq*` constructor in `link.py` takes, as `(build, keyword, least)`,
 #: `least` being the shortest it takes in milliseconds (XC-046). `ZmqLink` takes none;
 #: `ZmqConsole`'s `settle_s` is a sleep, not a wait ZeroMQ is given, and `time.sleep`
