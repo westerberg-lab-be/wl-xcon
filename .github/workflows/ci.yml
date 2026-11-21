@@ -94,12 +94,12 @@ jobs:
       - name: Check out wl-preproc inside the workspace
         uses: actions/checkout@v7
         with:
-          repository: jakewesterberg/wl-preproc
+          repository: westerberg-lab-be/wl-preproc
           path: wl-preproc
       - name: Check out wl-xtasks's main inside the workspace
         uses: actions/checkout@v7
         with:
-          repository: jakewesterberg/wl-xtasks
+          repository: westerberg-lab-be/wl-xtasks
           ref: main
           path: wl-xtasks
       - name: Install wl-sync at wl-preproc's own pin
@@ -191,12 +191,12 @@ jobs:
       - name: Check out wl-preproc inside the workspace
         uses: actions/checkout@v7
         with:
-          repository: jakewesterberg/wl-preproc
+          repository: westerberg-lab-be/wl-preproc
           path: wl-preproc
       - name: Check out wl-xtasks's main inside the workspace
         uses: actions/checkout@v7
         with:
-          repository: jakewesterberg/wl-xtasks
+          repository: westerberg-lab-be/wl-xtasks
           ref: main
           path: wl-xtasks
       - name: Install wl-sync at wl-preproc's own pin
@@ -303,12 +303,12 @@ jobs:
       - name: Check out wl-preproc inside the workspace
         uses: actions/checkout@v7
         with:
-          repository: jakewesterberg/wl-preproc
+          repository: westerberg-lab-be/wl-preproc
           path: wl-preproc
       - name: Check out wl-xtasks's main inside the workspace
         uses: actions/checkout@v7
         with:
-          repository: jakewesterberg/wl-xtasks
+          repository: westerberg-lab-be/wl-xtasks
           ref: main
           path: wl-xtasks
       - name: Install wl-sync at wl-preproc's own pin

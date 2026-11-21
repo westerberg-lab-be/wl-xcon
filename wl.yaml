@@ -8,7 +8,7 @@ visibility: public
 # (PI); GitHub redirects the old URL, and the registry keeps the old slug as an
 # alias. The Python package followed as `wl_xcon` (was `wl_expcontroller`) once
 # branch p4d2b-b2a-controls had merged, closing XC-053; the `wlx` command stays.
-remote: https://github.com/jakewesterberg/wl-xcon.git
+remote: https://github.com/westerberg-lab-be/wl-xcon.git
 
 summary: >-
   The behavioural task controller: a Python, Linux-first replacement for NIMH
