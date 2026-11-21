@@ -50,6 +50,7 @@ from wl_xcon.photometry import (
     xyY,
 )
 from wl_xcon.run import LONGEST_TRIAL_S
+from wl_xcon.saccade import HALF_WINDOW as SACCADE_HALF_WINDOW
 from wl_xcon.saccade import Params as SaccadeParams
 from wl_xcon.task import (
     kind_words,
@@ -3767,13 +3768,24 @@ ANSWER_INSIDE_WARMUP = "answer-inside-saccade-warmup"
 
 #: **The frame period a check counts a trial's frames by where its caller names none**: the one
 #: every session here runs at (`service.FRAME_PERIOD`, `wlx run`'s own), which
-#: `tests/test_saccade_warmup.py` holds this equal to. A session's own (`SessionSpec.frame_period`)
-#: is passed where it is judged live (`taskd.Session._layouts`).
+#: `tests/test_saccade_warmup.py` holds this equal to (`check` cannot read `service`'s, which
+#: imports `cli`, which imports this). A session's own (`SessionSpec.frame_period`) is passed
+#: where a session judges it: its pre-flight (`preflight.task`, `preflight.laid_out`), its run's
+#: start (`taskd.Session.run`) and each live change (`taskd.Session._layouts`).
 FRAME_PERIOD = 1 / 240
 
 #: The guards the saccade detector decides (`gaze.Tracked.happened`): a state with one, or with a
 #: clock one starts, waits on a saccade.
 _DETECTED = (SaccadeTo, SaccadeOnset)
+
+
+def blind_frames() -> int:
+    """**The frames of a trial before the rig's saccade detector is ready**, one sample a frame:
+    `saccade.Detector` takes its first velocity on the trial's fifth sample, its five-sample
+    window full (`saccade.HALF_WINDOW` either side), and is ready only once it has
+    `Params().warmup_samples` of them, on sample 54 at the defaults; before that it reports no
+    saccade at all. `tests/test_saccade_warmup.py` holds this to the detector itself."""
+    return SaccadeParams().warmup_samples + 2 * SACCADE_HALF_WINDOW
 
 
 def _waits_on_saccade(state: object) -> bool:
@@ -3786,16 +3798,6 @@ def _waits_on_saccade(state: object) -> bool:
     return False
 
 
-def _least_seconds(seconds: object, sources: dict[str, tuple]) -> "float | None":
-    """The least `seconds` can be on a trial, over what `sources` gives each setting (a draw at its
-    lowest), at least 0; `None` where nothing gives it or it is no finite number."""
-    spans = _spans(_form(seconds, sources))
-    if not spans:
-        return None
-    least = min(low for low, _ in spans)
-    return max(least, 0.0) if math.isfinite(least) else None
-
-
 def _whole_frames(seconds: float, frame_period: float) -> int:
     """The frames a wait of `seconds` takes at least, as the trial loop counts them (`run._Loop`):
     the first frame whose time since its zero reaches it, to a rounding (0.05 s is 12 frames at
@@ -3803,112 +3805,169 @@ def _whole_frames(seconds: float, frame_period: float) -> int:
     return max(0, math.ceil(round(seconds / frame_period, 6)))
 
 
-def _step(edge: object, sources: dict[str, tuple], frame_period: float,
-          may_pass: bool) -> "tuple[int, str | None, bool] | None":
-    """**The fewest frames `edge` can take its state's entry to its own**, as the trial loop runs it
-    (`run._Loop.frame`, `_take`), with what it names and whether it is a pass; `None` where no
-    number says. A state entered on frame n is judged from n + 1: a gaze edge, a detected one or
-    any other the world says (`Entered`, `Exited`, `SaccadeTo` ...) on that frame at the soonest;
-    a plain `After` of t when n + frames reaches t, at least one frame; a `Hold` of t likewise,
-    its first frame counting; an `After` timed from another guard one frame after that guard at
-    the soonest. **A plain `After` of 0 or less is a pass, taken on the frame its state is
-    entered** (TSK-78), but never by the start state on the trial's first frame, nor by a state a
-    pass entered (`may_pass`: at most one pass a frame), each of which judges it a frame later."""
+def _wait_said(seconds: object, sources: dict[str, tuple], least: float) -> "str | None":
+    """How a sentence names a wait at its least: a setting by name and value, "at its least" where
+    it can be other values; a number as written, where it is above 0; else nothing."""
+    if isinstance(seconds, P):
+        options = _spans(_form(seconds, sources)) or []
+        one = all(low == high for low, high in options) and len({low for low, _ in options}) == 1
+        return f"`{seconds.name}` {least:g} s" + ("" if one else " at its least")
+    return f"a {least:g} s wait as written" if least > 0.0 else None
+
+
+def _step(edge: object, sources: dict[str, tuple],
+          frame_period: float) -> "tuple[int, str | None] | None":
+    """**The fewest frames `edge` can take, from its state's entry to its own**, as the trial loop
+    runs it (`run._Loop.frame`, `_take`), with what it names; `None` where no number says, and for
+    an edge the detector decides. A state entered on frame n is judged from n + 1: a gaze edge or
+    any other the world says (`Entered`, `Exited`, `Onscreen` ...) on that frame at the soonest;
+    a plain `After` of t when n + frames reaches t, at least one frame (its pass, a frame of none,
+    is `_entries`'); a `Hold` of t likewise, its first frame counting; an `After` timed from
+    another guard one frame after that guard at the soonest. **A detected edge** (`SaccadeTo`,
+    `SaccadeOnset`, or an `After` timed from one) fires only once the detector is ready, so what it
+    enters is never inside the warm-up: not followed."""
     guard = getattr(edge, "guard", None)
+    if isinstance(guard, _DETECTED) or (
+            isinstance(guard, After) and isinstance(guard.since, _DETECTED)):
+        return None
     if isinstance(guard, (After, Hold)):
-        least = _least_seconds(guard.seconds, sources)
-        if least is None:
+        spans = _spans(_form(guard.seconds, sources))
+        if not spans:
             return None
+        least = min(low for low, _ in spans)
+        if not math.isfinite(least):
+            return None
+        least = max(least, 0.0)
         frames = _whole_frames(least, frame_period)
-        said = None
-        if isinstance(guard.seconds, P):
-            options = _spans(_form(guard.seconds, sources)) or []
-            one = all(low == high for low, high in options) and len(
-                {low for low, _ in options}) == 1
-            said = f"`{guard.seconds.name}` {least:g} s" + ("" if one else " at its least")
-        elif least > 0.0:
-            said = f"a {least:g} s wait as written"
+        said = _wait_said(guard.seconds, sources, least)
         if isinstance(guard, After) and guard.since is not None:
-            return 1 + frames, said, False
-        if isinstance(guard, After) and frames == 0 and may_pass:
-            return 0, said, True
-        return max(1, frames), said, False
-    return 1, None, False
+            return 1 + frames, said
+        return max(1, frames), said
+    return 1, None
 
 
-def _early_answers(structure: Trial, sources: dict[str, tuple], frame_period: float,
-                   warmup: int) -> list[tuple[str, str]]:
-    """**Each state waiting on a saccade that a trial can enter before the detector's warm-up is
-    over** (XC-505), with its sentence: the fewest frames from the trial's start to the state's
-    entry over every path of its edges (`_step`, each setting at the least `sources` gives it, a
-    draw at its lowest), against `warmup` frames, `saccade.Params.warmup_samples` velocities, one
-    a frame, before which `saccade.Detector` reports nothing. A state entered on frame n is judged
-    from n + 1, n frames into the trial; one entered before frame `warmup` is judged while the
-    detector is still blind, so a saccade there is never seen and the state ends on its other
-    exits, the task's error. An edge no number decides is not followed. Between trials, never
-    in a frame."""
+def _passes(state: object, sources: dict[str, tuple]) -> "tuple[list, bool]":
+    """**The edges of `state` that can be its pass, and whether one surely is** (TSK-78;
+    `run._Loop.passes`): the loop's pass is the first plain `After` whose seconds are 0 or less on
+    the trial, taken on the frame its state is entered, no other edge judged. Each plain `After`
+    that can be 0 or less can be it, in order, until one that can only be (every value 0 or
+    less): that one surely is, if none before it was, so no later edge is ever judged."""
+    can: list = []
+    for edge in getattr(state, "go", None) or ():
+        guard = getattr(edge, "guard", None)
+        if not (isinstance(guard, After) and guard.since is None):
+            continue
+        spans = _spans(_form(guard.seconds, sources))
+        if not spans:
+            continue
+        if min(low for low, _ in spans) <= 0.0:
+            can.append(edge)
+            if max(high for _, high in spans) <= 0.0:
+                return can, True
+    return can, False
+
+
+def _entries(structure: Trial, sources: dict[str, tuple],
+             frame_period: float) -> "dict[str, tuple[int, list[str]]]":
+    """**The fewest frames from a trial's start to each state's entry, and the waits on the way
+    named** (XC-505), each setting at the least `sources` gives it, a draw at its lowest: a
+    shortest path over the states' edges (`_step`). The start state is entered at frame 0 and
+    judged from frame 1; a state entered on frame n from n + 1. **A state entered by an edge, not
+    by a pass, takes its pass on that frame**, at no frame (`_passes`): where one surely is, it
+    alone leaves; at most one pass a frame, so a state a pass entered, and the start state, judge
+    a zero wait a frame later, as `run._Loop._take` does. An edge no number decides, and one the
+    detector decides, is not followed. Between trials, never in a frame."""
     states = {state.name: state for state in getattr(structure, "states", None) or ()
               if isinstance(getattr(state, "name", None), str)}
     start = getattr(structure, "start", None)
     if start not in states:
-        return []
-    # A node is a state and whether a pass entered it this frame; the start's first frame takes
-    # no pass, as one a pass entered takes none.
-    best: dict[tuple[str, bool], int] = {(start, True): 0}
+        return {}
+    # A node is a state and whether it may take its pass: not the start's first frame, nor one a
+    # pass entered.
+    best: dict[tuple[str, bool], int] = {(start, False): 0}
     came: dict[tuple[str, bool], tuple] = {}
-    queue = [(0, start, True)]
+    queue = [(0, start, False)]
+
+    def reach(node: tuple[str, bool], frames: int, origin: tuple, said) -> None:
+        if frames < best.get(node, math.inf):
+            best[node] = frames
+            came[node] = (origin, said)
+            heapq.heappush(queue, (frames, *node))
+
     while queue:
-        frames, name, passed = heapq.heappop(queue)
-        if best.get((name, passed), math.inf) < frames:
+        frames, name, may_pass = heapq.heappop(queue)
+        if best.get((name, may_pass), math.inf) < frames:
             continue
-        for edge in getattr(states[name], "go", None) or ():
+        edges = list(getattr(states[name], "go", None) or ())
+        if may_pass:
+            can, surely = _passes(states[name], sources)
+            for edge in can:
+                if isinstance(edge.to, str) and edge.to in states:
+                    seconds = edge.guard.seconds
+                    reach((edge.to, False), frames, (name, may_pass),
+                          _wait_said(seconds, sources, 0.0))
+            if surely:
+                continue
+        for edge in edges:
             to = getattr(edge, "to", None)
             if not isinstance(to, str) or to not in states:
                 continue
-            step = _step(edge, sources, frame_period, may_pass=not passed)
+            step = _step(edge, sources, frame_period)
             if step is None:
                 continue
-            took, said, is_pass = step
-            node = (to, is_pass)
-            if frames + took < best.get(node, math.inf):
-                best[node] = frames + took
-                came[node] = ((name, passed), said)
-                heapq.heappush(queue, (frames + took, to, is_pass))
-    found: list[tuple[str, str]] = []
-    period = frame_period
-    for name, state in states.items():
-        if not _waits_on_saccade(state):
-            continue
-        reached = [(frames, node) for node, frames in best.items() if node[0] == name]
-        if not reached:
-            continue
-        frames, node = min(reached)
-        if frames >= warmup:
+            took, said = step
+            reach((to, True), frames + took, (name, may_pass), said)
+    found: dict[str, tuple[int, list[str]]] = {}
+    for node, frames in sorted(best.items(), key=lambda item: item[1]):
+        if node[0] in found:
             continue
         waits: list[str] = []
-        while node in came:
-            node, said = came[node]
+        at = node
+        while at in came:
+            at, said = came[at]
             if said is not None:
                 waits.append(said)
-        waits.reverse()
-        # What is missing, up to the next millisecond, so the fix said is never short of it.
-        short = math.ceil(round((warmup - frames) * period * 1000, 6)) / 1000
+        found[node[0]] = (frames, waits[::-1])
+    return found
+
+
+def _early_answers(structure: Trial, sources: dict[str, tuple],
+                   frame_period: float) -> list[tuple[str, str]]:
+    """**Each state waiting on a saccade that a trial can enter before the detector is ready**
+    (XC-505), with its sentence: entered on frame n (`_entries`), it is judged from n + 1, and a
+    saccade there before the detector's `blind_frames()` is never seen, so the state ends on its
+    other exits, the task's error. Warned where n is below `blind_frames()`."""
+    blind = blind_frames()
+    period = frame_period
+    found: list[tuple[str, str]] = []
+    states = [state for state in getattr(structure, "states", None) or ()
+              if isinstance(getattr(state, "name", None), str)]
+    entries = _entries(structure, sources, frame_period)
+    for state in states:
+        if not _waits_on_saccade(state) or state.name not in entries:
+            continue
+        frames, waits = entries[state.name]
+        if frames >= blind:
+            continue
+        # What is missing, a frame more (a wait at its one-frame floor gains a frame less than it
+        # is lengthened by), up to the next millisecond, so the fix said is never short of it.
+        short = math.ceil(round((blind - frames + 1) * period * 1000, 6)) / 1000
         how = ", ".join([*waits, "a frame for each other step"] if waits else [
             "a frame for each step"])
-        found.append((name, (
-            f"an answer can come {frames * period:.3g} s into a trial, in state {name!r}, which "
-            f"waits on a saccade ({how}), but the saccade detector is blind for each trial's "
-            f"first {warmup * period:.3g} s (its warm-up, {warmup} frames at {1 / period:g} Hz), "
-            f"so an answer that early goes unseen and is scored as the task's error; lengthen "
-            f"the waits before it by {short:g} s or more in all")))
+        found.append((state.name, (
+            f"an answer can come {frames * period:.3g} s into a trial, in state {state.name!r}, "
+            f"which waits on a saccade ({how}), but the saccade detector is not ready until "
+            f"frame {blind} of each trial, {blind * period:.3g} s at {1 / period:g} Hz (its "
+            f"warm-up), so an answer that early goes unseen and is scored as the task's error; "
+            f"lengthen the waits before it by {short:g} s or more in all")))
     return found
 
 
 def _answer_sources(task: Task, values: dict) -> dict[str, tuple]:
-    """**What each setting can hold, for `answers_inside_warmup`**: the task's starts under its
-    own draws (the plain run's, `_sources`), and over them each of `values` -- a number itself, a
-    `(least, most)` pair a draw's or a staircase's span (`at_values`' reading), anything else
-    itself."""
+    """**What each setting can hold, for `answers_inside_warmup` at the values set**: the task's
+    starts under its own draws (the plain run's, `_sources`), and over them each of `values` -- a
+    number itself, a `(least, most)` pair a draw's or a staircase's span (`at_values`' reading),
+    anything else itself."""
     declared = {param.name: param for param in task.params}
     starts = {param.name: param.start for param in task.params if param.start is not None}
     plain = Block("session", [Condition("session", {}, target=1)])
@@ -3922,28 +3981,97 @@ def _answer_sources(task: Task, values: dict) -> dict[str, tuple]:
     return sources
 
 
+#: How many of a plan's conditions a load sentence names before it counts the rest.
+_PLACES_NAMED = 3
+
+
+def _places_said(places: "list[tuple[str | None, str]]") -> str:
+    """Where a load sentence holds: "the plain run", and each plan by name with up to
+    `_PLACES_NAMED` of its "block: condition"s, the rest counted."""
+    plain = any(plan is None for plan, _ in places)
+    plans: dict[str, list[str]] = {}
+    for plan, place in places:
+        if plan is not None and place not in plans.setdefault(plan, []):
+            plans[plan].append(place)
+    said = ["the plain run"] if plain else []
+    for plan, named in plans.items():
+        more = len(named) - _PLACES_NAMED
+        listed = ", ".join(named[:_PLACES_NAMED]) + (f" and {more} more" if more > 0 else "")
+        said.append(f"plan {plan!r} ({listed})")
+    return " and ".join(said)
+
+
+def _loaded_answers(task: Task, period: float) -> list[Finding]:
+    """**At load** (`answers_inside_warmup`, no `values`): over the plain run's one block and each
+    plan's blocks, their factorials expanded, each condition's values and draws over the task's
+    starts as `impossible` reads them (`_sources`: a block's draw, a condition's value or its own
+    range, a staircase's levels), each structure a trial of it can play, each special kind's
+    included (`_played_by`'s reading, whatever its percentage); one finding for each state and
+    sentence, naming where it holds (`_places_said`) unless that is everywhere the task can run.
+    A setting with no start that nothing gives is not judged here: a run's pre-flight judges the
+    run's own values (`laid_out`)."""
+    declared = {param.name: param for param in task.params}
+    starts = {param.name: param.start for param in task.params if param.start is not None}
+    specials = _specials_judged(task, starts, "every")
+    blocks: list[tuple[str | None, object]] = [
+        (None, Block("session", [Condition("session", {}, target=1)]))]
+    blocks += [(name, block) for name, plan in task.plans.items()
+               for block in getattr(plan, "blocks", None) or ()]
+    said: dict[tuple[str, str, str], list] = {}
+    judged: set = set()
+    for plan, block in blocks:
+        if not isinstance(block, Block):
+            continue
+        block = expanded(block)
+        for condition in block.conditions if isinstance(block.conditions, list) else ():
+            if not (isinstance(condition, Condition) and isinstance(condition.values, dict)
+                    and isinstance(condition.structure, (str, type(None)))):
+                continue
+            played = condition.structure or task.default
+            names = [played] + ([special.structure for special in specials]
+                                if played == task.default else [])
+            sources = _sources(task, block, condition, starts, frozenset(), {}, declared)
+            judged.add((plan, f"{block.name}: {condition.name}"))
+            for name in dict.fromkeys(names):
+                structure = task.structures.get(name)
+                if not isinstance(structure, Trial):
+                    continue
+                for state, sentence in _early_answers(structure, sources, period):
+                    said.setdefault((name, state, sentence), []).append(
+                        (plan, f"{block.name}: {condition.name}"))
+    # Where it holds is said only where it does not hold everywhere the task can run.
+    each = [(name, Finding(ANSWER_INSIDE_WARMUP, sentence if set(places) >= judged
+                           else f"{sentence} (in {_places_said(places)})",
+                           blocking=False, accepted_in=SESSION_KINDS,
+                           subjects=(f"state {state!r}",)))
+            for (name, state, sentence), places in said.items()]
+    return in_structures(each) if len(task.structures) > 1 else [f for _, f in each]
+
+
 def answers_inside_warmup(task: Task, values: dict | None = None,
                           frame_period: float | None = None) -> list[Finding]:
-    """**`ANSWER_INSIDE_WARMUP`, wherever the settings let an answer come inside the saccade
-    detector's warm-up** (XC-505; the PI, 2026-11-14, "Warn when settings allow it"): for each
-    structure, each state waiting on a saccade (`SaccadeTo`, `SaccadeOnset`) that a trial can
-    enter sooner than `saccade.Params().warmup_samples` frames at `frame_period` (`FRAME_PERIOD`
-    where none is named) from its start, every wait on the shortest way there at its least
-    (`_early_answers`). At load, at the task's starts and draws (`check_task`, `values` none); at
-    the values set (`laid_out`), each `values` over them. A warning in every kind; one for each
-    state, named by its structure in a task of several (`in_structures`), its subject the state,
-    so a change that keeps it true is no new warning (`taskd.Session._laid_out`). Between trials,
-    never in a frame."""
+    """**`ANSWER_INSIDE_WARMUP`, wherever the settings let an answer come before the saccade
+    detector is ready** (XC-505; the PI, 2026-11-14, "Warn when settings allow it"): for each
+    structure, each state waiting on a saccade (`SaccadeTo`, `SaccadeOnset`, or a clock one
+    starts) that a trial can enter sooner than `blind_frames()` frames at `frame_period`
+    (`FRAME_PERIOD` where none is named) from its start, every wait on the shortest way there at
+    its value, a draw at its lowest (`_early_answers`). **At load** (`values` `None`;
+    `check_task`): the plain run and every plan's blocks and conditions (`_loaded_answers`).
+    **At the values set** (`laid_out`): `values` over the task's starts and draws, every
+    structure. A warning in every kind; one for each state, named by its structure in a task of
+    several (`in_structures`), its subject the state, so a change that keeps it true is no new
+    warning (`taskd.Session._laid_out`). Between trials, never in a frame."""
     period = FRAME_PERIOD if frame_period is None else frame_period
     if not (_finite(period) and period > 0):
         return []
-    warmup = SaccadeParams().warmup_samples
-    sources = _answer_sources(task, values or {})
+    if values is None:
+        return _loaded_answers(task, period)
+    sources = _answer_sources(task, values)
     each: list[tuple[str, Finding]] = []
     for name, structure in task.structures.items():
         if not isinstance(structure, Trial):
             continue
-        for state, detail in _early_answers(structure, sources, period, warmup):
+        for state, detail in _early_answers(structure, sources, period):
             each.append((name, Finding(ANSWER_INSIDE_WARMUP, detail, blocking=False,
                                        accepted_in=SESSION_KINDS,
                                        subjects=(f"state {state!r}",))))

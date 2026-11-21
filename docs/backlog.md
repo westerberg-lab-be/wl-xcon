@@ -15,7 +15,7 @@ No ` — ` inside a field. Link a section, not a file, where one exists. `tests/
 
 **Finding one.** Grep the ID, a package (`P9`, `b3`), a repository (`wl-sync`) or a file. The sections: brainstorms the PI asked to have later; features no plan covers yet; defects and review findings deliberately not fixed; debt (cleanup, stale wording, test hygiene); anything that needs the rig or other hardware, measurements included; and asks of, or waits on, other repositories.
 
-**Next free ID: XC-555.**
+**Next free ID: XC-557.**
 
 ## Brainstorms queued for the PI
 
@@ -252,6 +252,8 @@ No ` — ` inside a field. Link a section, not a file, where one exists. `tests/
 - **XC-537** A keyboard press on *withdraw* or *hand back* can be lost to a frame: `dirty()` keeps a box only for a focused input or select, so a clean box with a focused button is replaced when the frame changes it and focus drops to the page; the pointer hold covers the mouse only (whole-build review M3). — 2026-11-19, [console interface plan, the whole-build review, Task 6](superpowers/plans/2026-11-19-console-interface.md#task-6-drafts-apply-apply-all-withdraw-and-a-frame-that-never-eats-a-press) — waits on: nothing
 - **XC-540** *withdraw* is offered on, and accepted from, any console, and two pages making the same command id (a random six-character prefix and a count each) would be withdrawn together; the record names who staged and who withdrew (whole-build review M8; told to the PI with the fix wave). — 2026-11-19, [console interface plan, the whole-build review, Task 6](superpowers/plans/2026-11-19-console-interface.md#task-6-drafts-apply-apply-all-withdraw-and-a-frame-that-never-eats-a-press) — waits on: the PI's try-out
 - **XC-542** A box's three-frame bound on an act the rig has not answered (`web.ANSWER_FRAMES`) counts `wlx serve`'s keepalives, one every 15 s between boundaries, so an act answered early in a trial longer than about 45 s is said "not confirmed by the rig" before its own boundary shows it waiting (the fix wave's re-review, M-d); count boundary frames, or bound it by the trial. — 2026-11-19, [console interface plan, Task 6](superpowers/plans/2026-11-19-console-interface.md#task-6-drafts-apply-apply-all-withdraw-and-a-frame-that-never-eats-a-press) — waits on: nothing
+- **XC-555** `answer-inside-saccade-warmup` judges when a saccade-waiting state can be entered, not when the answer's saccade can begin: a slow saccade begun before the detector is ready that leaves fixation after it, or one carried into a `SaccadeTo` state a timer entered ("count it both ways"), is missed unwarned. — 2026-11-20, [`check._early_answers`](../wl_xcon/check.py) (XC-505's review, the builder's concern 2) — waits on: nothing
+- **XC-556** A run's pre-flight offers a task warning twice when the load and the layout at the run's values both give it, since `preflight.laid_out` prefixes its sentence "in the plain run: " before `Service._preflight` compares them (`answer-inside-saccade-warmup`, `specials-over-100`); compare before prefixing, or by code and subjects. — 2026-11-20, [`preflight.laid_out`](../wl_xcon/preflight.py) (XC-505's review, M7) — waits on: nothing
 
 ## Debt
 

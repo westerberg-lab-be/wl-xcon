@@ -1702,6 +1702,7 @@ class Service:
             item, loaded, findings = _preflight.task(
                 task, self.allocation, session.spec.geometry, session.spec.calibration,
                 deployment=session.spec.deployment, plan=plan, start_block=start_block,
+                frame_period=session.spec.frame_period,
             )
             checked = (item,)
         except Exception as broken:  # noqa: BLE001 -- see the docstring
@@ -1729,7 +1730,8 @@ class Service:
         # run's, those the load already gives said once.
         beyond += [finding for finding in _preflight.laid_out(
             loaded, values, plan, self.allocation, session.spec.geometry,
-            session.spec.calibration, session.spec.deployment) if finding not in findings]
+            session.spec.calibration, session.spec.deployment,
+            frame_period=session.spec.frame_period) if finding not in findings]
 
         def warned():
             try:
