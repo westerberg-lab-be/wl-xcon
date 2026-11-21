@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import heapq
 import itertools
 import math
 import sys
@@ -49,6 +50,7 @@ from wl_xcon.photometry import (
     xyY,
 )
 from wl_xcon.run import LONGEST_TRIAL_S
+from wl_xcon.saccade import Params as SaccadeParams
 from wl_xcon.task import (
     kind_words,
     ANSWERS,
@@ -94,6 +96,7 @@ from wl_xcon.task import (
     Priming,
     Random,
     Remembered,
+    SaccadeOnset,
     SaccadeTo,
     Scaled,
     SequenceBalanced,
@@ -195,6 +198,7 @@ def check_task(
     calibration: Calibration | None = None,
     deployment: Deployment | None = None,
     source: Path | str | None = None,
+    frame_period: float | None = None,
 ) -> list[Finding]:
     """The load-time checks of a task object (engine spec §3.5; engine build C1): each trial
     structure's own (`check`), named by its structure where the task has several (the engine C1
@@ -215,7 +219,9 @@ def check_task(
     `direction-outside-0-360` for the range it is declared in (`_drawn_directions`). **A trial no
     animal can get right** (engine build C3's spec §9; the PI, 2026-10-30, Q10) is refused at the
     task's starting values, in each condition of the plain run and of every plan, every draw's
-    full range included (`_impossible_faults`, `impossible`)."""
+    full range included (`_impossible_faults`, `impossible`). **An answer the settings let come
+    inside the saccade detector's warm-up** is warned, at the task's starts and draws, counted in
+    frames of `frame_period` (`FRAME_PERIOD` where none is named; XC-505, `answers_inside_warmup`)."""
     several = len(task.structures) > 1
     # A structure's check reads a direction setting's declaration alone and knows nothing of
     # draws (the C3 plan's call 39).
@@ -273,6 +279,7 @@ def check_task(
         + _impossible_faults(task)
         + _found_by_faults(task)
         + _condition_spellings(task)
+        + answers_inside_warmup(task, None, frame_period)
         + ([] if source is None else _computed_positions(Path(source)))
     )
 
@@ -907,10 +914,13 @@ def at_values(task: Task, values) -> Task:
 #: is not warned of again for another luminance (`taskd.Session._laid_out`). **The special trials'
 #: percentages adding past 100** (`specials-over-100`) are a sum and no layout, judged here because
 #: these are the checks run at the values set (the pop-out revision's plan, Task 4), so shares set
-#: past 100 live are warned when a change makes them so (`_over_100`).
+#: past 100 live are warned when a change makes them so (`_over_100`). **An answer the values let
+#: come inside the saccade detector's warm-up** (`answer-inside-saccade-warmup`; XC-505) is a timing
+#: and no layout, judged here for the same reason (`answers_inside_warmup`).
 LAYOUT = ("stimulus-off-screen", "overlapping-windows", "crowded-array",
           "answer-window-reaches-objects", "window-inside-object", "objects-touch",
-          "scaled-small", "color-set-desaturated", "color-set-unreachable", "specials-over-100")
+          "scaled-small", "color-set-desaturated", "color-set-unreachable", "specials-over-100",
+          "answer-inside-saccade-warmup")
 
 #: **A size scaled by eccentricity that the center leaves small** (the console settings design's
 #: §5: "eccentricity 0 gives size 0, so the load check warns for a scaled stimulus at or near the
@@ -993,7 +1003,8 @@ def _scaled_sizes(task: Task, values: dict, fixed: dict) -> tuple[dict, list[Fin
 
 def laid_out(task: Task, values, *, allocation: Allocation = PROVISIONAL,
              geometry: Geometry | None = None, calibration: Calibration | None = None,
-             deployment: Deployment | None = None, fixed: dict | None = None) -> list[Finding]:
+             deployment: Deployment | None = None, fixed: dict | None = None,
+             frame_period: float | None = None) -> list[Finding]:
     """**The layout checks at the values set** (`LAYOUT`; the console settings design's §4): each
     structure's, on `task` with each setting `values` names pinned there (`at_values`: a number,
     or a draw's or a staircase's `(least, most)`) and every other open side at its start
@@ -1012,7 +1023,9 @@ def laid_out(task: Task, values, *, allocation: Allocation = PROVISIONAL,
     read as the sizes it gives at each place it is drawn, its center and nearness warned and a size
     past its bound refused (`_scaled_sizes`), `fixed` giving each such setting's fixed value. **And
     the special trials' percentages past 100** at the values (`_over_100`; `specials-over-100`), a
-    warning. Run between trials, never in a frame."""
+    warning, **and an answer the values let come inside the saccade detector's warm-up**, counted
+    in frames of `frame_period` (`answer-inside-saccade-warmup`, `answers_inside_warmup`; XC-505).
+    Run between trials, never in a frame."""
     values, scaled = _scaled_sizes(task, dict(values), fixed or {})
     pinned, unstarted = _at_start(at_values(task, values))
     own, _ = _at_start(task)
@@ -1040,6 +1053,9 @@ def laid_out(task: Task, values, *, allocation: Allocation = PROVISIONAL,
     over = _over_100(task, values)
     if over is not None:
         findings.append(over)
+    # An answer the settings let come inside the saccade detector's warm-up (XC-505), at the
+    # values set, at `frame_period` (`FRAME_PERIOD` where none is named).
+    findings += answers_inside_warmup(task, values, frame_period)
     del deployment  # read by no structure's check: a head's is the task's (`_head_faults`)
     return findings
 
@@ -3741,6 +3757,197 @@ def _little_time_faults(task: Task, starts: dict) -> list[Finding]:
     return [Finding("little-time-to-answer", detail, blocking=False, accepted_in=SESSION_KINDS,
                     subjects=tuple(dict.fromkeys(names)))
             for detail, names in said.items()]
+
+
+#: **An answer that can come inside the saccade detector's warm-up** (XC-505; the PI, 2026-11-14,
+#: asked in the UI: "Warn when settings allow it"): a warning in every kind, at load and at the
+#: values set (`laid_out`, so the run's pre-flight and each live change), never a refusal, and
+#: nothing else changes -- the detector stays per trial (S5 §5; `gaze.py`'s docstring).
+ANSWER_INSIDE_WARMUP = "answer-inside-saccade-warmup"
+
+#: **The frame period a check counts a trial's frames by where its caller names none**: the one
+#: every session here runs at (`service.FRAME_PERIOD`, `wlx run`'s own), which
+#: `tests/test_saccade_warmup.py` holds this equal to. A session's own (`SessionSpec.frame_period`)
+#: is passed where it is judged live (`taskd.Session._layouts`).
+FRAME_PERIOD = 1 / 240
+
+#: The guards the saccade detector decides (`gaze.Tracked.happened`): a state with one, or with a
+#: clock one starts, waits on a saccade.
+_DETECTED = (SaccadeTo, SaccadeOnset)
+
+
+def _waits_on_saccade(state: object) -> bool:
+    """Whether `state` has an exit the saccade detector decides (`_DETECTED`), or one timed from it."""
+    for edge in getattr(state, "go", None) or ():
+        guard = getattr(edge, "guard", None)
+        if isinstance(guard, _DETECTED) or (
+                isinstance(guard, After) and isinstance(guard.since, _DETECTED)):
+            return True
+    return False
+
+
+def _least_seconds(seconds: object, sources: dict[str, tuple]) -> "float | None":
+    """The least `seconds` can be on a trial, over what `sources` gives each setting (a draw at its
+    lowest), at least 0; `None` where nothing gives it or it is no finite number."""
+    spans = _spans(_form(seconds, sources))
+    if not spans:
+        return None
+    least = min(low for low, _ in spans)
+    return max(least, 0.0) if math.isfinite(least) else None
+
+
+def _whole_frames(seconds: float, frame_period: float) -> int:
+    """The frames a wait of `seconds` takes at least, as the trial loop counts them (`run._Loop`):
+    the first frame whose time since its zero reaches it, to a rounding (0.05 s is 12 frames at
+    240 Hz, never 13 for its floating-point remainder)."""
+    return max(0, math.ceil(round(seconds / frame_period, 6)))
+
+
+def _step(edge: object, sources: dict[str, tuple], frame_period: float,
+          may_pass: bool) -> "tuple[int, str | None, bool] | None":
+    """**The fewest frames `edge` can take its state's entry to its own**, as the trial loop runs it
+    (`run._Loop.frame`, `_take`), with what it names and whether it is a pass; `None` where no
+    number says. A state entered on frame n is judged from n + 1: a gaze edge, a detected one or
+    any other the world says (`Entered`, `Exited`, `SaccadeTo` ...) on that frame at the soonest;
+    a plain `After` of t when n + frames reaches t, at least one frame; a `Hold` of t likewise,
+    its first frame counting; an `After` timed from another guard one frame after that guard at
+    the soonest. **A plain `After` of 0 or less is a pass, taken on the frame its state is
+    entered** (TSK-78), but never by the start state on the trial's first frame, nor by a state a
+    pass entered (`may_pass`: at most one pass a frame), each of which judges it a frame later."""
+    guard = getattr(edge, "guard", None)
+    if isinstance(guard, (After, Hold)):
+        least = _least_seconds(guard.seconds, sources)
+        if least is None:
+            return None
+        frames = _whole_frames(least, frame_period)
+        said = None
+        if isinstance(guard.seconds, P):
+            options = _spans(_form(guard.seconds, sources)) or []
+            one = all(low == high for low, high in options) and len(
+                {low for low, _ in options}) == 1
+            said = f"`{guard.seconds.name}` {least:g} s" + ("" if one else " at its least")
+        elif least > 0.0:
+            said = f"a {least:g} s wait as written"
+        if isinstance(guard, After) and guard.since is not None:
+            return 1 + frames, said, False
+        if isinstance(guard, After) and frames == 0 and may_pass:
+            return 0, said, True
+        return max(1, frames), said, False
+    return 1, None, False
+
+
+def _early_answers(structure: Trial, sources: dict[str, tuple], frame_period: float,
+                   warmup: int) -> list[tuple[str, str]]:
+    """**Each state waiting on a saccade that a trial can enter before the detector's warm-up is
+    over** (XC-505), with its sentence: the fewest frames from the trial's start to the state's
+    entry over every path of its edges (`_step`, each setting at the least `sources` gives it, a
+    draw at its lowest), against `warmup` frames, `saccade.Params.warmup_samples` velocities, one
+    a frame, before which `saccade.Detector` reports nothing. A state entered on frame n is judged
+    from n + 1, n frames into the trial; one entered before frame `warmup` is judged while the
+    detector is still blind, so a saccade there is never seen and the state ends on its other
+    exits, the task's error. An edge no number decides is not followed. Between trials, never
+    in a frame."""
+    states = {state.name: state for state in getattr(structure, "states", None) or ()
+              if isinstance(getattr(state, "name", None), str)}
+    start = getattr(structure, "start", None)
+    if start not in states:
+        return []
+    # A node is a state and whether a pass entered it this frame; the start's first frame takes
+    # no pass, as one a pass entered takes none.
+    best: dict[tuple[str, bool], int] = {(start, True): 0}
+    came: dict[tuple[str, bool], tuple] = {}
+    queue = [(0, start, True)]
+    while queue:
+        frames, name, passed = heapq.heappop(queue)
+        if best.get((name, passed), math.inf) < frames:
+            continue
+        for edge in getattr(states[name], "go", None) or ():
+            to = getattr(edge, "to", None)
+            if not isinstance(to, str) or to not in states:
+                continue
+            step = _step(edge, sources, frame_period, may_pass=not passed)
+            if step is None:
+                continue
+            took, said, is_pass = step
+            node = (to, is_pass)
+            if frames + took < best.get(node, math.inf):
+                best[node] = frames + took
+                came[node] = ((name, passed), said)
+                heapq.heappush(queue, (frames + took, to, is_pass))
+    found: list[tuple[str, str]] = []
+    period = frame_period
+    for name, state in states.items():
+        if not _waits_on_saccade(state):
+            continue
+        reached = [(frames, node) for node, frames in best.items() if node[0] == name]
+        if not reached:
+            continue
+        frames, node = min(reached)
+        if frames >= warmup:
+            continue
+        waits: list[str] = []
+        while node in came:
+            node, said = came[node]
+            if said is not None:
+                waits.append(said)
+        waits.reverse()
+        # What is missing, up to the next millisecond, so the fix said is never short of it.
+        short = math.ceil(round((warmup - frames) * period * 1000, 6)) / 1000
+        how = ", ".join([*waits, "a frame for each other step"] if waits else [
+            "a frame for each step"])
+        found.append((name, (
+            f"an answer can come {frames * period:.3g} s into a trial, in state {name!r}, which "
+            f"waits on a saccade ({how}), but the saccade detector is blind for each trial's "
+            f"first {warmup * period:.3g} s (its warm-up, {warmup} frames at {1 / period:g} Hz), "
+            f"so an answer that early goes unseen and is scored as the task's error; lengthen "
+            f"the waits before it by {short:g} s or more in all")))
+    return found
+
+
+def _answer_sources(task: Task, values: dict) -> dict[str, tuple]:
+    """**What each setting can hold, for `answers_inside_warmup`**: the task's starts under its
+    own draws (the plain run's, `_sources`), and over them each of `values` -- a number itself, a
+    `(least, most)` pair a draw's or a staircase's span (`at_values`' reading), anything else
+    itself."""
+    declared = {param.name: param for param in task.params}
+    starts = {param.name: param.start for param in task.params if param.start is not None}
+    plain = Block("session", [Condition("session", {}, target=1)])
+    sources = _sources(task, plain, plain.conditions[0], starts, frozenset(), {}, declared)
+    for name, value in values.items():
+        if isinstance(value, tuple) and len(value) == 2 and all(_finite(v) for v in value):
+            least, most = sorted(float(v) for v in value)
+            sources[name] = (least,) if least == most else (_Spread(least, most),)
+        else:
+            sources[name] = (value,)
+    return sources
+
+
+def answers_inside_warmup(task: Task, values: dict | None = None,
+                          frame_period: float | None = None) -> list[Finding]:
+    """**`ANSWER_INSIDE_WARMUP`, wherever the settings let an answer come inside the saccade
+    detector's warm-up** (XC-505; the PI, 2026-11-14, "Warn when settings allow it"): for each
+    structure, each state waiting on a saccade (`SaccadeTo`, `SaccadeOnset`) that a trial can
+    enter sooner than `saccade.Params().warmup_samples` frames at `frame_period` (`FRAME_PERIOD`
+    where none is named) from its start, every wait on the shortest way there at its least
+    (`_early_answers`). At load, at the task's starts and draws (`check_task`, `values` none); at
+    the values set (`laid_out`), each `values` over them. A warning in every kind; one for each
+    state, named by its structure in a task of several (`in_structures`), its subject the state,
+    so a change that keeps it true is no new warning (`taskd.Session._laid_out`). Between trials,
+    never in a frame."""
+    period = FRAME_PERIOD if frame_period is None else frame_period
+    if not (_finite(period) and period > 0):
+        return []
+    warmup = SaccadeParams().warmup_samples
+    sources = _answer_sources(task, values or {})
+    each: list[tuple[str, Finding]] = []
+    for name, structure in task.structures.items():
+        if not isinstance(structure, Trial):
+            continue
+        for state, detail in _early_answers(structure, sources, period, warmup):
+            each.append((name, Finding(ANSWER_INSIDE_WARMUP, detail, blocking=False,
+                                       accepted_in=SESSION_KINDS,
+                                       subjects=(f"state {state!r}",))))
+    return in_structures(each) if len(task.structures) > 1 else [f for _, f in each]
 
 
 def _head_faults(task: Task, deployment: "Deployment | None") -> list[Finding]:

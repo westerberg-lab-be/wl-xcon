@@ -912,6 +912,17 @@ review's probe L scored 115 CORRECT / 85 WRONG_TARGET by its rates where the rig
 eye landed. The simulator is not the rig, but `gaze.Tracked` is: a frame through the eye builds
 only what a rig's frame builds and the eye's sample (`tests/test_simeye.py`).
 
+**An answer the settings let come inside the saccade detector's warm-up is warned of** (XC-505; the
+PI, 2026-11-14, "Warn when settings allow it"). The detector is per trial (S5 §5), and reports
+nothing before `saccade.Params.warmup_samples` velocities, one a frame, so a state that waits on a
+saccade (`SaccadeTo`, `SaccadeOnset`) begun sooner after a trial's start ends on its other exits,
+the task's error. `check.answers_inside_warmup` walks each structure's states from its start, each
+wait at its least -- a draw at its lowest, a zero wait a pass on its entering frame (TSK-78), every
+other step a frame -- and warns, `answer-inside-saccade-warmup`, in every kind, of each such state
+a trial can enter before the warm-up's last frame: at load at the task's starts and draws
+(`check_task`), and at the values set (`check.laid_out`, so the run's pre-flight and each live
+change, at the session's own frame period, `taskd.Session._layouts`). Nothing else changes.
+
 ## Message contracts (draft v0)
 
 - **Eye samples** (openiris -> taskd): OpenIris-native UDP poll on 9003
