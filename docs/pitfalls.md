@@ -418,6 +418,6 @@ once, twenty rounds over: with the linger undone it failed in all 30 of its runs
 containers, by its 17th round at the latest, and with it passed 300 of 300. **What the
 linger does not do**, read in libzmq 4.3.5's `src/session_base.cpp`: it holds the connection until
 the socket's queue has been taken by the connection's engine, not until the engine has written it,
-so a console so far behind that the connection's buffers are full still loses the tail (a probe
+so a console so far behind that the connection's buffers are full still loses the tail (an unrecorded probe, not in `tools/`,
 with the console's socket made to hold one message lost the last of 160 frames of 64 KB with a 10 s
 linger). A console that reads keeps up; the record, not the console, is the session's truth.

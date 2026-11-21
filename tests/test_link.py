@@ -2330,7 +2330,7 @@ def test_close_waits_only_after_a_recent_reply_and_never_past_the_grace(
 #: How many times over `test_the_frames_published_just_before_close_reach_the_console`
 #: publishes and closes, and how many frames each time before the last: about 34 KB, a
 #: test frame being under 2 KB. Enough that libzmq's I/O thread has not sent them all
-#: when the close comes straight after (a scratchpad probe of this shape with
+#: when the close comes straight after (an unrecorded scratchpad probe, not in `tools/` and not re-runnable, of this shape with
 #: `linger=0`, 2026-11-20, lost some in 52 of 60 rounds, and none of 40 with 4 frames),
 #: and well inside the connection's buffers (macOS's `net.inet.tcp.sendspace` is 128
 #: KiB), so the linger lets every frame go (none of 400 rounds lost in that probe).
