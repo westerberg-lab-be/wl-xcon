@@ -8,7 +8,7 @@ visibility: public
 # (PI); GitHub redirects the old URL, and the registry keeps the old slug as an
 # alias. The Python package followed as `wl_xcon` (was `wl_expcontroller`) once
 # branch p4d2b-b2a-controls had merged, closing XC-053; the `wlx` command stays.
-remote: https://github.com/jakewesterberg/wl-xcon.git
+remote: https://github.com/westerberg-lab-be/wl-xcon.git
 
 summary: >-
   The behavioural task controller: a Python, Linux-first replacement for NIMH
@@ -42,7 +42,7 @@ third_party:
       PsychoPy's**: 2026.2.3 declares `>=3.10,<3.13`, so Python 3.13 cannot run the
       display layer at all. That is not a preference and it reaches past this
       package -- wl-preproc's CI tests 3.13 because "3.13 is what Fedora ships",
-      so a Fedora workstation cannot run this project's display code, and the task
+      so a Fedora machine cannot run this project's display code, and the task
       PC's Ubuntu 24.04 (Python 3.12) is the right choice for a second reason
       beyond NI-DAQmx. Discovered 2026-08-31 by installing it; nothing in either
       repository's documents said so.
@@ -55,8 +55,10 @@ third_party:
       module built by DKMS, so it constrains the machine's distribution rather
       than merely being installed on it: NI-DAQmx 2026 Q2 supports RHEL 9.6/10.0,
       openSUSE 15.6/16.0 and Ubuntu 22.04/24.04 LTS, and does NOT support Fedora,
-      which is wl-stack's workstation standard. The task PC therefore deviates
-      deliberately. UNVERIFIED on hardware until a card is benched (pitfalls P10).
+      the OS of wl-stack's only Linux stack (wl-fedora-nvidia, groundwork for
+      its server stacks; wl-stack docs/naming.md). Lab desks are Macs
+      (wl-stack hosts.yaml; its 2026-11-20 machine-classes design). The task PC
+      therefore deviates from that Fedora stack deliberately. UNVERIFIED on hardware until a card is benched (pitfalls P10).
   - name: nidaqmx-python
     where: rig/task
     why: >-
