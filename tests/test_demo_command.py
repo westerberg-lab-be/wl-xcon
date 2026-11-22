@@ -299,9 +299,16 @@ def test_a_scripted_pointer_drives_a_trial_through_its_wlx_serve(wlx, zmq_cleanu
     with the field drawn** -- no trial begins while nobody steers, and no trial is scored (this
     task's call: before the first screen there is nothing to point at) -- and is then played by a
     scripted pointer posting to its `wlx serve` as the box's page does, reading the screens the rig
-    publishes: the rig's own eye rules score the look to the odd disc correct."""
+    publishes: the rig's own eye rules score the look to the odd disc correct. **Its pre-flight
+    says that `--set fix_hold=` does nothing** (the pop-out revision's whole-build review, M5): the
+    task draws `fix_hold` every trial."""
+    from wl_xcon.preflight import DRAWN_GIVEN
+
     demo = wlx.demo(str(_popout()), "--no-browser", "--trials", "1", *SHORT)
     started = _started(demo)
+    (values,) = [line for line in demo.out if line.startswith("wlx demo: pre-flight pass    "
+                                                              "starting values: ")]
+    assert f"{DRAWN_GIVEN} ('fix_hold')" in values, values
     trials = started["folder"] / "demo" / "sessions" / started["session"] / "xcon" / "trials.jsonl"
     screens = zmq_cleanup(ZmqConsole(started["link"][0], None, settle_s=0.0,
                                      receive_timeout_s=0.05))
@@ -558,12 +565,13 @@ def _ten_inputs(folder: Path) -> Path:
 
 
 def _off_the_field(folder: Path) -> Path:
-    """The reference task whose target may be placed 80° out, past any field a rig shows."""
+    """The reference task whose target starts 80° out, past any field a rig shows (its range, which
+    reached 80° here, is gone; an open side is judged at its start)."""
     text = (ROOT / "tasks" / "fixation_detection.py").read_text()
-    old = 'Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0)'
+    old = 'Param("target_x", unit="deg", start=10.0)'
     assert text.count(old) == 1
     path = folder / "off_the_field.py"
-    path.write_text(text.replace(old, old.replace("high=16.0", "high=80.0")))
+    path.write_text(text.replace(old, old.replace("start=10.0", "start=80.0")))
     return path
 
 

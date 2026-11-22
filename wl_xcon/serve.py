@@ -25,7 +25,9 @@ already runs, so no new dependency:
   since engine build C2a (`clear`, `drum`, `training`), since C3 a setting handed back,
   a drawn range changed live and a revert (`hand_back`, `range`, `revert`), and since the
   pop-out search build a block moved on or back naming the rig's suggestion it confirms, and a
-  hold of one (`next_block`, `back_block`, `decline`; `_WIRE_KINDS`).
+  hold of one (`next_block`, `back_block`, `decline`; `_WIRE_KINDS`), and since the console
+  interface rework several changes applied together and a waiting change withdrawn
+  (`apply_many`, `withdraw`), each naming its page's `cid`.
 - `POST /gaze` (demo mode §4.5) -- one pointer report from a demo's page, **gated exactly as
   `/commands` is** (`_writer`, the write checks factored out of `_command`; §14 item 13), never
   by `may_write`, then checked (`parse_gaze`), and, while the latest frame is a demo session's
@@ -777,6 +779,9 @@ _SHAPES = {
     "drum": frozenset({"scope"}),
     # The PI, 2026-10-18: the training aid *clear* and the percentage setting, switched.
     "training": frozenset({"setting", "on"}),
+    # The console settings build's Task 10 (the design's §8): the training switch, on, frozen or
+    # the plan's full task (`link.Shaping`).
+    "shaping": frozenset({"position"}),
     # Engine build C2b (the PI, 2026-10-19): a run moved on a block, or back one, by hand; since
     # the pop-out search build (2026-11-07) naming the rig's suggestion it confirms, where it
     # answers one, and the trainer's hold of one (`decline`; "Rig suggests, trainer confirms").
@@ -788,7 +793,27 @@ _SHAPES = {
     "hand_back": frozenset({"name"}),
     "range": frozenset({"name", "numbers"}),
     "revert": frozenset({"change"}),
+    # The console settings build (the PI, 2026-11-16): a timing setting switched to drawn on its
+    # card, a person's draw of one of its shapes (`link.SetForm`).
+    "form": frozenset({"name", "shape", "numbers", "values", "weights"}),
+    # And a color setting's hue picked by its set on its card (`link.SetColor`; the design's §6).
+    "color": frozenset({"name", "colorset", "color"}),
+    # And one of a setting's declared choices picked on its box by its words (`link.SetChoice`; the
+    # pop-out revision's Task 5b: a look's shape is a console setting).
+    "choice": frozenset({"name", "choice"}),
+    # And a new color defined three ways, saved as its set's proposed file (`link.DefineColor`; the
+    # design's §6, the build's Task 8).
+    "define_color": frozenset({"colorset", "new_set", "name", "method", "numbers"}),
+    # The console interface rework's Task 4 (the PI, 2026-11-19, "Apply per box, plus Apply all",
+    # and "Yes, a withdraw button"): several changes applied together, each a `set`, `range`,
+    # `form`, `color` or `choice` by its own fields (`_APPLIED`), and a waiting act withdrawn by its
+    # `cid`.
+    "apply_many": frozenset({"changes"}),
+    "withdraw": frozenset(),
 }
+#: **The kinds one change of an `apply_many` may be**, each by the fields its own command takes
+#: (`_SHAPES`), its `kind` among them, and never a `by` or a `cid`: the act's are the command's.
+_APPLIED = {kind: _SHAPES[kind] | {"kind"} for kind in _link.APPLY_KINDS}
 _SCHEDULES = {"at": "clock", "trials": "trials", "ml": "fluid"}
 #: The kinds `wlx taskd` takes (open, check, start, end and resume_session) that the page sends by the wire's own field names, built
 #: by the wire's own function (`link._command_from`; the b3a-2 plan, decision 3).
@@ -798,10 +823,15 @@ _SERVICE_KINDS = frozenset({"open", "check", "start", "end", "resume_session"})
 #: (`link._command_from`): the service's, since engine build C2a a run's `clear`, `drum` and
 #: `training`, since C3 its `hand_back`, `range` and `revert`, and since the pop-out search build
 #: `next_block`, `back_block` and `decline`, whose `suggestion` the wire checks
-#: (`link._suggestion`), which go to the run as any control does. A range's numbers are decoded
-#: there by `link._setting`, as a setting's value is.
+#: (`link._suggestion`), which go to the run as any control does, and since the console settings
+#: build `form`, `color`, `define_color` and `shaping`, since the console interface rework
+#: `apply_many` and `withdraw`, and since the pop-out revision's Task 5b `choice`. A range's
+#: numbers, a form's numbers, values and weights, and a new color's numbers, are decoded there by
+#: `link._setting`, as a setting's value is; a color's set and hue, and a choice's words, are words
+#: (`link._word`).
 _WIRE_KINDS = _SERVICE_KINDS | {"clear", "drum", "training", "hand_back", "range", "revert",
-                                "next_block", "back_block", "decline"}
+                                "next_block", "back_block", "decline", "form", "color", "choice",
+                                "define_color", "shaping", "apply_many", "withdraw"}
 
 
 def _finite(value: int | float) -> bool:
@@ -832,6 +862,76 @@ def _person(by: object) -> Box:
             f"{NAME_LIMIT} printable characters"
         )
     return Box(by.strip())
+
+
+#: The query fields `GET /color-preview` reads besides a method's numbers.
+_PREVIEW_FIELDS = ("set", "method")
+
+
+def _frame_sets(frame) -> dict:
+    """**Each color set a telemetry frame's cards describe**, by name, as a `colordef.Frame`: its
+    apex, luminance, design and hues' chromaticities as the rig sent them (`ParamRow.color`'s
+    `sets`). Empty for an idle frame, or none."""
+    from wl_xcon import colordef
+
+    found: dict = {}
+    for row in getattr(frame, "params", ()) or ():
+        sets = (row.color or {}).get("sets") if isinstance(row.color, dict) else None
+        for name, entry in (sets or {}).items():
+            if name in found or not isinstance(entry, dict):
+                continue
+            hues = entry.get("hues") if isinstance(entry.get("hues"), dict) else {}
+            found[name] = colordef.Frame(
+                name=name, apex=tuple(entry["apex"]),
+                luminance_cd_m2=float(entry["luminance_cd_m2"]),
+                design=dict(entry["design"]) if isinstance(entry.get("design"), dict) else None,
+                colors={hue: tuple(at["xy"]) for hue, at in hues.items()
+                        if isinstance(at, dict) and "xy" in at})
+    return found
+
+
+def color_preview(frame, query: dict) -> tuple[int, dict]:
+    """**`GET /color-preview`'s answer** (the console settings design's §6; its plan's Task 8): a new
+    color's chromaticity by `colordef.chromaticity`, in the set the latest frame's cards describe by
+    `set` (`_frame_sets`), or a new set's frame (`colordef.new_set`) for a name none describes, by
+    `method` and its numbers, each a query field holding one number. `{"x", "y", "srgb", "in_srgb",
+    "said"}`: x and y as the set's file would write them (`colordef.written`), which is what the rig
+    saves for the same numbers in the same set; its swatch on the sRGB standard at the set's
+    luminance and whether the standard shows it there (`colordef.swatch`), approximate on any
+    screen not measured; and a sentence. **Refused** (400, the numbers `None` and `said` why) for a
+    method, a number or a frame that defines no color. It writes nothing, so any viewer may ask."""
+    from wl_xcon import colordef
+
+    def refused(why: str) -> tuple[int, dict]:
+        return 400, {"x": None, "y": None, "srgb": None, "in_srgb": None, "said": why}
+
+    if any(len(values) != 1 for values in query.values()):
+        return refused("each field of a color preview is given once")
+    given = {key: values[0] for key, values in query.items()}
+    named, method = given.get("set", ""), given.get("method", "")
+    numbers = {}
+    for key, value in given.items():
+        if key in _PREVIEW_FIELDS:
+            continue
+        try:
+            number = float(value)
+        except ValueError:
+            return refused(f"a new color's {key} is {value!r}, not a number")
+        if not math.isfinite(number):
+            return refused(f"a new color's {key} is {value!r}, not a finite number")
+        numbers[key] = number
+    try:
+        within = _frame_sets(frame).get(named) or colordef.new_set(named, method, numbers)
+        x, y = colordef.written(colordef.chromaticity(within, method, numbers))
+        srgb, inside = colordef.swatch(within, (x, y))
+    except (ValueError, KeyError, TypeError) as why:
+        return refused(str(why))
+    outside = "" if inside else (", outside what the sRGB standard shows at the set's luminance, "
+                                 "so a panel like it desaturates the set to show it")
+    said = (f"{colordef.SAID[method]} ({colordef.numbers_words(method, numbers)}) in {named}: "
+            f"x {x:.5f}, y {y:.5f}{outside}; the swatch is approximate: this screen is not "
+            f"measured")
+    return 200, {"x": x, "y": y, "srgb": srgb, "in_srgb": inside, "said": said}
 
 
 def parse_command(data: object, actor: Member | None = None):
@@ -866,9 +966,23 @@ def parse_command(data: object, actor: Member | None = None):
             )
         by = actor
         allowed = {"kind"}
+    if kind in _link.CID_KINDS:
+        # **A box's command id rides beside the command** (schema 23; the console interface
+        # design's goal 4): the page's own name for the press, which the verdict echoes, decoded
+        # by the wire's rule (`link._cid`), never as a value.
+        allowed |= {"cid"}
     extra = set(data) - allowed - _SHAPES[kind]
     if extra:
         raise BadCommand(f"a {kind} command takes no {', '.join(sorted(extra))}")
+    if kind == "apply_many" and isinstance(data.get("changes"), list):
+        # Each change by its own kind's fields, as a command of that kind is refused one it does
+        # not take; what each is, and how many, the wire's rule says (`link._changes`).
+        for change in data["changes"]:
+            named = change.get("kind") if isinstance(change, dict) else None
+            taken = _APPLIED.get(named) if isinstance(named, str) else None
+            if taken is not None and set(change) - taken:
+                raise BadCommand(f"a {change['kind']} change in an apply_many takes no "
+                                 f"{', '.join(sorted(set(change) - taken))}")
     if kind in _WIRE_KINDS:
         try:
             return _link._command_from({**data, "by": actors.to_map(by)})
@@ -880,9 +994,10 @@ def parse_command(data: object, actor: Member | None = None):
             raise BadCommand("a setting names its parameter")
         try:
             value = _link._setting(data.get("value"), name, by)
+            cid = _link._cid(data, kind, by)
         except _link.CommandRefused as refused:
             raise BadCommand(refused.why) from refused
-        return _link.SetParameter(name=name, value=value, by=by)
+        return _link.SetParameter(name=name, value=value, by=by, cid=cid)
     if kind == "schedule":
         given = [key for key in _SCHEDULES if key in data]
         if len(given) != 1:
@@ -1879,8 +1994,12 @@ def make_handler(
             path = self._path()
             if path == "/":
                 self._page()
+            elif path == "/color-preview":
+                # A new color's preview (the console settings build's Task 8): it writes nothing,
+                # so any viewer may ask, and its fields are its query string.
+                self._color_preview()
             elif "?" in self.path:
-                self._refuse_method()  # only the page takes a query string
+                self._refuse_method()  # only the page and a preview take a query string
             elif path == "/events":
                 self._events()
             elif path == "/health":
@@ -1894,6 +2013,28 @@ def make_handler(
                 # 405 for a known path that takes another method -- `/commands`,
                 # since b2a -- and 404 for anything else.
                 self._refuse_method()
+
+        def _color_preview(self) -> None:
+            """`color_preview` on the latest frame, its fields the query string's."""
+            from urllib.parse import parse_qs, urlsplit
+
+            latest, _ = self._hub.snapshot(on_box=on_box(self.client_address[0]),
+                                           stale_after_s=self._stale_after_s)
+            # **At most 16 fields** (TSK-75: a fixed number says its reason): any viewer may ask
+            # for a preview, so the parse is bounded rather than left to the query's length; a
+            # well-formed one names at most five -- `set`, `method` and a method's numbers, at most
+            # three (`colordef.NUMBERS`, `OPTIONAL`, `FRAMING`). Why 16 rather than five was not
+            # written down when the console settings build's Task 8 chose it: a margin above
+            # five, the builder's.
+            try:
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True,
+                                 max_num_fields=16)
+            except ValueError:
+                code, answer = 400, {"x": None, "y": None, "srgb": None, "in_srgb": None,
+                                     "said": "a color preview takes at most 16 fields"}
+            else:
+                code, answer = color_preview(latest, query)
+            self._send_json(code, answer)
 
         def _font(self, font) -> None:
             """A bundled font (PI, 2026-09-26: "bundle the fonts"). Cached a day: the

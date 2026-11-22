@@ -27,7 +27,7 @@ from wl_xcon.marks import TIME_FORMATS as _TIME_FORMATS
 from wl_xcon.marks import clock_or_now as _clock_or_now
 from wl_xcon.marks import clock_time as _wall_clock_time
 from wl_xcon.bounds import Bounds, Exceeded, _finite
-from wl_xcon.check import check_task, impossible, unplaced, unpooled, unshowable, unstarted
+from wl_xcon.check import check_task, impossible, in_reach, unplaced, unpooled, unstarted
 from wl_xcon.findings import SESSION_KINDS
 from wl_xcon.review import position_words
 from wl_xcon.review import render_task as render_review
@@ -1230,8 +1230,10 @@ def render(frame: _link.Telemetry | _link.Idle) -> str:
         # A whole position in the rig's words, eccentricity and direction first, its unit in
         # them (`ParamRow.position`, schema 18; XC-401): the line `wlx console` already has,
         # though it shows none of schema 16's, 17's and 19's additions (XC-387).
+        # And a look or a color in the rig's words (`ParamRow.words`, schema 22; XC-420).
         shown = (
             _printable(row.position) if row.position is not None
+            else _printable(row.words) if row.words is not None
             else _with_unit(_shown(value), unit)
         )
         if row.bounded:
@@ -1562,13 +1564,17 @@ def main(argv: list[str] | None = None) -> int:
         "command the link accepts: `set` (change a setting, a reward volume among "
         "them), `stop`, `pause`, `resume`, `reward` (a manual reward, "
         "while paused), `schedule` and `cancel` (a scheduled stop), `mark` (a mark's "
-        "note), `clear`, `drum`, `training`, `next_block`, `back_block`, `decline`, `hand_back`, "
-        "`range`, and `revert` (the run's counts, blocks, settings and draws), and the "
-        "five only `wlx taskd` acts on, which a `wlx run` session refuses: `open` (open "
+        "note), `clear`, `drum`, `training`, `shaping`, `next_block`, `back_block`, `decline`, "
+        "`hand_back`, `range`, `form`, `color`, `choice` (one of a setting's choices, by its "
+        "words), `apply_many` (several settings together), "
+        "`withdraw` (a waiting change taken back) and `revert` (the run's counts, blocks, "
+        "settings and draws), and the "
+        "six only `wlx taskd` acts on, which a `wlx run` session refuses: `open` (open "
         "a session, recording the departure time and the fluid the animal has already "
         "had today, and accepting warnings), `check`, `start` (start a run, "
         "acknowledging unknown pre-flight items), `end` (end a session, recording the "
-        "return time), and `resume_session`; "
+        "return time), `resume_session`, and `define_color` (write a new color as a color "
+        "set's proposed file beside the tasks folder); "
         "any host that can reach the MARK port can put marks on the record. S9a §6 "
         "designs the real thing and it is P4d-3's; this flag does not make a remote "
         "bind safe, only deliberate",
@@ -1763,12 +1769,14 @@ def main(argv: list[str] | None = None) -> int:
         "invented name, send every command it accepts: here `open` (open a session, "
         "recording the departure time and the fluid the animal has already had today, "
         "and accepting warnings), `check`, `start` (start a run, acknowledging unknown "
-        "pre-flight items), `end` (end a session, recording the return time), and "
-        "`resume_session`, and `wlx run`'s as well: `set` (a reward volume among the "
+        "pre-flight items), `end` (end a session, recording the return time), "
+        "`resume_session`, and `define_color` (write a new color as a color set's proposed "
+        "file beside the tasks folder), and `wlx run`'s as well: `set` (a reward volume among the "
         "settings), `stop` and `pause` (of the run), `resume`, `reward` (a manual "
         "reward, also while the animal's return is awaited), `schedule`, `cancel`, "
-        "`mark`, `clear`, `drum`, `training`, `next_block`, `back_block`, `decline`, `hand_back`, "
-        "`range`, and `revert`; see `wlx run "
+        "`mark`, `clear`, `drum`, `training`, `shaping`, `next_block`, `back_block`, `decline`, "
+        "`hand_back`, `range`, `form`, `color`, `choice`, `apply_many`, `withdraw` and `revert`; "
+        "see `wlx run "
         "--link-allow-remote` for the rest of what it exposes",
     )
 
@@ -1996,6 +2004,16 @@ def main(argv: list[str] | None = None) -> int:
                     f"{_printable(str(refused))}"
                 ) from refused
 
+        # **A starting luminance the panel cannot show its color set at starts at the panel's
+        # reachable top** (`check.in_reach`; the PI, 2026-11-20, "Start at the brightest it
+        # can, warn"), its warning among the session's below, which `--accept-warnings` accepts;
+        # `Session.run` starts at the same value. One no value its setting allows shows is refused
+        # below, before the session opens.
+        reached, lowered, unreachable = in_reach(
+            task, {**{p.name: p.start for p in task.params if p.start is not None}, **values},
+            calibration)
+        values.update(reached)
+
         # **A place with no value, refused before the session opens** (XC-415; the PI,
         # 2026-10-30, "Refuse to start"; the review of its fix, I2): a setting placing a window, a
         # stimulus, an update or an array's objects, or sizing a window, that neither the task's
@@ -2013,10 +2031,10 @@ def main(argv: list[str] | None = None) -> int:
         # whose trials would have nothing to draw, refused here for the same reason.
         unset += unpooled(
             task, {**{p.name: p.start for p in task.params if p.start is not None}, **values})
-        # And a luminance the panel cannot show a color set at (`check.unshowable`; XC-494).
-        unset += unshowable(
-            task, {**{p.name: p.start for p in task.params if p.start is not None}, **values},
-            calibration)
+        # And a luminance the panel cannot show a color set at, at any value its setting allows
+        # (`check.in_reach`; XC-494). Each named by its setting (the re-review's N4), as the
+        # pre-flight names it.
+        unset += [(name, f"{name!r}: {said}") for name, said in unreachable]
         if unset:
             raise SystemExit(
                 "task refused, session not started, nothing recorded: "
@@ -2056,6 +2074,7 @@ def main(argv: list[str] | None = None) -> int:
             + warnlist.of_deployment(deployment)
             + setup
             + warnlist.of_findings(findings)
+            + warnlist.of_findings(lowered)
         )
         outside = warnlist.refused(warnings, args.session_kind)
         if outside:

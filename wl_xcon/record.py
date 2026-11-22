@@ -113,14 +113,28 @@ CONTROLS = "controls.jsonl"
 #: `{"correct", "of"}` -- and `at_hardest`), and a person's hold of one (`declined`: `was` and
 #: `now` the stage it stays in, and the `suggestion` it answers, the suggested row's `change`); a
 #: confirmation is the `next_block` or `back_block` row of `CONTROLS`, naming that `suggestion`.
-#: **Appended only**, after `training`: `STROBED` is the first four by place.
+#: **Since the console settings build (2026-11-17), a person's form** (`form`: a timing setting
+#: switched to drawn on its card, `now` its draw every field, its `shape` beside; XC-513, the ask in
+#: `docs/pending-wl-preproc-amendments.md`), and **the training switch** (`shaping`, which the
+#: build's Task 10 writes: `name` `"shaping"`, `was` and `now` its positions, `meaning` null, no
+#: `sequence`). **Since the console interface rework (2026-11-19), a change withdrawn while it
+#: waited** (`withdrawn`, which `taskd.Session._withdraw` writes; XC-529, the ask in
+#: `docs/pending-wl-preproc-amendments.md`): one row for each setting the withdrawn act covered,
+#: sharing one fresh `change` id taken as it is withdrawn, `was` and `now` equal -- what the setting
+#: held and holds, null where a draw, a staircase, a pool or the conditions give it -- `meaning`
+#: null, no `sequence`, `event_code` null, and its own `cid` (the page's id for the Apply taken
+#: back), `withdrawn` (`{"kind", "now"}`: the row it would have been) and `staged_by` (who sent it,
+#: an actor map or null). **Appended only**: a reader keys on the
+#: names, and `STROBED` names its kinds.
 KINDS = ("set", "hand_back", "range", "revert", "clear", "drum", "training", "suggested",
-         "declined")
+         "declined", "form", "shaping", "withdrawn")
 
 #: **The kinds that strobe `PARAM_CHANGED`**, once for each row, and so carry its `sequence`, which
-#: joins the n-th such row to the n-th such code (XC-288 §3.4): the first four `KINDS`. A clear,
-#: a switch, a suggestion and a hold strobe nothing.
-STROBED = KINDS[:4]
+#: joins the n-th such row to the n-th such code (XC-288 §3.4), **by name** (it was the first four
+#: `KINDS` by place until `form`, appended after `declined`, strobed too; XC-513): a person's
+#: value, a hand-back, a live range, a revert's rows and a person's form. A clear, a switch, a
+#: suggestion, a hold, the training switch and a withdrawal strobe nothing.
+STROBED = ("set", "hand_back", "range", "revert", "form")
 
 #: One row when each run starts and one when it ends (P4d-2b spec §6.3), joined by
 #: `run`: the task, the allocation and their versions, the values and the bounded values
@@ -247,15 +261,23 @@ def _written(value: object) -> object:
     (`photometry.ColorSetLight`, the pop-out search's colors) **names its set by the set's name
     alone** (`canonical`'s `sets_by_name`; the pop-out search build's final fixes, 2026-11-07, told
     to wl-preproc before it was written): `{"class": "ColorSetLight", "fields": {"color": "blue",
-    "colorset": "isohue", "fraction": 1.0}}`, the set itself -- its colors, apex, held luminance and
-    source, and how the rig drew it -- defined once in each run's start row (`color_sets`), where
-    written whole it rode every trial line once per look, about 3.9 KB a line.
+    "colorset": "isohue", "fraction": 1.0, "luminance": null, "saturation": 1.0}}` -- **its
+    `saturation` always written** (the console settings build, accepted by wl-preproc 2026-11-18:
+    a number, or a setting by reference), the chromaticity it is drawn at its look's `light_xy`
+    beside it on the line (`_stimuli`), so a reader computes its light from that and the
+    realization (`photometry.colorset_xyz`'s rule) -- the set itself -- its colors, apex, held luminance,
+    source and `design`, and how the rig drew it, each realization with its calibration's
+    `macaque_row` -- defined once in each run's start row (`color_sets`), where written whole it
+    rode every trial line once per look, about 3.9 KB a line.
 
     **A draw** (`task.Distribution`: a task's, a block's or a condition's own range) **is written
     the same way, every field** (engine build C3's call 12; the controller's ruling 2 of
     2026-10-30), its `repeat` among them: `{"class": "Uniform", "fields": {"low": -10.0, "high":
     10.0, "repeat": "fresh"}}`, so a reader never needs this build's defaults. A value drawn from
-    one is written as the value it is.
+    one is written as the value it is. **A size scaled by eccentricity** (`task.Scaled`, a person's
+    form for a size setting; the console settings design's §5) is a trial line's `params` value
+    for its setting, written so too, `{"class": "Scaled", "fields": {"factor": 0.3}}`, each
+    object's size in degrees beside it in `stimuli` (`_stimuli`'s `size_deg`).
 
     **Anything else raises `TypeError`**, as `json` does: a `Polar` holding a setting, or a bare
     setting reference, is no value, and a record never writes a stand-in for one; nor does it write
@@ -264,7 +286,7 @@ def _written(value: object) -> object:
     from wl_xcon.geometry import polar_deg, shown_direction
     from wl_xcon.look import Edge, Fill, Outline, Shape
     from wl_xcon.photometry import Color, Contrast
-    from wl_xcon.task import Appearance, Distribution, Polar
+    from wl_xcon.task import Appearance, Distribution, Polar, Scaled
 
     def number(field: object) -> bool:
         return isinstance(field, (int, float)) and not isinstance(field, bool)
@@ -276,7 +298,8 @@ def _written(value: object) -> object:
         direction = None if value.eccentricity == 0 else shown_direction(value.direction)
         return {"eccentricity": value.eccentricity + 0, "direction": direction, "x": x + 0.0,
                 "y": y + 0.0}
-    if isinstance(value, (Appearance, Color, Contrast, Shape, Fill, Edge, Outline, Distribution)):
+    if isinstance(value, (Appearance, Color, Contrast, Shape, Fill, Edge, Outline, Distribution,
+                          Scaled)):
         return canonical(value, every_field=True, sets_by_name=True)
     raise TypeError(f"the record writes no {type(value).__name__} value ({value!r})")
 
@@ -286,7 +309,39 @@ def _written(value: object) -> object:
 _UNREADABLE = (KeyError, TypeError, ValueError, IndexError, ArithmeticError)
 
 
-def _stimuli(placed: tuple, values: dict) -> list[dict]:
+def _light_xy(looks, values: dict, calibration) -> "list[float] | None":
+    """**The CIE 1931 `[x, y]` of the light a look is drawn in, where a color set's light draws it**
+    (`photometry.ColorSetLight`; its `light_xy`, accepted by wl-preproc 2026-11-18): a sized look's
+    `color` (`Disc`, `Square`, `Cross`, `Polygon`) or a `Look`'s flat fill's, bound from `values`,
+    at its saturation and after any move into the gamut (`photometry.colorset_xy`); `None` for
+    any other look or light, with no calibration, and where it cannot be read."""
+    from wl_xcon.look import Flat, Look
+    from wl_xcon.photometry import ColorSetLight, colorset_xy
+    from wl_xcon.task import SIZED_LOOKS, P
+
+    def value(field):
+        return values.get(field.name) if isinstance(field, P) else field
+
+    looks = value(looks)
+    if isinstance(looks, SIZED_LOOKS):
+        light = value(looks.color)
+    elif isinstance(looks, Look) and isinstance(looks.fill, Flat):
+        light = value(looks.fill.color)
+    else:
+        return None
+    if not isinstance(light, ColorSetLight) or calibration is None:
+        return None
+    try:
+        bound = ColorSetLight(light.colorset, light.color, fraction=value(light.fraction),
+                              luminance=value(light.luminance),
+                              saturation=value(light.saturation))
+        (x, y), _ = colorset_xy(bound, calibration)
+    except _UNREADABLE:
+        return None
+    return [float(x) + 0.0, float(y) + 0.0]
+
+
+def _stimuli(placed: tuple, values: dict, windows: tuple = (), calibration=None) -> list[dict]:
     """**Where each stimulus a trial showed was** (XC-399; the PI, 2026-10-19, "Record both, tell
     wl-preproc"), as its line writes it: one entry for each `Show` and each `Update` the trial drew,
     in the order they took effect (`run.Result.placed`).
@@ -303,16 +358,38 @@ def _stimuli(placed: tuple, values: dict) -> list[dict]:
     null at eccentricity 0** (`geometry.shown_polar`; the PI, 2026-10-30, "0 to 360 everywhere" and
     "Empty at center"), so straight down is 270, never -90. **An array** adds `objects`, each
     object's, in index order, on its true circle about its center (`task.Array.positions`, as the
-    screen places them), and `target`, the index of the object it declares the target. **A
+    screen places them), each with `drawn`, false at a place left empty (a `Blank`), and `target`,
+    the index of the object it declares the target, with `found_by` and `odd_place`: an array with
+    no target (`found_by` `"none"`, a catch) writes `target` null and the index it declares, the
+    place an odd one would hold, as `odd_place`, null on every other array (XC-543; wl-preproc,
+    2026-11-19). **A
     stimulus drawn by per-eye positions** (engine spec §5.4) is drawn at no cyclopean position, so
     those four are null and `left` and `right` give each eye's own, in that eye's frame.
+
+    **And each size, in degrees, as drawn at its place** (the console settings design's §5; the
+    wl-preproc ask of 2026-11-17, group 2): every entry's `size_deg`, its look's `size` at its
+    cyclopean place (`task.size_at`: a fixed size as itself, a scaled one its factor times that
+    place's true eccentricity), null for an array, whose objects carry theirs, for a look with no
+    single `size`, and where it cannot be read; and each of an array's `objects` its own
+    `size_deg` and `window_deg`, its object window's radius in degrees (`windows`, the trial's
+    `ObjectWindows`; `ObjectWindows.radius_at`), both keys always written, `window_deg` null where
+    the array has no object window.
+
+    **And the light each look is drawn in** (the PI's CAM16-UCS answer of 2026-11-18; accepted by
+    wl-preproc 2026-11-18 as named): every entry's and each of an array's `objects`' `light_xy`,
+    the CIE 1931 `[x, y]` of the light, where a color set's light draws it (`ColorSetLight`), after
+    its saturation and any move into the gamut its realization made (`_light_xy`,
+    `photometry.colorset_xy`) on `calibration`, the run's; null for an array's own entry (its
+    objects carry theirs), for a look in no color set's light, and where it cannot be read; the key
+    always written. A reader's light at any saturation: `u = (x/y, 1, (1 − x − y)/y)`, `L =
+    fraction × luminance`, `XYZ = u × L / (macaque_row · u)`.
 
     **Never raises on a position** (the review's I1): one naming a setting with no value, or one
     that cannot be read, is written null with why in `unresolved` (null when everything resolved),
     so a trial that ran and paid always has its line. Computed as the line is written, between
     trials, never in a frame."""
     from wl_xcon.geometry import shown_polar
-    from wl_xcon.task import Array, Blank, P, Polar, position_of
+    from wl_xcon.task import SIZED_LOOKS, Array, Blank, P, Polar, position_of, size_at
 
     def value(field):
         """A field as it stands: a setting's value, `None` where it has none."""
@@ -340,6 +417,21 @@ def _stimuli(placed: tuple, values: dict) -> list[dict]:
         eccentricity, direction = shown_polar(x, y)
         return {"eccentricity": eccentricity, "direction": direction, "x": x + 0.0, "y": y + 0.0}
 
+    def size_of(looks, place) -> "float | None":
+        """A sized look's size at `place`, in degrees; `None` where it has none or it cannot be
+        read."""
+        looks = value(looks) if isinstance(looks, P) else looks
+        if not isinstance(looks, SIZED_LOOKS) or place is None:
+            return None
+        size = value(looks.size)
+        if size is None:
+            return None
+        try:
+            return size_at(size, place) + 0.0
+        except _UNREADABLE:
+            return None
+
+    families = {declared.of: declared for declared in windows}
     nowhere = {"eccentricity": None, "direction": None, "x": None, "y": None}
     entries = []
     for stimulus, frame, kind, changed, _, off in placed:
@@ -368,9 +460,35 @@ def _stimuli(placed: tuple, values: dict) -> list[dict]:
                     reasons.append(why(missing))
                 else:
                     try:
-                        entry["objects"] = [where(*p) for p in looks.positions(values, (x, y))]
+                        places = looks.positions(values, (x, y))
+                        entry["objects"] = [where(*p) for p in places]
                     except _UNREADABLE as fault:
                         reasons.append(f"its objects could not be placed ({fault})")
+                    else:
+                        family = families.get(stimulus.name)
+                        for index, (place, object_entry) in enumerate(
+                                zip(places, entry["objects"])):
+                            try:
+                                own = looks.object_looks(index, values)
+                            except _UNREADABLE:
+                                own = None
+                            # **Whether the object was drawn** (XC-543, accepted 2026-11-19):
+                            # false at a place left empty, a `Blank`; null where its look is a
+                            # setting with no value, or cannot be read.
+                            shown = value(own) if isinstance(own, P) else own
+                            object_entry["drawn"] = (None if shown is None
+                                                     else not isinstance(shown, Blank))
+                            object_entry["size_deg"] = size_of(own, place)
+                            object_entry["light_xy"] = _light_xy(own, values, calibration)
+                            object_entry["window_deg"] = None
+                            if family is not None:
+                                try:
+                                    radius = family.radius_at(looks, index, place, values)
+                                    radius = value(radius) if isinstance(radius, P) else radius
+                                    object_entry["window_deg"] = (
+                                        None if radius is None else float(radius) + 0.0)
+                                except _UNREADABLE:
+                                    pass
             return entry
 
         entry = {"name": stimulus.name, "kind": kind, "frame": frame, "off": off,
@@ -382,13 +500,27 @@ def _stimuli(placed: tuple, values: dict) -> list[dict]:
                          right=None if stimulus.at_right is None else at(stimulus.at_right))
         else:
             entry.update(at(stimulus.at))
+        try:
+            cyclopean = None if unset(stimulus.at) else position_of(stimulus.at, values)
+        except _UNREADABLE:
+            cyclopean = None
+        entry["size_deg"] = None if array else size_of(looks, cyclopean)
+        # **The light it is drawn in** (`_light_xy`; wl-preproc, 2026-11-18): null for an array,
+        # whose objects carry theirs.
+        entry["light_xy"] = None if array else _light_xy(looks, values, calibration)
         if array:
-            entry["target"] = None
+            # **What names its target, and the place an odd one would hold** (XC-543, wl-preproc's
+            # answer of 2026-11-19): an array with no target (`found_by` "none", a catch) writes
+            # `target` null and the index it declares as `odd_place`; every other array its target
+            # and `odd_place` null. Both keys always written, as `size_deg` is.
+            entry["found_by"] = looks.found_by
+            entry["target"] = entry["odd_place"] = None
+            place = "odd_place" if looks.found_by == "none" else "target"
             if unset(looks.target):
                 reasons.append(why(unset(looks.target)))
             else:
                 try:
-                    entry["target"] = int(value(looks.target))
+                    entry[place] = int(value(looks.target))
                 except _UNREADABLE as fault:
                     reasons.append(f"its target could not be read ({fault})")
         entry["unresolved"] = "; ".join(dict.fromkeys(reasons)) or None
@@ -473,6 +605,11 @@ class SessionRecord:
         eased: tuple = (),
         planned: dict | None = None,
         color_realized: dict | None = None,
+        object_windows: tuple = (),
+        shaping: str = "on",
+        calibration=None,
+        trial_kind: str | None = None,
+        stepped: bool | None = None,
     ) -> list[dict]:
         """One trial's record, flushed before returning.
 
@@ -534,10 +671,23 @@ class SessionRecord:
         kind, frame and `off`, its (x, y) and its true eccentricity and direction beside them, a
         position that cannot be resolved written null with why, never raised. Required, as
         `position` is: a line written without it would say the trial showed nothing, and nothing
-        would say so. **Returns the line's `stimuli`**, so the session can say on the changes feed
+        would say so. Each with its size in degrees at its place, and each array object's its own
+        and its object window's radius (`size_deg`, `window_deg`), from `object_windows`, the
+        trial's `ObjectWindows` (the console settings design's §5). **And the training switch for
+        it** (`shaping`, one of `task.SHAPING`: `"on"`, `"frozen"` or `"full"`; the console
+        settings design's §8, XC-513's group 4), so a reader tells a frozen trial, which counted
+        toward no bar, and one of the full task from training as declared, its values the full
+        task gave each named `drawn: "full"`. And each look's `light_xy` on `calibration`, the
+        run's (`_stimuli`). **And its kind, and whether it stepped** (the pop-out revision's Task 3;
+        wl-preproc accepted both on 2026-11-19, XC-543, renaming the first): `trial_kind`,
+        `"normal"` or a special kind's name (`task.Special`) in a task declaring special trials,
+        null in one declaring none, its `structure` the structure it played; `stepped`, whether its
+        outcome counted on its block's staircase, a success or a failure on a trial whose value the
+        staircase gave -- false where it moved nothing on it (a special trial, a value a person
+        held, an outcome that is neither, a frozen trial), null where no staircase runs. **Returns the line's `stimuli`**, so the session can say on the changes feed
         that one could not be resolved (`taskd`, once a run).
         """
-        stimuli = _stimuli(placed, params)
+        stimuli = _stimuli(placed, params, object_windows, calibration)
         if self._trials is None:
             self._trials = (self.directory / "trials.jsonl").open("a", encoding="utf-8")
         self._trials.write(
@@ -562,6 +712,8 @@ class SessionRecord:
                     "drumming": drumming,
                     "aids": list(aids),
                     "structure": structure,
+                    "trial_kind": trial_kind,
+                    "stepped": stepped,
                     "overridden": list(overridden),
                     "drawn": {} if drawn is None else dict(drawn),
                     "live": list(live),
@@ -569,6 +721,7 @@ class SessionRecord:
                     # not move, `planned` null outside a designed block.
                     "eased": list(eased),
                     "planned": planned,
+                    "shaping": shaping,
                     # The pop-out search build's fix round: each color set this trial drew at a
                     # luminance its run had not yet written, realized on the run's panel, by set
                     # name (`taskd.Session._realize`); null on every other line. Named

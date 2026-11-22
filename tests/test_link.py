@@ -69,6 +69,7 @@ from wl_xcon.link import (
     SchemaMismatch,
     ShortfallRow,
     Simulated,
+    SetForm,
     SetParameter,
     Staged,
     NextBlock,
@@ -177,6 +178,8 @@ def _session_with(
         stopped_because="",
         staged=(),
         refusals=(),
+        # `Session.answers` (schema 23): what each refusal answers, one for each, here none.
+        answers=(),
         # Stand-ins for `Session.parameters` and `Session.recent_outcomes` (P4d-2b
         # b1): the shapes `Telemetry.of` reads, as `staged` and `refusals` are. Each setting's
         # choices seventh since schema 18 (XC-401's fix round, M2), and where its value comes from
@@ -243,6 +246,14 @@ def _session_with(
         staircase=None,
         bars=None,
         pooled=None,
+        # `Session.shaping` and `.full_task` (schema 22, the console settings build's Task 10): a
+        # run with no training to switch.
+        shaping="",
+        full_task=False,
+        # `Session.groups` (schema 23, the console interface rework's Task 7): a task with none.
+        groups=(),
+        # `Session.withdrawals` (schema 23, the whole-build review's I1): nothing withdrawn.
+        withdrawals=(),
     )
 
 
@@ -705,14 +716,17 @@ def test_the_commands_said_to_be_wlx_taskds_alone_are_the_services_own():
     """The review's M3: the sentence says which service acts on each kind, and nothing held
     the half that says `wlx taskd` alone. The kinds the table gives to `taskd` are the ones
     the service takes between runs and a `wlx run` session refuses
-    (`service._SERVICE_COMMANDS`), read from there and never copied."""
+    (`service._SERVICE_COMMANDS`), and those it takes in any phase, which a `wlx run` session
+    refuses too (`service._ANY_PHASE`, since the console settings build's Task 8), read from there
+    and never copied."""
     import wl_xcon.link as link_module
     from wl_xcon import service
 
     said = {
         kind for kind, (who, _) in link_module._COMMAND_EXPOSURE.items() if who == "taskd"
     }
-    assert said == {command.KIND for command in service._SERVICE_COMMANDS}
+    assert said == {command.KIND
+                    for command in (*service._SERVICE_COMMANDS, *service._ANY_PHASE)}
 
 
 def test_the_refusal_says_what_a_command_does_in_each_service_and_reads_as_two_lists():
@@ -727,7 +741,7 @@ def test_the_refusal_says_what_a_command_does_in_each_service_and_reads_as_two_l
     assert "pause the session, or in `wlx taskd` its run" in said
     assert "between runs or while its return is awaited" in said
     assert "the fluid it has already had today" in said and "accepting warnings" in said
-    assert ", and `revert` (" in said and ", and `resume_session` (" in said
+    assert ", and `revert` (" in said and ", and `define_color` (" in said
 
 
 def test_which_endpoints_count_as_leaving_this_machine():
@@ -901,6 +915,7 @@ def test_telemetry_caps_the_refusal_feed_and_counts_what_it_dropped():
         (f"param_{n}", "jake", "not a parameter this task declares")
         for n in range(REFUSAL_HISTORY + 3)
     )
+    session.answers = ((None, None),) * len(session.refusals)
     session.link = Simulated(
         refused=[Refused(name="<transport>", by=None, why="newest")],
         refused_dropped=7,
@@ -2505,7 +2520,7 @@ def test_schema_8_reads_the_pause_the_schedule_and_the_feed_from_the_session():
 
     telemetry = Telemetry.of(session, Tally(), _scheduler(), index=40)
 
-    assert telemetry.schema == SCHEMA == 21
+    assert telemetry.schema == SCHEMA == 23
     assert telemetry.paused_at == 1_700_000_100.0
     assert telemetry.scheduled_stop == ScheduledStop(
         kind="trials", target=48.0, by=Box("jake"), said="after trial 48"
@@ -2568,15 +2583,15 @@ def test_a_frame_carries_the_setup_the_session_runs_in():
     assert decode(encode(stereo)).view == "stereoscope"
     assert decode(encode(stereo)).half_ipd_cm == 1.6
     assert decode(encode(_telemetry())).half_ipd_cm is None
-    assert SCHEMA == 21
+    assert SCHEMA == 23
 
 
-def test_a_schema_7_frame_is_refused_by_a_schema_21_reader():
-    """§3's schema rule: a reader built for 21 refuses 7 by name, before touching a
+def test_a_schema_7_frame_is_refused_by_a_schema_22_reader():
+    """§3's schema rule: a reader built for 22 refuses 7 by name, before touching a
     field (`SchemaMismatch`), and says which it reads."""
     old = encode(replace(_telemetry(), schema=7))
 
-    with pytest.raises(SchemaMismatch, match="carried schema 7 and this console reads schema 21"):
+    with pytest.raises(SchemaMismatch, match="carried schema 7 and this console reads schema 23"):
         decode(old)
 
 
@@ -2750,7 +2765,7 @@ def test_schema_10_survives_the_wire_with_its_absences_intact():
         assert decode(encode(original)) == original
     assert type(decode(encode(populated)).preflight.items[0]) is PreflightItem
     assert type(decode(encode(populated)).question) is Question
-    assert SCHEMA == 21
+    assert SCHEMA == 23
 
 
 def test_a_session_before_its_first_run_has_no_block_task_or_counts():
@@ -2806,7 +2821,7 @@ def test_an_idle_frame_carries_the_last_closed_sessions_summary_across_the_wire(
     assert type(restored.closed) is Telemetry and restored.closed.phase == "closed"
     assert (restored.closed.fluid_today_ml, restored.closed.shortfall_ml) == (None, None)
     assert decode(encode(replace(idle, closed=None))).closed is None
-    assert SCHEMA == 21
+    assert SCHEMA == 23
 
 
 def test_idle_of_carries_what_it_is_given_as_the_closed_summary():
@@ -2828,7 +2843,7 @@ def test_an_idle_frame_of_another_schema_is_refused_by_name():
         )
     )
 
-    with pytest.raises(SchemaMismatch, match="carried schema 13 and this console reads schema 21"):
+    with pytest.raises(SchemaMismatch, match="carried schema 13 and this console reads schema 23"):
         decode(old)
 
 
@@ -2972,7 +2987,7 @@ def test_the_strips_levels_and_the_return_survive_the_wire():
     assert decode(encode(original)) == original
     # 12 added `performance` (the strip's session, task, run and block counts) and
     # `returned_at` (the recorded return).
-    assert SCHEMA == 21
+    assert SCHEMA == 23
 
 
 def test_a_frame_between_runs_carries_the_session_alone():
@@ -3050,7 +3065,7 @@ def test_the_instant_a_session_was_resumed_survives_the_wire_and_none_stays_none
     assert decode(encode(resumed)).resumed_at == 1_700_000_050.0
     assert decode(encode(_telemetry())).resumed_at is None
     # 13 added `Stranded.resumable` and `why`, and `Telemetry.resumed_at`.
-    assert SCHEMA == 21
+    assert SCHEMA == 23
 
 
 def test_the_frame_reads_the_resume_from_the_session():
@@ -3067,7 +3082,7 @@ def test_the_frame_reads_the_resume_from_the_session():
 def test_a_schema_13_frame_is_refused_by_name():
     """b2b (schema 14): a frame whose `by`s are strings is refused by its schema, by
     name, before any `by` is read."""
-    with pytest.raises(SchemaMismatch, match="carried schema 13 and this console reads schema 21"):
+    with pytest.raises(SchemaMismatch, match="carried schema 13 and this console reads schema 23"):
         decode(encode(replace(_telemetry(), schema=13)))
 
 
@@ -3104,7 +3119,7 @@ def test_schema_15_carries_the_kind_the_calibration_and_the_warnings_both_ways()
         warnings=(WarningRow("default calibration", "the standard's", SESSION_KINDS, None, None),),
     )
 
-    assert (sent.schema, decode(encode(sent))) == (21, sent)
+    assert (sent.schema, decode(encode(sent))) == (23, sent)
     assert type(decode(encode(sent)).warnings[0]) is WarningRow
     assert decode(encode(unloaded)).calibration is None
     assert decode(encode(idle)) == idle
@@ -3143,7 +3158,7 @@ def test_schema_16_carries_each_shortfall_drumming_the_training_aids_and_each_co
         only = replace(sent, rule="streak", **flags)
         assert decode(encode(only)) == only
     assert decode(encode(replace(sent, rule=None))).rule is None
-    with pytest.raises(SchemaMismatch, match="carried schema 15 and this console reads schema 21"):
+    with pytest.raises(SchemaMismatch, match="carried schema 15 and this console reads schema 23"):
         decode(encode(replace(sent, schema=15)))
 
 
@@ -3231,7 +3246,7 @@ def test_a_schema_14_frame_of_either_shape_is_refused_by_name():
 
     for old in (replace(_telemetry(), schema=14), idle):
         with pytest.raises(
-                SchemaMismatch, match="carried schema 14 and this console reads schema 21"):
+                SchemaMismatch, match="carried schema 14 and this console reads schema 23"):
             decode(encode(old))
 
 
@@ -3287,7 +3302,7 @@ def test_schema_17_carries_the_plan_the_next_block_the_time_left_and_the_plans_o
     assert decode(encode(replace(sent, plan=None, next_block=None, block_left_s=None,
                                  run_left_s=None, preflight=replace(preflight, plan=None,
                                                                     plans=())))).plan is None
-    with pytest.raises(SchemaMismatch, match="carried schema 16 and this console reads schema 21"):
+    with pytest.raises(SchemaMismatch, match="carried schema 16 and this console reads schema 23"):
         decode(encode(replace(sent, schema=16)))
 
 
@@ -3424,8 +3439,8 @@ def test_a_staged_position_reaches_the_console_as_its_words():
     words for it, eccentricity and direction first, as a word value already travels there; a
     `Polar` was no value the wire could carry."""
     session = SimpleNamespace(**{**vars(_session_with(1.25, 3.0)), "staged": (
-        ("target_pos", Polar(8.0, 0.0), Polar(8.0, 45.0), Box("jake"), False, "set", (), False, ""),
-        ("fix_hold", 0.3, 0.4, Box("jake"), False, "set", (), False, ""),
+        ("target_pos", Polar(8.0, 0.0), Polar(8.0, 45.0), Box("jake"), False, "set", (), False, "", None, ()),
+        ("fix_hold", 0.3, 0.4, Box("jake"), False, "set", (), False, "", None, ()),
     ), "parameters": (
         ("target_pos", "deg", None, None, Polar(8.0, 0.0), False,
          (Polar(8.0, 0.0), Polar(8.0, 45.0))),
@@ -3449,9 +3464,9 @@ def test_schema_18_carries_a_settings_position_and_refuses_17_by_name():
         ParamRow("fix_hold", "s", 0.1, 1.0, 0.3, False),
     ))
 
-    assert (sent.schema, decode(encode(sent))) == (21, sent)
+    assert (sent.schema, decode(encode(sent))) == (23, sent)
     assert decode(encode(sent)).params[1].position is None
-    with pytest.raises(SchemaMismatch, match="carried schema 17 and this console reads schema 21"):
+    with pytest.raises(SchemaMismatch, match="carried schema 17 and this console reads schema 23"):
         decode(encode(replace(sent, schema=17)))
 
 
@@ -3468,8 +3483,8 @@ def test_a_pair_is_a_position_only_where_its_setting_is_declared_one():
         ("target_pos", "deg", None, None, (0.3, 0.6), False, ((0.3, 0.6), (5.0, 0.0))),
         ("cue", "deg", None, None, Polar(8.0, 0.0), False, ()),
     ), "staged": (
-        ("span", (0.3, 0.6), (0.4, 0.6), Box("jake"), False, "set", (), False, ""),
-        ("target_pos", (5.0, 0.0), (0.3, 0.6), Box("jake"), False, "set", (), False, ""),
+        ("span", (0.3, 0.6), (0.4, 0.6), Box("jake"), False, "set", (), False, "", None, ()),
+        ("target_pos", (5.0, 0.0), (0.3, 0.6), Box("jake"), False, "set", (), False, "", None, ()),
     )})
 
     frame = Telemetry.of(session, Tally(), _scheduler(), 0)
@@ -3495,7 +3510,7 @@ def test_a_position_that_is_not_finite_is_said_plainly_and_never_faults_the_fram
         ("target_pos", "deg", None, None, (math.inf, 0.0), False, ((math.inf, 0.0), (5.0, 0.0))),
         ("cue", "deg", None, None, Polar(math.nan, 45.0), False, ()),
     ), "staged": (
-        ("cue", Polar(8.0, 45.0), Polar(-math.inf, 45.0), Box("jake"), False, "set", (), False, ""),
+        ("cue", Polar(8.0, 45.0), Polar(-math.inf, 45.0), Box("jake"), False, "set", (), False, "", None, ()),
     )})
 
     frame = Telemetry.of(session, Tally(), _scheduler(), 0)
@@ -3598,7 +3613,7 @@ def test_schema_21_carries_demo_on_every_frame_idle_or_running():
     read as a real session's; and a frame of schema 20 is refused by name, each shape."""
     from _frames import idle as idle_frame
 
-    assert SCHEMA == 21
+    assert SCHEMA == 23
     running = _telemetry()
     assert running.demo is False, "a real session's frame unless it says otherwise"
     for demo in (True, False):
@@ -3624,7 +3639,7 @@ def test_schema_21_carries_demo_on_every_frame_idle_or_running():
         decode(_repacked(idle_frame(closed=running), lambda data: data["closed"].pop("demo")))
 
     for frame in (running, idle_frame(), _drawn()):
-        with pytest.raises(SchemaMismatch, match="carried schema 20 and this console reads schema 21"):
+        with pytest.raises(SchemaMismatch, match="carried schema 20 and this console reads schema 23"):
             decode(encode(replace(frame, schema=20)))
 
 
@@ -3654,7 +3669,7 @@ def test_drawn_round_trips_whole_under_the_schema_check():
     assert decode(encode(blank)).mask_deg == 12.0
     assert decode(encode(blank)).vergence_half_deg == STEREOSCOPE.vergence_half_deg > 1.0
 
-    with pytest.raises(SchemaMismatch, match="carried schema 20 and this console reads schema 21"):
+    with pytest.raises(SchemaMismatch, match="carried schema 20 and this console reads schema 23"):
         decode(encode(replace(sent, schema=20)))
 
 
@@ -3960,3 +3975,512 @@ def test_close_releases_the_gaze_sockets_and_an_unclosed_one_is_released_by_the_
     assert returned, "collecting an unclosed link or gaze sender in a reference cycle hung for 10 s"
     assert ctx.closed and sender_ctx.closed
     assert socket() is None and push() is None
+
+
+# --- The timing switch's command (the console settings build's Task 2) --------------------------
+
+#: One `SetForm` of each shape a card sends, and how many values `_setting` decodes in it.
+FORMS = [
+    (SetForm(name="fix_hold", shape="non_aging", numbers={"shortest": 0.75, "longest": 1.25},
+             by=Box("jake")), 2),
+    (SetForm(name="fix_hold", shape="uniform", numbers={"low": 0.2, "high": 0.4}, by=Box("jake")),
+     2),
+    (SetForm(name="fix_hold", shape="normal",
+             numbers={"mean": 0.5, "sd": 0.1, "low": 0.3, "high": 0.7}, by=Box("jake")), 4),
+    (SetForm(name="fix_hold", shape="list", numbers={}, by=Box("jake"),
+             values=(0.3, 0.5, 0.7)), 3),
+    (SetForm(name="fix_hold", shape="weights", numbers={}, by=Box("jake"), values=(0.3, 0.5),
+             weights=(3.0, 1.0)), 4),
+    (SetForm(name="fix_size", shape="scaled", numbers={"factor": 0.3}, by=Box("jake")), 1),
+]
+
+
+@pytest.mark.parametrize("form, decoded", FORMS)
+def test_set_form_round_trips_and_its_numbers_pass_through_setting(monkeypatch, form, decoded):
+    """`SetForm` over the wire and back, each shape (the design's §3; the planner's call: a new
+    command beside `SetRange`, `KIND` `"form"`), every number, value and weight decoded by
+    `_setting`, M8's rule, welfare-listed and called unchanged: counted here, so a decoder that
+    skipped it would show. A word among them is refused, and so are more than `LISTED_LIMIT`
+    values, and a shape that is none of the six."""
+    import wl_xcon.link as link
+
+    calls = []
+    real = link._setting
+
+    def counted(value, name, by):
+        calls.append(value)
+        return real(value, name, by)
+
+    monkeypatch.setattr(link, "_setting", counted)
+    assert SetForm.KIND == "form"
+    assert _decode_command(_encode_command(form)) == form
+    assert len(calls) == decoded
+
+
+def test_a_form_with_a_word_too_many_values_or_no_shape_is_refused_where_it_is_decoded():
+    from wl_xcon.link import LISTED_LIMIT
+
+    assert LISTED_LIMIT == 64
+    cases = [
+        (dict(shape="uniform", numbers={"low": "short", "high": 0.4}),
+         "'fix_hold' was sent the word 'short' as its 'low': a drawn form's numbers are finite "
+         "numbers, never a word"),
+        (dict(shape="list", values=[0.3, "long"]),
+         "'fix_hold' was sent the word 'long' among its values"),
+        (dict(shape="weights", values=[0.3, 0.5], weights=[1.0, "heavy"]),
+         "'fix_hold' was sent the word 'heavy' among its weights"),
+        (dict(shape="list", values=[0.5] * (LISTED_LIMIT + 1)),
+         f"a 'form' command's values are at most {LISTED_LIMIT} numbers"),
+        (dict(shape="list", values=0.5), f"a 'form' command's values are at most {LISTED_LIMIT}"),
+        (dict(shape="spiky", numbers={"low": 0.2}), "a 'form' command's shape is one of "
+         "non_aging, uniform, normal, list, weights, scaled"),
+        (dict(numbers={"low": 0.2}), "a 'form' command's shape is one of"),
+        (dict(shape="uniform", numbers={"low": float("nan"), "high": 0.4}),
+         "which is not a real number"),
+    ]
+    for fields, said in cases:
+        with pytest.raises(CommandRefused) as refused:
+            _decode_command(_packed(kind="form", name="fix_hold", by=JAKE, **fields))
+        assert said in refused.value.why, (fields, refused.value.why)
+
+
+def test_a_card_carries_its_switch_and_the_shape_in_force_over_the_wire():
+    """Schema 22: each `ParamRow` says whether its card offers the drawn side (`switch`) and the
+    shape in force, a person's or the open block's draw, by whom; both cross the wire whole, and a
+    reader of 21 refuses 22 by name."""
+    shape = {"shape": "non_aging", "numbers": {"shortest": 0.75, "longest": 1.25}, "values": [],
+             "weights": [], "by": "person"}
+    rows = (ParamRow.of("fix_hold", "s", 0.05, 2.0, 0.3, False, (), "form", (), None, None,
+                        "drawn", shape),
+            ParamRow.of("fix_window", "deg", 0.5, 5.0, 2.0, False))
+    sent = _telemetry(params=rows)
+
+    restored = decode(encode(sent))
+
+    assert restored.params == rows
+    assert (restored.params[0].switch, restored.params[0].shape) == ("drawn", shape)
+    assert (restored.params[1].switch, restored.params[1].shape) == (None, None)
+    assert SCHEMA == 23
+    with pytest.raises(SchemaMismatch, match="carried schema 21 and this console reads schema 23"):
+        decode(encode(replace(sent, schema=21)))
+
+
+def test_a_card_carries_its_profile_over_the_wire():
+    """Schema 22: a drawn card's profile crosses the wire whole, a fixed card's is none."""
+    from wl_xcon import variation
+    from wl_xcon.task import NonAging
+
+    wait = NonAging.between(0.75, 1.25)
+    shape = {**variation.shaped(wait), "by": "person"}
+    profile = variation.profile(wait).as_dict()
+    rows = (ParamRow.of("fix_hold", "s", 0.05, 2.0, 0.3, False, (), "form", (), None, None,
+                        "drawn", shape, profile),
+            ParamRow.of("fix_window", "deg", 0.5, 5.0, 2.0, False))
+
+    restored = decode(encode(_telemetry(params=rows)))
+
+    assert restored.params == rows
+    assert restored.params[0].profile == profile and len(profile["density"]) == 20
+    assert restored.params[1].profile is None
+
+
+def test_a_card_carries_each_limits_reason_over_the_wire():
+    """Schema 22 (the console settings plan's Task 4): a card's `why`, each limit's one-line reason
+    or `None`, crosses the wire whole; a card whose setting declares no bound carries none."""
+    why = {"low": "below 0 cannot be", "high": "a fraction is at most 1"}
+    rows = (ParamRow.of("catch_share", "fraction", 0.0, 1.0, 0.1, False, why=why),
+            ParamRow.of("free", "deg", None, None, 2.0, False))
+
+    restored = decode(encode(_telemetry(params=rows)))
+
+    assert restored.params == rows
+    assert (restored.params[0].why, restored.params[1].why) == (why, None)
+
+
+#: A color card as the rig makes it (`ParamRow.color`; the console settings design's §6).
+COLOR_CARD = {
+    "sets": {"isohue": {"apex": [0.31272, 0.329], "luminance_cd_m2": 15.0, "design": None,
+                        "hues": {"green": {"xy": [0.31324, 0.50711], "srgb": "#4a9a3e"},
+                                 "red": {"xy": [0.45955, 0.32918], "srgb": None}}}},
+    "set": "isohue", "hue": "green", "approximate": True,
+    "saturation": {"setting": "distractor_saturation", "value": 0.25, "cd_m2": 7.5},
+    "luminance": {"setting": "distractor_fraction", "value": 0.5, "cd_m2": 7.5,
+                  "set_wide": False},
+}
+
+
+def test_set_color_round_trips_and_a_malformed_one_is_refused_where_it_is_decoded():
+    """`SetColor` over the wire and back (the design's §6: a pick names a set and a hue), `KIND`
+    `"color"`, and from a page's body (`serve.parse_command`); a set, a hue or a name that is no
+    text of 1 to `TEXT_LIMIT` characters is refused, naming the field."""
+    from wl_xcon.link import CommandRefused, SetColor, TEXT_LIMIT
+    from wl_xcon.serve import parse_command
+
+    pick = SetColor(name="distractor_appearance", colorset="isohue", color="red", by=Box("jake"))
+    assert SetColor.KIND == "color"
+    assert _decode_command(_encode_command(pick)) == pick
+    body = {"kind": "color", "name": "distractor_appearance", "colorset": "isohue",
+            "color": "red"}
+    parsed = parse_command({**body, "by": "jake"})
+    assert (type(parsed), parsed.name, parsed.colorset, parsed.color) == (
+        SetColor, "distractor_appearance", "isohue", "red")
+    for field, bad in (("colorset", 3), ("color", ""), ("color", "r" * (TEXT_LIMIT + 1)),
+                       ("name", None)):
+        with pytest.raises(CommandRefused, match=f"a 'color' command's {field} is text"):
+            _command_from({**body, "by": {"kind": "box", "name": "jake"}, field: bad})
+
+
+def test_a_color_card_and_a_look_in_words_cross_the_wire():
+    """Schema 22, XC-420 closed: a color card crosses the wire whole, and a value that is a look
+    crosses as its words with `value` null -- a staged one too, its `was` and `now` the words."""
+    from wl_xcon.photometry import ColorSet, ColorSetLight
+    from wl_xcon.review import appearance_words
+    from wl_xcon.task import Disc, P
+
+    isohue = ColorSet.load("tests/fixtures/isohue.json")
+    green, red = (Disc(size=1.0, color=ColorSetLight(isohue, hue, saturation=P("pale")))
+                  for hue in ("green", "red"))
+    row = ParamRow.of("distractor_appearance", "appearance", None, None, green, False,
+                      (green, red), "run", color=COLOR_CARD)
+    assert (row.value, row.words, row.color) == (
+        None, "Disc: color isohue green at saturation pale", COLOR_CARD)
+    staged = Staged(name="distractor_appearance", was=appearance_words(green),
+                    now=appearance_words(red), by=Box("jake"), bounded=False)
+    sent = _telemetry(params=(row, ParamRow.of("fix_window", "deg", 0.5, 5.0, 2.0, False)),
+                      staged=(staged,))
+
+    restored = decode(encode(sent))
+
+    assert restored == sent
+    assert restored.params[0].color == COLOR_CARD and restored.params[1].color is None
+    assert restored.params[1].words is None
+    assert restored.staged[0].now == "Disc: color isohue red at saturation pale"
+
+
+# --- Schema 23: what a box needs, and verdicts keyed to the page's command id -----------------
+
+
+def test_a_row_carries_what_a_box_needs_over_the_wire():
+    """Schema 23 (the console interface design's "What the rig must send that it does not"): each
+    row's `whole`, `step`, `choices`, `start`, `label`, `help`, `group`, `percent`, `members`,
+    `applied` and `warned`, a staged row's `cid` and `warnings` and a refusal's `cid` and `value`,
+    cross the wire whole. A row's choices are words only, at most `CHOICES_LIMIT`, else none; its
+    start a number or a word, else none. Each field malformed is a malformed frame, never read; and
+    a reader of 22 refuses 23 by name."""
+    from wl_xcon.link import CHOICES_LIMIT, Applied, PoolMember
+
+    member = PoolMember(bit=2, odd="blue", among="red", odd_hex="#2476c8", among_hex="#bf5c5c",
+                        on=True)
+    rows = (
+        ParamRow.of("set_size", "objects", 1, 12, 6, False, section="Other", whole=True, step=1,
+                    start=4, label="Set size", help="How many discs the ring shows.",
+                    group="Ring", applied=Applied(trial=3, by="jake (box, unverified)"),
+                    warned=("crowded-array: too close",)),
+        ParamRow.of("move_up_bar", "fraction", 0.0, 1.0, 0.8, False, step=0.05, percent=True,
+                    start=0.8),
+        ParamRow.of("pairings", "pairings", 1, 4095, 66, False, members=(member,)),
+        ParamRow.of("side", "", None, None, "left", False, ("left", "right"), start="left"),
+        ParamRow.of("many", "", None, None, "c0", False,
+                    tuple(f"c{n}" for n in range(CHOICES_LIMIT + 1))),
+        ParamRow.of("look", "appearance", None, None, None, False, (Polar(1.0, 0.0), 3.0),
+                    start=Polar(1.0, 0.0)),
+    )
+    assert (rows[3].choices, rows[3].start) == (("left", "right"), "left")
+    assert rows[4].choices == () and rows[5].choices == () and rows[5].start is None
+    assert (rows[0].whole, rows[0].step, rows[0].group, rows[0].applied.trial) == (
+        True, 1, "Ring", 3)
+    staged = Staged(name="set_size", was=4.0, now=6.0, by=Box("jake"), bounded=False, cid="b-7",
+                    warnings=("crowded-array: too close",))
+    refused = Refused(name="set_size", by=Box("jake"), why="a whole number", cid="b-8",
+                      value=4.5)
+    sent = _telemetry(params=rows, staged=(staged,), refusals=(refused,))
+
+    restored = decode(encode(sent))
+
+    assert restored == sent
+    assert restored.params[2].members == (member,) and type(restored.params[2].members[0]) is (
+        PoolMember)
+    assert type(restored.params[0].applied) is Applied
+    assert (restored.staged[0].cid, restored.staged[0].warnings) == (
+        "b-7", ("crowded-array: too close",))
+    assert (restored.refusals[0].cid, restored.refusals[0].value) == ("b-8", 4.5)
+    plain = decode(encode(_telemetry()))
+    assert all((p.whole, p.choices, p.group, p.members, p.applied, p.warned) ==
+               (False, (), None, None, None, ()) for p in plain.params)
+
+    def params(change):
+        return lambda data: change(data["params"][0])
+
+    bad = [
+        (params(lambda p: p.update(whole=1)), "a flag is true or false, not 1"),
+        (params(lambda p: p.update(step=0)), "a step is a number above 0"),
+        (params(lambda p: p.update(step="1")), "a drawing's number is a finite one"),
+        (params(lambda p: p.update(choices=[1, 2])), "a list of words"),
+        (params(lambda p: p.update(start=[4])), "a value is a finite number or a word"),
+        (params(lambda p: p.update(label=None)), "a name or a reason is a string"),
+        (params(lambda p: p.update(group=3)), "a name or a reason is a string"),
+        (params(lambda p: p.update(applied={"trial": -1, "by": "jake"})),
+         "a count is a whole number from 0"),
+        (params(lambda p: p.update(warned="crowded")), "a list of words"),
+        (lambda data: data["params"][2]["members"][0].update(odd_hex="blue"),
+         "a swatch is #rrggbb or empty"),
+        (lambda data: data["params"][2]["members"][0].update(bit=0),
+         "a pairing's bit is a whole number from 1"),
+        (lambda data: data["staged"][0].update(cid="x" * 65), "a command id is printable text"),
+        (lambda data: data["staged"][0].update(warnings=[3]), "a list of words"),
+        (lambda data: data["refusals"][0].update(cid=""), "a command id is printable text"),
+        (lambda data: data["refusals"][0].update(value={"x": 1}), "a value is a finite number"),
+        (params(lambda p: p.pop("whole")), "KeyError: 'whole'"),
+    ]
+    for change, said in bad:
+        with pytest.raises(FrameError, match=said):
+            decode(_repacked(sent, change))
+
+    assert SCHEMA == 23
+    with pytest.raises(SchemaMismatch, match="carried schema 22 and this console reads schema 23"):
+        decode(encode(replace(sent, schema=22)))
+
+
+def test_a_frame_lists_the_tasks_groups(tmp_path):
+    """Schema 23 (the console interface rework's Task 7; the design's goal 8, the PI: "One box
+    after Timing"): a frame names each group the task declares -- its title, its settings in the
+    order it declares them, its sentence, and the section its settings share, where its box sits
+    -- read off the session between runs as in one (the task's declaration), and crossing the wire
+    whole; a task with none lists none; each field malformed is a malformed frame, never read."""
+    import _sessions
+    from wl_xcon.dio import Simulated as Card
+    from wl_xcon.link import GroupRow
+    from wl_xcon.taskd import Session, SessionSpec
+
+    spec = SessionSpec(
+        task=str(_sessions.grouped_task(tmp_path)), allocation="tasks/allocation.py",
+        root=tmp_path, session_id="2027-01-14_01", subject="A", trials=1, frame_period=1 / 240,
+        seed=1, values={}, bounds=_sessions.bounds(), already_delivered_today=0.0,
+        deployment=Deployment.RIG_FIXED, geometry=DIRECT, session_kind="training",
+        calibration=SRGB)
+    session = Session(spec, card=Card(), pump=Pump())
+    holds = GroupRow("Holds", ("fix_hold", "target_hold"),
+                     "Hold {fix_hold} on the cross, then {target_hold} on the target", "Timing")
+    assert session.groups == ((holds.name, holds.settings, holds.sentence, holds.section),)
+    rows = {row[0]: ParamRow.of(*row) for row in session.parameters}
+    assert (rows["fix_hold"].group, rows["target_hold"].group, rows["hit_bar"].group) == (
+        "Holds", "Holds", None)
+    assert (rows["hit_bar"].percent, rows["hit_bar"].label) == (True, "Bar to pass")
+    stand_in = _session_with(delivered_ml=1.0, already_today=None)
+    stand_in.groups = session.groups
+    framed = Telemetry.of(stand_in, Tally(), _scheduler(), index=0)
+    assert framed.groups == (holds,)
+
+    restored = decode(encode(framed))
+
+    assert restored == framed and type(restored.groups[0]) is GroupRow
+    assert restored.groups[0].settings == ("fix_hold", "target_hold")
+    assert _telemetry().groups == () and decode(encode(_telemetry())).groups == ()
+    plain = replace(framed, groups=(replace(holds, sentence=None),))
+    assert decode(encode(plain)).groups[0].sentence is None
+
+    def group(change):
+        return lambda data: change(data["groups"][0])
+
+    bad = [
+        (lambda data: data.update(groups={}), "a frame's groups are a list"),
+        (group(lambda g: g.pop("section")), "a group is its name, settings, sentence and section"),
+        (group(lambda g: g.update(extra=1)), "a group is its name, settings, sentence and section"),
+        (group(lambda g: g.update(settings=[])), "a group's settings are one or more names"),
+        (group(lambda g: g.update(settings=["fix_hold", 3])), "a group's settings are one or more"),
+        (group(lambda g: g.update(settings="fix_hold")), "a group's settings are one or more"),
+        (group(lambda g: g.update(sentence=7)), "a name or a reason is a string"),
+        (group(lambda g: g.update(name="")), "a group's name is a word"),
+        (group(lambda g: g.update(section=None)), "a name or a reason is a string"),
+        (lambda data: data.pop("groups"), "KeyError: 'groups'"),
+    ]
+    for change, said in bad:
+        with pytest.raises(FrameError, match=said):
+            decode(_repacked(framed, change))
+
+
+def test_a_frame_lists_the_acts_withdrawn_by_command_id():
+    """Schema 23 (the console interface rework's whole-build review, I1: "say 'withdrawn' only on
+    the rig's word"): a frame carries the command id of each act a withdrawal took back, read off
+    the session (`Session.withdrawals`), crossing the wire whole; none by default; a list that is
+    not one of command ids is a malformed frame, never read."""
+    stand_in = _session_with(delivered_ml=1.0, already_today=None)
+    stand_in.withdrawals = ("pg-1", "pg-7")
+    framed = Telemetry.of(stand_in, Tally(), _scheduler(), index=0)
+    assert framed.withdrawals == ("pg-1", "pg-7")
+    assert decode(encode(framed)) == framed
+    assert _telemetry().withdrawals == () and decode(encode(_telemetry())).withdrawals == ()
+    bad = [
+        (lambda data: data.update(withdrawals="pg-1"), "a list of command ids"),
+        (lambda data: data.update(withdrawals=[None]), "a list of command ids"),
+        (lambda data: data.update(withdrawals=["x" * 65]), "a list of command ids"),
+        (lambda data: data.pop("withdrawals"), "KeyError: 'withdrawals'"),
+    ]
+    for change, said in bad:
+        with pytest.raises(FrameError, match=said):
+            decode(_repacked(framed, change))
+
+
+def test_a_box_command_carries_its_cid_beside_it_never_inside_its_value():
+    """Schema 23 (the console interface design's goal 4): a box's command -- a value, a hand-back,
+    a range, a draw, a color's pick -- carries the page's command id beside its fields, over the
+    wire and from a page's body (`serve.parse_command`), absent for none; one that is no printable
+    text of 1 to 64 characters is refused naming the field, before any session sees it, and a
+    command of another kind takes none."""
+    from wl_xcon.link import CID_LIMIT, HandBack, SetColor, SetRange
+    from wl_xcon.serve import BadCommand, parse_command
+
+    jake = Box("jake")
+    commands = (
+        SetParameter(name="set_size", value=6.0, by=jake, cid="box-1"),
+        HandBack(name="set_size", by=jake, cid="box-2"),
+        SetRange(name="fix_hold", numbers={"low": 0.2}, by=jake, cid="box-3"),
+        SetForm(name="fix_hold", shape="uniform", numbers={"low": 0.2, "high": 0.4}, by=jake,
+                cid="box-4"),
+        SetColor(name="odd_color", colorset="isohue", color="red", by=jake, cid="box-5"),
+    )
+    for command in commands:
+        assert _decode_command(_encode_command(command)) == command
+        assert _decode_command(_encode_command(replace(command, cid=None))).cid is None
+    assert parse_command({"kind": "set", "name": "set_size", "value": 6, "by": "jake",
+                          "cid": "box-1"}) == commands[0]
+    assert parse_command({"kind": "hand_back", "name": "set_size", "by": "jake",
+                          "cid": "box-2"}) == commands[1]
+    assert parse_command({"kind": "set", "name": "set_size", "value": 6, "by": "jake"}).cid is None
+    for cid in ("", "x" * (CID_LIMIT + 1), "two\nlines", 7):
+        with pytest.raises(CommandRefused, match="a 'set' command's cid is printable text of 1"):
+            _decode_command(_packed(kind="set", name="set_size", value=6.0, by=JAKE, cid=cid))
+        with pytest.raises(BadCommand, match="a 'range' command's cid is printable text of 1"):
+            parse_command({"kind": "range", "name": "fix_hold", "numbers": {"low": 0.2},
+                           "by": "jake", "cid": cid})
+    with pytest.raises(BadCommand, match="a stop command takes no cid"):
+        parse_command({"kind": "stop", "by": "jake", "cid": "box-9"})
+
+
+def test_apply_many_and_withdraw_round_trip_and_call_setting(monkeypatch):
+    """The console interface plan's Task 4: an apply of several -- a value, a range, a draw and a
+    color's pick -- and a withdrawal cross the wire and a page's body (`serve.parse_command`) as
+    made, under their required command id, **each decoded change through `link._setting`**, M8's
+    rule, welfare-listed and called unchanged: counted here, every value and number once. Each
+    change takes the command's `by` and no `by` or `cid` of its own; 1 to `APPLY_LIMIT` of them, of
+    the four kinds; and an act with no id is refused, before any session sees it."""
+    import re
+
+    import wl_xcon.link as link
+    from wl_xcon.link import APPLY_LIMIT, ApplyMany, SetColor, SetRange, Withdraw
+    from wl_xcon.serve import BadCommand, parse_command
+
+    calls = []
+    real = link._setting
+
+    def counted(value, name, by):
+        calls.append((name, value))
+        return real(value, name, by)
+
+    monkeypatch.setattr(link, "_setting", counted)
+    jake = Box("jake")
+    applied = ApplyMany(changes=(
+        SetParameter(name="fix_hold", value=0.35, by=jake),
+        SetRange(name="fix_acquisition", numbers={"low": 3.0, "high": 5.0}, by=jake),
+        SetForm(name="response_deadline", shape="list", numbers={}, by=jake, values=(0.6, 0.8)),
+        SetColor(name="odd_color", colorset="isohue", color="red", by=jake),
+    ), cid="all-1", by=jake)
+    withdraw = Withdraw(cid="all-1", by=jake)
+    assert (ApplyMany.KIND, Withdraw.KIND, APPLY_LIMIT) == ("apply_many", "withdraw", 64)
+
+    assert _decode_command(_encode_command(applied)) == applied
+    assert sorted(calls) == sorted([("fix_hold", 0.35), ("fix_acquisition", 3.0),
+                                    ("fix_acquisition", 5.0), ("response_deadline", 0.6),
+                                    ("response_deadline", 0.8)])
+    assert _decode_command(_encode_command(withdraw)) == withdraw
+    calls.clear()
+    body = {"kind": "apply_many", "by": "jake", "cid": "all-1", "changes": [
+        {"kind": "set", "name": "fix_hold", "value": 0.35},
+        {"kind": "range", "name": "fix_acquisition", "numbers": {"low": 3.0, "high": 5.0}},
+        {"kind": "form", "name": "response_deadline", "shape": "list", "values": [0.6, 0.8]},
+        {"kind": "color", "name": "odd_color", "colorset": "isohue", "color": "red"}]}
+    assert parse_command(body) == applied
+    assert len(calls) == 5
+    assert parse_command({"kind": "withdraw", "by": "jake", "cid": "all-1"}) == withdraw
+
+    refused = [
+        ({"changes": []}, "changes are 1 to 64 in a list"),
+        ({"changes": [{"kind": "set", "name": "fix_hold", "value": 0.3}] * (APPLY_LIMIT + 1)},
+         "changes are 1 to 64 in a list"),
+        ({"changes": [{"kind": "hand_back", "name": "fix_hold"}]}, "'hand_back' is none of them"),
+        ({"changes": [{"kind": "set", "name": "fix_hold", "value": 0.3, "cid": "x"}]},
+         "takes no cid of its own"),
+        ({"changes": [{"kind": "set", "name": "fix_hold", "value": True}]},
+         "'fix_hold' was sent True"),
+        ({"changes": [{"kind": "set", "name": "fix_hold", "value": 0.3}], "cid": None},
+         "names its act by a cid"),
+    ]
+    for over, said in refused:
+        fields = {"kind": "apply_many", "by": JAKE, "cid": "all-1", **over}
+        with pytest.raises(CommandRefused, match=re.escape(said)):
+            _decode_command(_packed(**fields))
+    with pytest.raises(CommandRefused, match="a 'withdraw' command names its act by a cid"):
+        _decode_command(_packed(kind="withdraw", by=JAKE))
+    with pytest.raises(BadCommand, match="a set change in an apply_many takes no by"):
+        parse_command({**body, "changes": [{"kind": "set", "name": "fix_hold", "value": 0.3,
+                                            "by": "kim"}]})
+    with pytest.raises(BadCommand, match="a withdraw command takes no name"):
+        parse_command({"kind": "withdraw", "by": "jake", "cid": "all-1", "name": "fix_hold"})
+
+
+def _xtasks_or_skip():
+    """The wl-xtasks checkout holding the pop-out search, as `tests/test_popout_search.py` looks
+    for it; skipped where there is none, failed under `WLX_REQUIRE_XTASKS=1`."""
+    import os
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    found = next((c for c in (root / "wl-xtasks", root.parent / "wl-xtasks")
+                  if (c / "tasks" / "popout_search.py").is_file()), None)
+    if found is None:
+        if os.environ.get("WLX_REQUIRE_XTASKS") == "1":  # pragma: no cover - CI's
+            raise AssertionError("WLX_REQUIRE_XTASKS=1 but no wl-xtasks checkout holding "
+                                 "tasks/popout_search.py was found")
+        pytest.skip("no wl-xtasks checkout holding tasks/popout_search.py")
+    return found / "tasks" / "popout_search.py"
+
+
+def test_the_pool_row_lists_its_pairs_as_data(tmp_path):
+    """Schema 23 (the console interface design's goal 7, the PI: "4 × 4 grid, add or remove"): the
+    pop-out's pool's setting's row, as the session makes it, lists its twelve pairings as data in
+    the pool's order -- bits 1 to 2048, each odd one's and distractors' color by name with its
+    `#rrggbb` swatch -- each `on` as the value 66 holds it (blue among red and red among blue,
+    the run's first pairings), and crosses the wire whole; every other row lists none."""
+    import re
+    from pathlib import Path
+
+    from wl_xcon.dio import Simulated as Card
+    from wl_xcon.taskd import Session, SessionSpec
+
+    import _sessions
+
+    task = _xtasks_or_skip()
+    spec = SessionSpec(
+        task=str(task), allocation="tasks/allocation.py", root=tmp_path,
+        session_id="2027-01-14_01", subject="A", trials=1, frame_period=1 / 240, seed=1,
+        values={"pairings": 66}, bounds=_sessions.bounds(), already_delivered_today=0.0,
+        deployment=Deployment.RIG_FIXED, geometry=DIRECT, session_kind="training",
+        calibration=SRGB, plan="training")
+    session = Session(spec, card=Card(), pump=Pump())
+    rows = {row[0]: ParamRow.of(*row) for row in session.parameters}
+
+    members = rows["pairings"].members
+    colors = ("blue", "purple", "red", "green")
+    assert [m.bit for m in members] == [2 ** n for n in range(12)]
+    assert [(m.odd, m.among) for m in members] == [
+        (odd, among) for odd in colors for among in colors if among != odd]
+    assert all(re.fullmatch(r"#[0-9a-f]{6}", m.odd_hex) and re.fullmatch(r"#[0-9a-f]{6}",
+               m.among_hex) for m in members)
+    assert len({m.odd_hex for m in members}) == 4
+    assert {m.odd: m.odd_hex for m in members} == {m.among: m.among_hex for m in members}
+    assert [(m.odd, m.among) for m in members if m.on] == [("blue", "red"), ("red", "blue")]
+    assert sum(m.bit for m in members if m.on) == 66
+    assert all(row.members is None for name, row in rows.items() if name != "pairings")
+
+    restored = decode(encode(_telemetry(params=(rows["pairings"],))))
+    assert restored.params[0].members == members

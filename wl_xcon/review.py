@@ -337,9 +337,13 @@ def render(trial: Trial, allocation_names: dict[int, str] | None = None) -> str:
                 # A family, described as one: how many members it has is a
                 # parameter, so listing them would be listing one configuration.
                 count = " or ".join(counts.get(window.of, [])) or "?"
+                # A ratio of each object's radius (`ObjectWindows.scale`; the console settings
+                # design's §5), said as one.
+                radius = (_value_label(window.radius) if window.scale is None
+                          else f"{_value_label(window.scale)} × each object's radius")
                 lines.append(
                     f"| `{window.of}.*` | {count} objects on a ring "
-                    f"| {_value_label(window.radius)} | `{window.of}` "
+                    f"| {radius} | `{window.of}` "
                     f"| {window.eye} |"
                 )
                 continue
@@ -485,6 +489,7 @@ def render_task(task: Task, allocation_names: dict[int, str] | None = None) -> s
     lines += _counting(task)
     lines += _draws(task)
     lines += _pool(task)
+    lines += _specials(task)
     lines += _plans(task)
     for name in (task.default, *(other for other in task.structures if other != task.default)):
         heading = f"## Structure `{name}`"
@@ -529,6 +534,34 @@ def _pool(task: Task) -> list[str]:
             f"the bars afresh, the staircase staying where it is. {starts}", "",
             "| Number | Pairing | The odd one's look | The distractors' look |",
             "|---|---|---|---|", *rows, ""]
+
+
+def _specials(task: Task) -> list[str]:
+    """**The task's kinds of special trial** (`task.Special`; the pop-out revision's Task 3): each
+    kind, the setting its percentage of trials is read from and what that starts at, and the
+    structure it plays, with how a trial is drawn special, so a reviewer of the task file reads
+    here what its catches and probes are. Nothing where the task declares none."""
+    if not task.specials:
+        return []
+    declared = {param.name: param for param in task.params}
+
+    def start(name: str) -> str:
+        value = getattr(declared.get(name), "start", None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "no start"
+        return f"{value:g}%"
+
+    rows = [f"| {_cell(special.kind)} | `{special.share.name}` | {start(special.share.name)} "
+            f"| `{special.structure}` |" for special in task.specials]
+    return ["### Special trials", "",
+            f"Each trial of the default structure, `{task.default}`, is drawn special or normal "
+            f"between trials from the run's seed, each kind at its percentage, in the order "
+            f"below; past 100 in all, each in proportion and none normal. A special trial plays "
+            f"its kind's structure with its stage's values, its staircase's value and its "
+            f"pairing, and counts in the stage's bars, but steps no staircase; a repeat of one is "
+            f"the same kind. Each trial line says its kind (`trial_kind`) and whether it stepped "
+            f"(`stepped`).", "",
+            "| Kind | Its percentage | Starts at | Plays |", "|---|---|---|---|", *rows, ""]
 
 
 #: A counting class in the words the PI confirms it in (the engine C2a plan's Appendix B).
@@ -725,6 +758,63 @@ def position_words(value: object, choices=()) -> str | None:
     if isinstance(value, (tuple, list)) and len(value) == 2 and declares_position(choices):
         return _point_label(tuple(value))
     return None
+
+
+#: The longest an appearance's words run (`appearance_words`): a frame is re-encoded at every
+#: trial boundary, and an appearance nests; a display bound, as `link.TEXT_LIMIT` is.
+APPEARANCE_WORDS_LIMIT = 200
+
+
+def appearance_words(value: object) -> str | None:
+    """**A setting's value that is an appearance or a color, or a piece of one, in the rig's words**
+    (XC-420; the console settings design's §6: a color pick is the first console path that puts
+    one among the run's values): what a console shows in its place, made by the rig, so that no
+    console reads a declaration -- telemetry carries the words and a null value
+    (`link.ParamRow.words`, a staged row's `was` and `now`). **A color-set light by its set and
+    hue**, then each level not at full, in the order the light declares them: `isohue blue`,
+    `isohue red at saturation 0.5`, `isohue blue at fraction distractor_fraction, luminance
+    color_luminance`; a gray by its cd/m²; any other declaration by its kind in people's words
+    (`task.kind_words`: a ring for an `Annulus`, the PI, 2026-11-20) and each field not at its
+    default, a setting by its name: `Disc: size disc_size, color isohue blue at luminance
+    color_luminance`. **These words are what a `choice` names a look by** (`link.choice_words`), a
+    wire word between the page and the rig that the record never writes. Cut at `APPEARANCE_WORDS_LIMIT`
+    characters. `None` for any other value: a number, a word, a position (`position_words`)."""
+    from wl_xcon.look import Edge, Fill, Outline, Shape
+    from wl_xcon.photometry import Color, ColorSetLight, Contrast, Gray
+    from wl_xcon.task import Appearance, kind_words
+
+    def said(part: object) -> str:
+        if isinstance(part, P):
+            return part.name
+        if isinstance(part, bool) or part is None:
+            return str(part)
+        if isinstance(part, (int, float)):
+            return f"{part:g}"
+        if isinstance(part, ColorSetLight):
+            levels = [f"{field} {said(getattr(part, field))}"
+                      for field, full in (("fraction", 1.0), ("luminance", None),
+                                          ("saturation", 1.0))
+                      if getattr(part, field) != full]
+            return (f"{part.colorset.name} {part.color}"
+                    + (f" at {', '.join(levels)}" if levels else ""))
+        if isinstance(part, Gray):
+            return f"gray at {said(part.cd_m2)} cd/m²"
+        if is_dataclass(part) and not isinstance(part, type):
+            shown = [f"{spec.name} {said(getattr(part, spec.name))}" for spec in fields(part)
+                     if getattr(part, spec.name) != spec.default]
+            # A look by its kind in people's words, a ring for an `Annulus` (`task.kind_words`;
+            # the PI, 2026-11-20).
+            return kind_words(part) + (f": {', '.join(shown)}" if shown else "")
+        if isinstance(part, (tuple, list)):
+            return "(" + ", ".join(said(item) for item in part) + ")"
+        return str(part)
+
+    if not isinstance(value, (Appearance, Color, Contrast, Shape, Fill, Edge, Outline)):
+        return None
+    words = said(value)
+    if len(words) > APPEARANCE_WORDS_LIMIT:
+        words = words[:APPEARANCE_WORDS_LIMIT - 1] + "…"
+    return words
 
 
 def _set_label(value: object, choices=(), unit: str = "", direction: bool = False) -> str:

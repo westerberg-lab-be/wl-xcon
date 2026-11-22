@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from importlib import resources
 from pathlib import Path
 
@@ -329,14 +330,15 @@ def test_a_runs_start_row_defines_each_set_as_written_and_as_this_panel_draws_it
         return {"luminance_cd_m2": shown.luminance, "desaturation": shown.desaturation,
                 "xy": {name: list(xy) for name, xy in shown.xy.items()},
                 "xyz": {name: list(xyz) for name, xyz in shown.xyz.items()},
-                "drive": {name: list(levels) for name, levels in shown.drive.items()}}
+                "drive": {name: list(levels) for name, levels in shown.drive.items()},
+                "macaque_row": list(photometry.macaque_row(panel))}
 
     defined = _color_sets(_task(_four(cs)), panel, {})
 
     assert defined == {"isohue": {
         "name": "isohue", "colors": {name: list(xy) for name, xy in cs.colors.items()},
         "apex": list(cs.apex), "luminance_cd_m2": 15.0, "held": "macaque_2deg_LM1",
-        "source": cs.source, "realized": [realization(shown)],
+        "source": cs.source, "design": None, "realized": [realization(shown)],
     }}
     assert defined["isohue"]["realized"][0]["xy"]["green"] != defined["isohue"]["colors"]["green"]
     dimmer = _trial({name: photometry.ColorSetLight(cs, name, luminance=P("bright"))
@@ -403,3 +405,229 @@ def test_a_luminance_range_that_desaturates_the_set_is_a_warning_saying_which_pa
     (every,) = [f for f in check(always, calibration=SRGB) if f.code == "color-set-desaturated"]
     assert "at any luminance setting 'bright' allows, 40 to 50 cd/m²" in every.detail
 
+
+
+# --- A light's saturation (the console settings design's §6) ----------------------------------
+
+
+def _xy(xyz) -> tuple[float, float]:
+    X, Y, Z = xyz
+    return (X / (X + Y + Z), Y / (X + Y + Z))
+
+
+#: **Read independently of `photometry`, from `cam16` alone**: the lightness of the set's design
+#: frame's gray (the generator's J' 65, isohue's own), its macaque luminance on the sRGB standard's
+#: model, and a bisection's count for a chromaticity's light at a J'.
+GRAY_J, HALVINGS = 65.0, 80
+
+
+def _frame_gray() -> float:
+    from wl_xcon import cam16
+
+    return sum(r * v for r, v in zip(photometry.SRGB_MACAQUE, cam16.from_ucs((GRAY_J, 0.0, 0.0))))
+
+
+def _unit(xy) -> tuple[float, float, float]:
+    x, y = xy
+    return (x / y, 1.0, (1.0 - x - y) / y)
+
+
+def _ucs_at(xy, lightness: float) -> tuple[float, float, float]:
+    """The CAM16-UCS J', a', b' of the light of chromaticity `xy` whose J' is `lightness`."""
+    from wl_xcon import cam16
+
+    low, high = 0.0, 4.0
+    for _ in range(HALVINGS):
+        middle = (low + high) / 2
+        J = cam16.to_ucs(tuple(middle * u for u in _unit(xy)))[0]
+        low, high = (middle, high) if J < lightness else (low, middle)
+    return cam16.to_ucs(tuple(low * u for u in _unit(xy)))
+
+
+def _color_ucs(xy) -> tuple[float, float, float]:
+    """A color's CAM16-UCS J', a', b' in the design frame: held at the frame's gray's macaque
+    luminance on the sRGB standard's model."""
+    from wl_xcon import cam16
+
+    unit = _unit(xy)
+    per = sum(r * u for r, u in zip(photometry.SRGB_MACAQUE, unit))
+    return cam16.to_ucs(tuple(u * _frame_gray() / per for u in unit))
+
+
+def test_saturation_scales_a_lights_cam16_chroma_at_its_hue_holding_its_macaque_luminance():
+    """The PI, 2026-11-18 (COL-39): "saturation scales the color's CAM16 chroma at a fixed hue,
+    matching your generator". On the standard and on a panel that desaturates the set, each color's
+    light at saturation 0.5, read in CAM16-UCS at its color's J' about the apex taken at that J',
+    has half its color's chroma, to 1e-9, at its color's hue angle, to 1e-7°; at 1 it is its color
+    as the set is realized, exactly; at 0 the apex, exactly; and a saturation a hair inside either
+    end lies within 1e-7 of it, so the exact ends are the formula's own. At each its macaque
+    luminance is its fraction of the set's, within 1e-9. The screen binds a saturation setting as
+    it binds a fraction."""
+    import math
+
+    from wl_xcon.screen import _Lights
+
+    cs = colorset()
+    for panel in (SRGB, measured(green=NARROW_GREEN)):
+        shown = photometry.realize(cs, panel)
+        for color in COLORS:
+            realized = shown.xy[color]
+            J, a, b = _color_ucs(realized)
+            _, a0, b0 = _ucs_at(cs.apex, J)
+            for s in (0.0, 1e-9, 0.5, 1.0 - 1e-9, 1.0):
+                light = photometry.ColorSetLight(cs, color, fraction=0.8, saturation=s)
+                xyz = photometry.colorset_xyz(light, panel)
+                xy, share = photometry.colorset_xy(light, panel)
+                assert share == 0.0 and _xy(xyz) == pytest.approx(xy, abs=1e-12)
+                assert photometry.macaque_cd_m2(xyz, panel) == pytest.approx(0.8 * 15.0, abs=1e-9)
+                if s in (0.0, 1.0):
+                    assert xy == (tuple(cs.apex) if s == 0.0 else realized), (panel.id, color, s)
+                elif s < 0.5 or s > 0.5:
+                    assert xy == pytest.approx(cs.apex if s < 0.5 else realized, abs=1e-7)
+                else:
+                    _, a_s, b_s = _ucs_at(xy, J)
+                    assert math.hypot(a_s - a0, b_s - b0) == pytest.approx(
+                        0.5 * math.hypot(a - a0, b - b0), abs=1e-9), (panel.id, color)
+                    assert math.degrees(math.atan2(b_s - b0, a_s - a0)) == pytest.approx(
+                        math.degrees(math.atan2(b - b0, a - a0)), abs=1e-7), (panel.id, color)
+    lights = _Lights(values={"pale": 0.5}, calibration=SRGB, background=None)
+    assert lights.xyz(photometry.ColorSetLight(cs, "red", saturation=P("pale"))) == pytest.approx(
+        photometry.colorset_xyz(photometry.ColorSetLight(cs, "red", saturation=0.5), SRGB),
+        rel=1e-12)
+    with pytest.raises(ValueError, match="0 to 1"):
+        photometry.colorset_xyz(photometry.ColorSetLight(cs, "red", saturation=1.5), SRGB)
+
+
+def test_saturation_is_no_straight_line_in_xy_and_a_set_without_a_design_reads_the_generators_gray():
+    """**Not the old line in xy**: isohue's red at saturation 0.5 lies off the straight segment
+    from the apex to it, by more than 1e-3 in y (a CAM16-UCS hue line bends in xy). **A set with a
+    design reads its own gray lightness**: isohue with its design (J' 65) gives the same light as
+    the copy without one, which reads the generator's J' 65 (`photometry.GRAY_LIGHTNESS`); a design
+    at J' 50 gives another."""
+    import dataclasses
+
+    cs = colorset()
+    (ax, ay), (rx, ry) = cs.apex, cs.colors["red"]
+    xy, _ = photometry.colorset_xy(photometry.ColorSetLight(cs, "red", saturation=0.5), SRGB)
+    assert abs(xy[1] - (ay + 0.5 * (ry - ay))) > 1e-3
+    designed = dataclasses.replace(cs, design={"space": "CAM16-UCS", "gray_lightness": 65.0,
+                                               "chroma": 29.49})
+    darker = dataclasses.replace(cs, design={"space": "CAM16-UCS", "gray_lightness": 50.0,
+                                             "chroma": 29.49})
+    assert photometry.GRAY_LIGHTNESS == 65.0
+    at = {}
+    for name, each in (("plain", cs), ("designed", designed), ("darker", darker)):
+        at[name], _ = photometry.colorset_xy(
+            photometry.ColorSetLight(each, "red", saturation=0.5), SRGB)
+    assert at["designed"] == at["plain"]
+    assert abs(at["darker"][0] - at["plain"][0]) > 1e-6
+
+
+def test_every_saturation_of_isohue_is_shown_on_the_standard_and_the_test_panels():
+    """**No isohue light leaves these panels' gamuts at any saturation**: on the standard and on a
+    narrow test panel, at luminances the set is shown at as written and desaturated, every
+    saturation on a grid from 0 to 1 is a light the panel makes, none clipped, none moved
+    (`colorset_xy`'s share 0), each at its CAM16-UCS place (`saturated_xy`) -- what the
+    ColorSetLight's docstring says was computed."""
+    cs = colorset()
+    for panel, luminances in ((SRGB, (5.0, 15.0, 30.0)), (measured(green=NARROW_GREEN), (15.0,))):
+        for luminance in luminances:
+            assert photometry.unrealizable(
+                photometry.ColorSetLight(cs, "green", luminance=luminance), panel) is None
+            shown = photometry.realize(cs, panel, luminance)
+            for color in COLORS:
+                for step in range(21):
+                    s = step / 20
+                    light = photometry.ColorSetLight(cs, color, luminance=luminance, saturation=s)
+                    assert photometry.unrealizable(light, panel) is None, (
+                        panel.id, luminance, color, step)
+                    xy, share = photometry.colorset_xy(light, panel)
+                    assert share == 0.0
+                    assert xy == photometry.saturated_xy(cs, shown.xy[color], s)
+
+
+#: **A panel built so a CAM16-UCS path leaves its gamut**: its red and green primaries on the line
+#: y = 0.3295, just above isohue's apex (y 0.32900) and its red (y 0.32918), so the straight segment
+#: between them is inside, and the red's path at saturation 0.5, which bows to y 0.3307, is not.
+#: Illustrative, as every test panel is.
+EDGE = 0.3295
+
+
+def test_a_saturation_outside_the_panels_gamut_is_moved_toward_the_apex_and_warned():
+    """**Handled as the realization handles a light outside the gamut**: a set of isohue's red
+    alone, shown as written on a panel whose edge runs between its straight segment and its
+    CAM16-UCS path, is drawn at saturation 0.5 moved toward the apex in xy by the least share that
+    shows it (to `DESATURATION_STEP`), on the line from its CAM16-UCS place to the apex, its
+    luminance held and nothing clipped; the load check warns `color-set-desaturated`, naming the
+    light, its saturation and the share -- reading a saturation setting's range between its ends,
+    where its ends need nothing -- and on the standard it warns nothing."""
+    one = photometry.ColorSet(name="red", colors={"red": colorset().colors["red"]},
+                              apex=colorset().apex, luminance_cd_m2=2.0, held=colorset().held,
+                              source="a test's")
+    panel = measured(red=xyY(0.66, EDGE, 45.0), green=xyY(0.05, EDGE, 140.0),
+                     blue=xyY(0.15, 0.06, 12.0))
+    shown = photometry.realize(one, panel)
+    assert shown.desaturation == 0.0
+    light = photometry.ColorSetLight(one, "red", saturation=0.5)
+    asked = photometry.saturated_xy(one, shown.xy["red"], 0.5)
+    xy, share = photometry.colorset_xy(light, panel)
+    assert 0.5 < share < 0.9
+    (ax, ay) = one.apex
+    assert xy == pytest.approx((asked[0] + share * (ax - asked[0]),
+                                asked[1] + share * (ay - asked[1])), abs=1e-12)
+    assert photometry.unrealizable(light, panel) is None
+    narrower = (asked[0] + (share - 1e-6) * (ax - asked[0]),
+                asked[1] + (share - 1e-6) * (ay - asked[1]))
+    weights = panel.weights_of(photometry._held_light(narrower, 2.0, panel))
+    assert max(weights) > 1.0 + photometry.TOLERANCE or min(weights) < -photometry.TOLERANCE
+    xyz = photometry.colorset_xyz(light, panel)
+    assert _xy(xyz) == pytest.approx(xy, abs=1e-12)
+    assert photometry.macaque_cd_m2(xyz, panel) == pytest.approx(2.0, abs=1e-9)
+    for s in (0.0, 1.0):
+        assert photometry.colorset_xy(
+            photometry.ColorSetLight(one, "red", saturation=s), panel)[1] == 0.0
+
+    pale = Param("pale", unit="fraction", low=0.0, high=1.0, start=1.0)
+    lit = {"odd": photometry.ColorSetLight(one, "red", saturation=P("pale"))}
+    (warned,) = [f for f in check(_trial(lit, params=[pale]), calibration=panel)
+                 if f.code == "color-set-desaturated"]
+    assert not warned.blocking and warned.accepted_in == SESSION_KINDS
+    assert warned.subjects == ("color set 'red'",)
+    assert "CAM16-UCS" in warned.detail
+    assert re.search(r"Disc in red at saturation 0\.\d+ and 2 cd/m², by \d+\.\d%$", warned.detail), (
+        warned.detail)
+    assert [f for f in check(_trial(lit, params=[pale]), calibration=SRGB)
+            if f.code == "color-set-desaturated"] == []
+
+
+def test_a_swatch_is_the_light_as_the_srgb_standard_shows_it():
+    """`photometry.srgb_hex`: the standard's white at its 80 cd/m² is `#ffffff`, black `#000000`,
+    wl-style's four previews and its gray read back as themselves, and a light past the gamut is
+    clipped to a color the page can show."""
+    assert photometry.srgb_hex(photometry.to_xyz(xyY(*D65, 80.0))) == "#ffffff"
+    assert photometry.srgb_hex((0.0, 0.0, 0.0)) == "#000000"
+    for hex_ in (*PREVIEWS.values(), GRAY):
+        assert photometry.srgb_hex(_srgb_light(hex_)) == hex_
+    bright = photometry.srgb_hex(photometry.to_xyz(xyY(0.15, 0.06, 500.0)))
+    assert len(bright) == 7 and bright.startswith("#")
+
+
+def test_a_light_at_saturation_zero_adds_no_desaturation_warning():
+    """The pop-out revision's seam, defect 1: a light is read at its own saturation. Beside the
+    four colors at 15 cd/m², a fixation light at saturation 0 drawn at a luminance setting of 1 to
+    30 cd/m² -- where the standard cannot show the set as written above about 26 -- is the set's
+    gray whatever its hue, so it adds no `color-set-desaturated`; at saturation 1 the same light
+    is warned for it."""
+    cs = colorset()
+    bright = Param("bright", unit="cd/m2", low=1.0, high=30.0, start=15.0)
+
+    def warned(saturation: float) -> list:
+        lights = {name: photometry.ColorSetLight(cs, name) for name in COLORS[:3]}
+        lights["fix"] = photometry.ColorSetLight(cs, "green", luminance=P("bright"),
+                                                 saturation=saturation)
+        return [f for f in check(_trial(lights, params=[bright]), calibration=SRGB)
+                if f.code == "color-set-desaturated"]
+
+    assert warned(0.0) == []
+    (pale,) = warned(1.0)
+    assert "'bright'" in pale.detail

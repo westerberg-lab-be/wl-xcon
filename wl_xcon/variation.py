@@ -45,8 +45,8 @@ from statistics import NormalDist
 from wl_xcon.declarations import canonical
 from wl_xcon.geometry import shown_direction
 from wl_xcon.task import (
-    EASIER, NOT_DIFFICULTY, Background, Block, Condition, Distribution, Factorial, Listed, Meaning,
-    NonAging, P, Param, Polar, Task, TruncatedNormal, Uniform, Weighted, is_point,
+    EASIER, FRESH, NOT_DIFFICULTY, Background, Block, Condition, Distribution, Factorial, Listed,
+    Meaning, NonAging, P, Param, Polar, Scaled, Task, TruncatedNormal, Uniform, Weighted, is_point,
 )
 
 #: 2**53: a unit is the first 53 bits of a hash, as a fraction of this.
@@ -57,14 +57,27 @@ _ABOVE_0 = math.nextafter(0.0, 1.0)
 _BELOW_1 = math.nextafter(1.0, 0.0)
 
 #: **The numbers a person may change live, by kind** (the PI, 2026-10-30, Q7b, "Yes, range changes
-#: live"; the spec's §6, "a uniform's ends; a wait's shortest, average and longest"): a uniform's
-#: ends, a normal's numbers and cut, a wait's shortest, mean and longest. The kind never changes
-#: live (a task edit); a weighted set's weights and a list's items are not changed live in engine
-#: build C3.
+#: live"; the spec's §6): a uniform's ends, a normal's numbers and cut, and **a wait's shortest and
+#: longest, its mean derived from them** (TSK-15's revision; the PI, 2026-11-16, "Derived from min
+#: and max", which supersedes C3's live average: the console settings plan's call). The kind never
+#: changes live (a task edit); a weighted set's weights and a list's items are not changed live in
+#: engine build C3.
 LIVE_NUMBERS: dict[type, tuple[str, ...]] = {
     Uniform: ("low", "high"),
     TruncatedNormal: ("mean", "sd", "low", "high"),
-    NonAging: ("minimum", "mean", "maximum"),
+    NonAging: ("minimum", "maximum"),
+}
+
+#: **The numbers a person's draw of each shape takes** (`task.SHAPES`; the console settings
+#: design's §3), by the names a card sends them under (`link.SetForm`): a non-aging wait its
+#: shortest and longest, a uniform its ends, a normal its mean, spread and cut; a list and a
+#: weighted list none, their `values` and `weights` sent beside.
+FORM_NUMBERS: dict[str, tuple[str, ...]] = {
+    "non_aging": ("shortest", "longest"),
+    "uniform": ("low", "high"),
+    "normal": ("mean", "sd", "low", "high"),
+    "list": (),
+    "weights": (),
 }
 
 #: The fields of each distribution that are places on its setting's axis: a direction's are
@@ -298,7 +311,11 @@ def draw(
       `maximum` by its inverse distribution function -- the distribution drawing a wait past the
       longest again gives, without a loop.
 
-    Anything else, which the load refuses, draws `None`."""
+    **A size scaled by eccentricity** (`task.Scaled`; the console settings design's §5) is no draw:
+    it gives itself, each object then drawn at its own place (`task.size_at`). Anything else, which
+    the load refuses, draws `None`."""
+    if isinstance(distribution, Scaled):
+        return distribution
     if isinstance(distribution, Listed):
         values = _items(distribution.values)
         place = ordinal % len(values)
@@ -474,6 +491,11 @@ def level_name(level: object) -> str:
     if isinstance(level, str):
         return level
     if isinstance(level, Distribution):
+        if isinstance(level, NonAging):
+            # A condition's name keeps the numbers the author wrote, not the decay's arithmetic
+            # (`words`, since TSK-15's revision): a name is an identity, said the same in every
+            # build (the console settings build's Task 2, the builder's call).
+            return f"non-aging from {level.minimum!r} to {level.maximum!r}, mean {level.mean!r}"
         return words(level, "")
     if _number(level):
         return repr(level)
@@ -594,9 +616,12 @@ def numbers(distribution: object) -> dict[str, float] | None:
 
 def with_numbers(distribution: Distribution, changed: dict[str, float]) -> Distribution:
     """**`distribution` with the numbers a person changed live** (the PI, 2026-10-30, Q7b): the
-    same kind, what a repeat takes and every number not named as they were. `ValueError`, saying
-    which, for a kind whose numbers are not changed live or a name that is not one of its live
-    numbers. Whether the result can be drawn is `check.undrawable`'s to judge."""
+    same kind, what a repeat takes and every number not named as they were. **A wait whose end a
+    person moves derives its decay again** (`NonAging.between`; TSK-15's revision), its mean a
+    third of the new range past the shortest; a declared mean stands until an end moves.
+    `ValueError`, saying which, for a kind whose numbers are not changed live or a name that is
+    not one of its live numbers. Whether the result can be drawn is `check.undrawable`'s to
+    judge."""
     fields = LIVE_NUMBERS.get(type(distribution))
     kind = type(distribution).__name__
     if fields is None:
@@ -610,7 +635,223 @@ def with_numbers(distribution: Distribution, changed: dict[str, float]) -> Distr
                 f"{name!r} is not a number of a {kind} changed live; its live numbers are "
                 f"{', '.join(fields)}"
             )
+    if isinstance(distribution, NonAging) and changed:
+        moved = dataclasses.replace(distribution, **changed)
+        return NonAging.between(moved.minimum, moved.maximum, repeat=moved.repeat)
     return dataclasses.replace(distribution, **changed)
+
+
+def formed(shape: str, numbers: dict, values: tuple = (), weights: tuple = (), *,
+           repeat: str = FRESH) -> Distribution:
+    """**The distribution a person's draw of `shape` is** (the console settings design's §3;
+    `task.SHAPES`), from the numbers, values and weights a card sent (`link.SetForm`), what a
+    repeat takes `repeat` -- `FRESH` on the console (the PI's "Follow same/fresh": the wait is
+    new): a non-aging wait between its shortest and longest, its decay derived
+    (`NonAging.between`), a uniform, a normal cut to its own range, a list in shuffled passes, a
+    weighted list. **`ValueError`, with the sentence a console shows**, for a shape that is none
+    of them, numbers other than its own (`FORM_NUMBERS`), values or weights a shape of numbers
+    does not take, weights a list does not take, and a shortest not below the longest. Whether
+    it can be drawn is `check.undrawable`'s to judge."""
+    if shape not in FORM_NUMBERS:
+        raise ValueError(f"{shape!r} is not a shape a setting is drawn in: one of "
+                         f"{', '.join(FORM_NUMBERS)}")
+    wanted = FORM_NUMBERS[shape]
+    if set(numbers) != set(wanted):
+        sent = ", ".join(sorted(numbers)) or "none"
+        takes = " and ".join(wanted) if wanted else "no numbers"
+        raise ValueError(f"a {shape} draw takes {takes}, and was sent {sent}")
+    if wanted and (values or weights):
+        raise ValueError(f"a {shape} draw takes no values or weights, only {', '.join(wanted)}")
+    if shape == "list" and weights:
+        raise ValueError("a list draw takes no weights: send a weighted list for those")
+    if shape == "non_aging":
+        shortest, longest = numbers["shortest"], numbers["longest"]
+        if not shortest < longest:
+            raise ValueError(f"its shortest, {shortest!r}, is not below its longest, "
+                             f"{longest!r}; give a shortest below the longest")
+        return NonAging.between(shortest, longest, repeat=repeat)
+    if shape == "uniform":
+        return Uniform(numbers["low"], numbers["high"], repeat=repeat)
+    if shape == "normal":
+        return TruncatedNormal(numbers["mean"], numbers["sd"], numbers["low"], numbers["high"],
+                               repeat=repeat)
+    if shape == "list":
+        return Listed(tuple(values), repeat=repeat)
+    return Weighted(tuple(values), tuple(weights), repeat=repeat)
+
+
+#: The shape each kind of distribution is offered as on a card (`shaped`), `FORM_NUMBERS`' names.
+_SHAPE_OF = {NonAging: "non_aging", Uniform: "uniform", TruncatedNormal: "normal",
+             Listed: "list", Weighted: "weights"}
+
+
+def shaped(distribution: object, declared: Param | None = None) -> dict | None:
+    """**A draw as a card's drawn side shows it** (`link.ParamRow.shape`; the console settings
+    design's §3): its shape and its numbers by the names a card sends back (`FORM_NUMBERS`), a
+    normal's cut filled from `declared` where it gives none, and a list's values and weights as
+    lists, each a number. `None` for anything else, and for a set holding a value that is no
+    finite number (a word, a position), which no card's fields can hold. **A size's scaling**
+    (`task.Scaled`; the console settings design's §5) is shape `"scaled"`, its number its
+    `factor`."""
+    if isinstance(distribution, Scaled):
+        return {"shape": "scaled", "numbers": {"factor": distribution.factor}, "values": [],
+                "weights": []}
+    shape = _SHAPE_OF.get(type(distribution))
+    if shape is None:
+        return None
+    values = list(values_of(distribution))
+    weights = list(_items(distribution.weights)) if isinstance(distribution, Weighted) else []
+    if not all(_finite(item) for item in values + weights):
+        return None
+    if isinstance(distribution, NonAging):
+        numbers = {"shortest": distribution.minimum, "longest": distribution.maximum}
+    elif isinstance(distribution, Uniform):
+        numbers = {"low": distribution.low, "high": distribution.high}
+    elif isinstance(distribution, TruncatedNormal):
+        low, high = _cut(distribution, declared)
+        numbers = {"mean": distribution.mean, "sd": distribution.sd, "low": low, "high": high}
+    else:
+        numbers = {}
+    return {"shape": shape, "numbers": numbers, "values": values, "weights": weights}
+
+
+#: **How many bars a continuous draw's histogram has** (the console settings design's §3): 20 bins
+#: across its range, an engineering default for a figure a card can hold -- fine enough to show a
+#: hazard climbing near the longest wait (the decay report's table is read at 1/4, 1/2, 2/3 and 9/10
+#: of a range), coarse enough that each bin holds a readable share. A list has a bar a value instead.
+PROFILE_BINS = 20
+
+#: A normal given no end, neither its own nor its setting's, is drawn over its mean plus and minus
+#: this many spreads, which holds all but 6 in 100,000 of its draws.
+_UNCUT = 4.0
+
+#: Profiles built so far, by distribution (`profile`): a few hundred at most, a card's draw
+#: being one of a handful, cleared whole past `_KEPT` so a long session never grows it unbounded.
+_PROFILES: dict = {}
+_KEPT = 256
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Profile:
+    """**A draw's histogram and its hazard** (`profile`): `edges`, the bins' ends (one more than
+    `density`) for a range, or the values themselves (as many as `density`) for a list or a
+    weighted set; `density`, each bin's or value's share of the draws, summing to 1; and `hazard`,
+    each one's chance of ending there given it has not, as a multiple of the first's, so a flat
+    hazard is 1 throughout."""
+
+    edges: tuple
+    density: tuple
+    hazard: tuple
+
+    def as_dict(self) -> dict:
+        """The profile as `link.ParamRow.profile` carries it."""
+        return {"edges": list(self.edges), "density": list(self.density),
+                "hazard": list(self.hazard)}
+
+
+def _hazards(density: tuple) -> tuple:
+    """Each bin's hazard as a multiple of the first with any chance's: `density[i]` over the share
+    of draws still to end at it, `sum(density[i:])`, 0 where none is left. The first bin with a
+    hazard above 0 is the one the rest are measured against (the first itself, unless it holds
+    nothing); all 0 where no bin holds any."""
+    left = 0.0
+    rates = []
+    for share in reversed(density):
+        left += share
+        rates.append(share / left if left > 0 else 0.0)
+    rates.reverse()
+    base = next((rate for rate in rates if rate > 0), 0.0)
+    return tuple(rate / base if base else 0.0 for rate in rates)
+
+
+def _build(kind: str, numbers: tuple, bins: int) -> Profile:
+    """`profile`'s arithmetic, once for each distinct `(kind, numbers, bins)`. `numbers` is what the
+    kind needs: a range's ends and its decay, a normal's mean, spread and cut, or a finite set's
+    values and weights."""
+    if kind in ("listed", "weighted"):
+        values, weights = numbers
+        share: dict = {}
+        for value, weight in zip(values, weights):
+            if weight > 0:
+                share[value] = share.get(value, 0.0) + weight
+        total = sum(share.values())
+        if not share or not total > 0:
+            return Profile((), (), ())
+        edges = tuple(sorted(share))
+        density = tuple(share[value] / total for value in edges)
+        return Profile(edges, density, _hazards(density))
+    low, high = numbers[0], numbers[1]
+    if not high > low:
+        return Profile((low,), (1.0,), (1.0,))
+    edges = tuple(low + (high - low) * place / bins for place in range(bins))
+    edges += (high,)
+    if kind == "non_aging":
+        scale = numbers[2]
+        span = high - low
+
+        def cdf(at: float) -> float:
+            return math.expm1(-(at - low) / scale) / math.expm1(-span / scale)
+    elif kind == "normal":
+        normal = NormalDist(numbers[2], numbers[3])
+        below = normal.cdf(low)
+
+        def cdf(at: float) -> float:
+            return (normal.cdf(at) - below) / (normal.cdf(high) - below)
+    else:
+        def cdf(at: float) -> float:
+            return (at - low) / (high - low)
+    cuts = [cdf(at) for at in edges]
+    density = tuple(max(cuts[place + 1] - cuts[place], 0.0) for place in range(bins))
+    total = sum(density)
+    density = tuple(share / total for share in density) if total > 0 else density
+    return Profile(edges, density, _hazards(density))
+
+
+def profile(distribution: Distribution, declared: Param | None = None, *,
+            bins: int = PROFILE_BINS) -> Profile:
+    """**What a card shows of a drawn setting's distribution** (the console settings design's §3;
+    the PI, 2026-11-16): its density as bars, each bin's share of the draws, and its hazard
+    *against flat*, each bin's chance of ending given it has not, as a multiple of the first bin's
+    (the decay report's columns), so a constant hazard is 1 and the foreperiod's rises to 3.67 in
+    the bin holding 9/10 of its range. A range is cut into `bins` equal bins, a normal cut as
+    `bounds_of` cuts it (an end neither it nor `declared` gives, `_UNCUT` spreads from its mean);
+    **a list or a weighted set has one bar for each value**, a value of weight 0 left out since it
+    is never drawn, a repeated value one bar, its hazard discrete, `P(v) / P(>= v)`. A distribution
+    of no width is one bar of every draw; one no draw can come from (an empty list, weights all 0)
+    has no bars, and so does one whose arithmetic fails (`check.undrawable` refuses it at load). **Arithmetic of the declared distribution, not a measurement of the rig.**
+    **Cached by distribution**, so `Session.parameters` -- read between trials for every drawn
+    card -- builds none twice, and never in a frame."""
+    if isinstance(distribution, (Listed, Weighted)):
+        values = values_of(distribution)
+        weights = (tuple(_items(distribution.weights)) if isinstance(distribution, Weighted)
+                   else (1.0,) * len(values))
+        kind, numbers = type(distribution).__name__.lower(), (values, weights)
+    elif isinstance(distribution, NonAging):
+        low, high = bounds_of(distribution)
+        kind, numbers = "non_aging", (low, high, distribution.mean - distribution.minimum)
+    elif isinstance(distribution, TruncatedNormal):
+        low, high = bounds_of(distribution, declared)
+        mean, sd = distribution.mean, distribution.sd
+        low = mean - _UNCUT * sd if low == -math.inf else low
+        high = mean + _UNCUT * sd if high == math.inf else high
+        kind, numbers = "normal", (low, high, mean, sd)
+    elif isinstance(distribution, Uniform):
+        kind, numbers = "uniform", (distribution.low, distribution.high)
+    else:
+        return Profile((), (), ())
+    key = (kind, numbers, bins)
+    built = _PROFILES.get(key)
+    if built is None:
+        if len(_PROFILES) >= _KEPT:
+            _PROFILES.clear()
+        try:
+            built = _build(*key)
+        except (ArithmeticError, ValueError):
+            # A spread of 0, a decay of 0: what the load refuses (`check.undrawable`), shown as no
+            # bars rather than raised between trials.
+            built = Profile((), (), ())
+        _PROFILES[key] = built
+    return built
 
 
 def _turned(value: object) -> object:
@@ -653,7 +894,10 @@ def words(distribution: Distribution, unit: str, *, direction: bool = False) -> 
     `"uniform from 315 deg to 45 deg"`; `"one of 0.1 s, 0.5 s, weighted 3:1"`; `"normal of mean
     1.0 s and sd 0.1 s, cut from 0.9 s to 1.1 s"` (`"cut to the setting's range"` where it
     declares no cut of its own); `"each of 2, 4, 6 once a pass, shuffled"` or `"in order: 2, 4, 6,
-    over and over"`; `"non-aging from 0.75 s to 1.25 s, mean 1.0 s"`."""
+    over and over"`; `"non-aging from 0.75 s to 1.25 s, mean 1.0 s"`; a size's scaling (`task.Scaled`)
+    `"scaled, 0.3 times its eccentricity"`."""
+    if isinstance(distribution, Scaled):
+        return f"scaled, {distribution.factor!r} times its eccentricity"
     shown = _shown(distribution, direction)
     # In a direction draw, equal ends mean the whole turn (the controller's ruling on the review of
     # Task 4): a span of 360 in the task's own terms reads as both ends the same direction.
@@ -689,9 +933,35 @@ def words(distribution: Distribution, unit: str, *, direction: bool = False) -> 
             return f"in order: {items}, over and over"
         return f"each of {items} once a pass, shuffled"
     if isinstance(shown, NonAging):
-        return (f"non-aging from {amount(shown.minimum)} to {amount(shown.maximum)}, "
-                f"mean {amount(shown.mean)}")
+        return _wait_said(shown, amount, unit)
     return repr(distribution)
+
+
+def _wait_said(wait: NonAging, amount, unit: str) -> str:
+    """**A non-aging wait in the rig's words, with its decay's arithmetic** (TSK-15's revision; the
+    console settings design's §3): its two ends, then its time constant (`mean - minimum`), how
+    many draws in how many are drawn again past the longest (`e^-(range/τ)`, rounded to a whole
+    one in n) and its mean once they are (`realized_mean`), each to four significant figures: 750
+    to 1250 ms with its decay derived reads "τ 0.1667 s, 1 in 20 drawn again, mean 0.8905 s".
+    Arithmetic of the declared distribution, not a measurement of the rig. One whose numbers give
+    no decay -- not finite, its mean not past its shortest or past its longest -- is said with its
+    numbers as written, never raising (the load refuses it)."""
+    ends = f"non-aging from {amount(wait.minimum)} to {amount(wait.maximum)}"
+    numbers = (wait.minimum, wait.mean, wait.maximum)
+    if not (all(_finite(number) for number in numbers)
+            and wait.minimum < wait.mean <= wait.maximum):
+        return f"{ends}, mean {amount(wait.mean)}"
+    tau = wait.mean - wait.minimum
+    again = math.exp(-(wait.maximum - wait.minimum) / tau)
+    if again <= 0.0 or 1.0 / again > 1e6:
+        redrawn = "fewer than 1 in a million drawn again"
+    else:
+        redrawn = f"1 in {round(1.0 / again)} drawn again"
+
+    def figure(value: float) -> str:
+        return f"{value:.4g} {unit}" if unit else f"{value:.4g}"
+
+    return f"{ends} (τ {figure(tau)}, {redrawn}, mean {figure(realized_mean(wait))})"
 
 
 def directions(task: Task) -> frozenset[str]:

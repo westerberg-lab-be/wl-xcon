@@ -389,8 +389,8 @@ def _either_task(tmp_path, reach: float) -> str:
     axis."""
     text = Path("tasks/fixation_detection.py").read_text(encoding="utf-8")
     written_for = 'view="direct"'
-    across = 'Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0)'
-    up = 'Param("target_y", unit="deg", low=-16.0, high=16.0, start=0.0)'
+    across = 'Param("target_x", unit="deg", start=10.0)'
+    up = 'Param("target_y", unit="deg", start=0.0)'
     assert text.count(written_for) == 1 and text.count(across) == 1 and text.count(up) == 1
     text = text.replace(written_for, 'view="either"').replace(
         across, f'Param("target_x", unit="deg", low={-reach}, high={reach}, start=10.0)'
@@ -503,6 +503,8 @@ def test_wlx_run_says_the_calibration_and_every_warning_its_flag_accepts(tmp_pat
     assert "  calibration: srgb-standard (the sRGB standard, measured by nobody)" in out
     assert [line for line in out if line.startswith("  warning accepted: ")] == [
         f"  warning accepted: {row['code']}: {row['detail']}" for row in rows]
+    # And no limit with no reason: each bound the reference task keeps is impossible or decided,
+    # with its reason (`unexplained-limit`; the console settings plan's Task 5).
     assert [row["code"] for row in rows] == ["default calibration", "contrast-on-default"]
 
 
@@ -572,7 +574,12 @@ def test_wlx_check_view_checks_one_setup(tmp_path, capsys):
     wide = _either_task(tmp_path, 16.0)
 
     assert main(["check", wide, "--rig", RIG_FILE, "--allocation", ALLOCATION, "--view", "direct"]) == 0
-    assert main(["check", GOOD, "--rig", RIG_FILE, "--allocation", ALLOCATION, "--view", "stereoscope"]) == 1
+    # The task starts at 10°, which the stereoscope's mask shows: only its mismatch is said. The
+    # ±16° it reached before the PI took the range away (2026-11-16) is a value it is refused at.
+    assert main(["check", wide, "--rig", RIG_FILE, "--allocation", ALLOCATION, "--view",
+                 "stereoscope"]) == 1
+    assert "stimulus-off-screen" in capsys.readouterr().out
+    assert main(["check", GOOD, "--rig", RIG_FILE, "--allocation", ALLOCATION, "--view", "stereoscope"]) == 0
     assert "wrong-setup" in capsys.readouterr().out
 
 
@@ -977,7 +984,7 @@ def test_the_link_allow_remote_help_says_every_command_a_host_could_send(capsys)
     """XC-172: `wlx run`'s help listed some of the commands and `wlx taskd`'s named
     opening and ending sessions but not starting runs or acknowledging. Each now names
     every kind the link accepts (read from `Command`, so one added later fails here) --
-    `wlx run`'s all of them with the five only `wlx taskd` acts on said to be refused by
+    `wlx run`'s all of them with the six only `wlx taskd` acts on said to be refused by
     a `wlx run` session, and `wlx taskd`'s the same list."""
     run_help = _help_of(capsys, "run")
     taskd_help = _help_of(capsys, "taskd")
@@ -2460,6 +2467,18 @@ def test_console_shows_a_setting_holding_a_position_eccentricity_and_direction_f
                                "8° at 45° · (x, y) (5.675, 5.675) by jake") for line in rendered)
 
 
+def test_console_shows_a_setting_holding_a_look_in_the_rigs_words():
+    """XC-420 closed: a setting whose value is a look travels as the rig's words, `value` null
+    (`ParamRow.words`), and `wlx console`'s parameter line prints the words, never *unset*."""
+    rendered = render(_telemetry(params=(
+        ParamRow("distractor_appearance", "appearance", None, None, None, False,
+                 words="Disc: color isohue red"),),
+    )).splitlines()
+
+    assert ("  param: distractor_appearance Disc: color isohue red (no declared range)"
+            in rendered)
+
+
 def test_console_shows_a_staged_value_that_is_no_number_or_word_as_written():
     """XC-401's second fix round: a staged value that is neither a number nor a word -- a pair a
     setting not declared a position holds, arriving as a list -- is printed as written, where
@@ -2591,12 +2610,21 @@ def test_wlx_run_refuses_a_task_the_other_setups_field_cannot_show_before_anythi
     argv = _run_args(tmp_path, "--out-of-cage-at", _hhmm())
     argv[argv.index("direct")] = "stereoscope"
     argv += ["--subject-settings", "tasks/reference_subject.py"]
+    text = Path("tasks/fixation_detection.py").read_text(encoding="utf-8")
+    old = 'Param("target_x", unit="deg", start=10.0)'
+    assert text.count(old) == 1
+    far = tmp_path / "far_detection.py"
+    far.write_text(text.replace(old, 'Param("target_x", unit="deg", start=16.0)'), encoding="utf-8")
+    argv[1] = str(far)
+    argv[argv.index("target_x=10.0")] = "target_x=16.0"
 
     with pytest.raises(SystemExit) as refused:
         main(argv)
 
-    # The setups' mismatch is a warning (XC-352's A12); the reference task's ±16° beyond the
-    # stereoscope's ±12° mask still refuses, before anything is recorded.
+    # The setups' mismatch is a warning (XC-352's A12); the reference task starting at ±16°,
+    # beyond the stereoscope's ±12° mask, still refuses, before anything is recorded (the range
+    # that reached 16° is gone, so the task that starts there stands for it: an open side is held
+    # at its start at load).
     assert "stimulus-off-screen" in str(refused.value) and "wrong-setup" not in str(refused.value)
     assert not (tmp_path / "2027-01-14_01").exists()
 
@@ -2628,7 +2656,7 @@ def test_wlx_check_holds_the_task_object_to_its_declarations(tmp_path, capsys):
     """`wlx check` is the guardrail a person runs (this file's docstring): a setting with no meaning
     is refused there too."""
     text = Path("tasks/fixation_detection.py").read_text()
-    was = '        Param("fix_hold", unit="s", low=0.05, high=2.0, start=0.3),\n'
+    was = '        Param("fix_hold", unit="s", low=0.0, high=10.0, start=0.3, why=HOLD_WHY_10),\n'
     assert text.count(was) == 1
     unexplained = tmp_path / "unexplained.py"
     unexplained.write_text(text.replace(
@@ -2725,6 +2753,7 @@ def test_wlx_run_records_the_warnings_its_flag_accepted(tmp_path):
     assert [(r["code"], r["how"], r["by"]) for r in rows] == [
         ("default calibration", "--accept-warnings", {"kind": "box", "name": "jake"}),
         ("contrast-on-default", "--accept-warnings", {"kind": "box", "name": "jake"})]
+    assert {(r["how"], r["by"]["name"]) for r in rows} == {("--accept-warnings", "jake")}
 
 
 def test_wlx_run_accepts_its_warnings_before_the_departure_is_marked(tmp_path, monkeypatch):

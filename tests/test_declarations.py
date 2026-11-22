@@ -229,8 +229,9 @@ DEFAULTS = {
     "Choice": {"objects": REQUIRED, "by": REQUIRED},
     "Color": {},
     "ColorSet": {"name": REQUIRED, "colors": REQUIRED, "apex": REQUIRED, "luminance_cd_m2": 15.0,
-                 "held": "macaque_2deg_LM1", "source": ""},
-    "ColorSetLight": {"colorset": REQUIRED, "color": REQUIRED, "fraction": 1.0, "luminance": None},
+                 "held": "macaque_2deg_LM1", "source": "", "design": None},
+    "ColorSetLight": {"colorset": REQUIRED, "color": REQUIRED, "fraction": 1.0, "luminance": None,
+                      "saturation": 1.0},
     "Condition": {"name": REQUIRED, "values": REQUIRED, "target": REQUIRED, "structure": None},
     "ConeContrast": {"L": 0.0, "M": 0.0, "S": 0.0},
     "Constrained": {"max_run": 2, "weights": {}},
@@ -262,6 +263,9 @@ DEFAULTS = {
     },
     "FeatureAbove": {"source": REQUIRED, "threshold": REQUIRED},
     "Fixed": {},
+    # The console settings build's Task 10: a plan's full task (`task.FullTask`, `Plan.full`), new
+    # and at its default in every task written before it, so raising nothing.
+    "FullTask": {"block": REQUIRED, "values": {}},
     "Form": {},
     "Gabor": {
         "sf": 2.0,
@@ -280,11 +284,16 @@ DEFAULTS = {
         "color": None,
     },
     "Gray": {"cd_m2": REQUIRED},
+    "Group": {"name": REQUIRED, "settings": REQUIRED, "sentence": ""},
     "Guard": {},
     "Hide": {"stimulus": REQUIRED},
     "Hold": {"window": REQUIRED, "seconds": REQUIRED},
     "Listed": {"values": REQUIRED, "in_order": False, "repeat": None},
-    "ObjectWindows": {"of": REQUIRED, "radius": REQUIRED, "eye": "both"},
+    # `radius` was required until the console settings build's Task 6 (2026-11-18), which gave it
+    # `None` beside the new `scale`, exactly one declared (refused as built): no task written
+    # before could leave it out, so none is at the new default and none's content moves, and the
+    # format stands (the builder's ruling).
+    "ObjectWindows": {"of": REQUIRED, "radius": None, "eye": "both", "scale": None},
     "Mark": {"code": REQUIRED},
     "Meaning": {
         "kind": REQUIRED,
@@ -306,6 +315,8 @@ DEFAULTS = {
         "color": None,
     },
     "NonAging": {"minimum": REQUIRED, "mean": REQUIRED, "maximum": REQUIRED, "repeat": None},
+    # A size's scaling (the console settings build): a person's form, held by no task file yet.
+    "Scaled": {"factor": REQUIRED},
     "On": {"guard": REQUIRED, "to": REQUIRED, "do": []},
     "Onscreen": {"patch": "task"},
     "Order": {},
@@ -318,9 +329,17 @@ DEFAULTS = {
         "choices": [],
         "live": True,
         "start": None,
+        "why": "",
+        "section": "",
+        "label": "",
+        "help": "",
+        "whole": False,
+        "step": None,
+        "percent": False,
     },
     "Picture": {"asset": "", "size": 10.0},
-    "Plan": {"blocks": REQUIRED, "order": {"class": "Fixed", "fields": {}}, "time_limit_s": None},
+    "Plan": {"blocks": REQUIRED, "order": {"class": "Fixed", "fields": {}}, "time_limit_s": None,
+             "full": None},
     "Plaid": {
         "sf": 2.0,
         "orientation": 0.0,
@@ -359,6 +378,7 @@ DEFAULTS = {
     "Show": {"stimulus": REQUIRED},
     "Shuffled": {},
     "Slant": {"gradient": 0.05, "orientation": 0.0},
+    "Special": {"kind": REQUIRED, "share": REQUIRED, "structure": REQUIRED},
     "Square": {"size": 1.0, "contrast": None, "color": None},
     "Staircase": {"setting": REQUIRED, "levels": REQUIRED, "down": 3, "up": 1, "start": None,
                   "hardest": ""},
@@ -386,6 +406,8 @@ DEFAULTS = {
         "pool": None,
         "plans": {},
         "draws": {},
+        "groups": [],
+        "specials": [],
     },
     "Tolerances": {"blink": 0.0, "tracker_lost": 0.05},
     "Touched": {"window": REQUIRED},

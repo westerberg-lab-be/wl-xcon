@@ -11,10 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 import math
+import string
 from enum import Enum
 from typing import NamedTuple
 
-from wl_xcon.geometry import on_circle_deg, polar_deg
+from wl_xcon.geometry import on_circle_deg, polar_deg, polar_of_deg
 from wl_xcon.photometry import Color, ColorSetLight, Contrast
 
 
@@ -145,10 +146,14 @@ class Param:
     live: bool = True
     #: **The value a run starts with when nobody gives one** (P4d-2b spec §6.2:
     #: "Starting values are the task's own"; S8 §3.4's *task* layer, under what a console
-    #: or `wlx run --set` gives): a number inside the parameter's own declared range.
-    #: `__post_init__` refuses any other as the task is built: a starting appearance is
-    #: not carried until telemetry publishes one (XC-420; the record writes one since REC-27),
-    #: and a start outside `[low, high]` would run under `wlx run`, which takes no
+    #: or `wlx run --set` gives): a number inside the parameter's own declared range, or, **for a
+    #: setting of choices, one of them** -- a look, the fixation point's hold look say (the
+    #: pop-out revision's plan, Task 5; TSK-79; XC-517, the other half of XC-420): a run, the
+    #: record (REC-27's form), the pre-flight and the card take it as they take a choice set live.
+    #: `__post_init__` refuses any other as the task is built: a setting of choices starts at one
+    #: of them and nothing else, a number included, since a run would start at a value
+    #: `Session.set` refuses; a setting of numbers at a finite number; and a start outside
+    #: `[low, high]` would run under `wlx run`, which takes no
     #: pre-flight (XC-159; the b3a-2 final review, m2). A bound past a float's range is refused
     #: as the setting is built, with a start or without (XC-423); any other bound that is not a
     #: real number is left to
@@ -159,8 +164,95 @@ class Param:
     #: starts the run -- and a `wlx taskd` run whose trials use a number nobody gave is
     #: refused by its pre-flight (`preflight.values`), not faulted at its first trial.
     start: object = None
+    #: **Why its limits stand, in one line** (the console settings design's §4; the PI,
+    #: 2026-11-16, "Hard limits only where impossible"): every bound a setting declares is a hard
+    #: limit, a value past it refused, and the console's card says why (`limit_reason`). Needed
+    #: only where no standard reason covers a bound (below 0, a count below 1, a fraction above
+    #: 1); a bound with neither is warned at load (`check.UNEXPLAINED_LIMIT`). Printable text of
+    #: `REASON_LIMIT` characters at most, refused otherwise as the setting is built.
+    why: str = ""
+    #: **The section of the console's Task parameters tab it sits in** (the console settings design's
+    #: §7; the PI, 2026-11-16, "The task file names it"): a printable line of `SECTION_LIMIT`
+    #: characters at most, `/` making a subsection (`"Stimuli/fixation point"`), two levels at most,
+    #: refused otherwise as the setting is built. Empty, the default, names none: `section_of` then
+    #: gives `TIMING` for a setting in seconds, else `OTHER`. A section under `TRAINING_SECTION`
+    #: goes to the Training tab.
+    section: str = ""
+    #: **Its plain name on the console's box** (the console interface design's goal 5; the PI,
+    #: 2026-11-19, "Plain name, code name small"): the box shows it, its code name small beneath.
+    #: A printable line of `LABEL_LIMIT` characters at most, refused otherwise as the setting is
+    #: built. Empty, the default, names none: the box shows the code name alone.
+    label: str = ""
+    #: **What it is, in one sentence** (the design's goal 5): opened inside its box. A printable
+    #: line of `REASON_LIMIT` characters at most, as `why` is, refused otherwise as it is built.
+    help: str = ""
+    #: **Whether it holds whole numbers only** (the design's goal 6; the PI, 2026-11-19, of a set
+    #: size: "there should not be a decimal option for entry"): its box shows no decimals and steps
+    #: by 1. The task declares it; the console never guesses it from the unit. True or False,
+    #: refused otherwise as it is built; its start, bounds and step are whole where given, judged at
+    #: load (`check`'s `bad-whole`).
+    whole: bool = False
+    #: **How far one press of the box's -/+ moves it** (the design's call on steps): a number above
+    #: 0, refused otherwise as it is built. `None`, the default, takes its unit's (`step_of`).
+    step: "float | None" = None
+    #: **Whether the console shows this fraction as a percent** (the design's call: "a fraction may
+    #: be shown as a percent"): x100 with `%` on the page, so a training bar reads "at least [80]%";
+    #: the setting, its commands and the record keep the fraction. Only on a setting in
+    #: `"fraction"`, refused otherwise as it is built.
+    percent: bool = False
 
     def __post_init__(self) -> None:
+        parts = self.section.split("/") if isinstance(self.section, str) else []
+        if not (
+            isinstance(self.section, str)
+            and self.section.isprintable()
+            and len(self.section) <= SECTION_LIMIT
+            and (self.section == "" or (len(parts) <= 2 and all(part.strip() for part in parts)))
+        ):
+            raise ValueError(
+                f"parameter {self.name!r}: its section is one printable line of {SECTION_LIMIT} "
+                f"characters at most, with no more than one '/' (two levels) and a name on each "
+                f"side of it, not {self.section!r}"
+            )
+        if not (isinstance(self.why, str) and self.why.isprintable()
+                and len(self.why) <= REASON_LIMIT):
+            raise ValueError(
+                f"parameter {self.name!r}: why its limits stand is one printable line of "
+                f"{REASON_LIMIT} characters at most, not {self.why!r}"
+            )
+        if not _one_line(self.label, LABEL_LIMIT):
+            raise ValueError(
+                f"parameter {self.name!r}: its plain name (label) is one printable line of "
+                f"{LABEL_LIMIT} characters at most, not {self.label!r}"
+            )
+        if not _one_line(self.help, REASON_LIMIT):
+            raise ValueError(
+                f"parameter {self.name!r}: what it is (help) is one printable line of "
+                f"{REASON_LIMIT} characters at most, not {self.help!r}"
+            )
+        for which in ("whole", "percent"):
+            if not isinstance(getattr(self, which), bool):
+                raise ValueError(
+                    f"parameter {self.name!r}: {which} is True or False, not "
+                    f"{getattr(self, which)!r}"
+                )
+        if self.percent and self.unit != "fraction":
+            raise ValueError(
+                f"parameter {self.name!r}: percent shows a fraction as a percent, and its unit "
+                f"is {self.unit!r}, not 'fraction'"
+            )
+        step = self.step
+        if step is not None and (
+            isinstance(step, bool)
+            or not isinstance(step, (int, float))
+            or (isinstance(step, int) and _past_float(step))
+            or not math.isfinite(step)
+            or step <= 0
+        ):
+            raise ValueError(
+                f"parameter {self.name!r}: its step is a number above 0 that a float holds, or "
+                f"None for its unit's, not {step!r}"
+            )
         # **A bound past a float's range is refused as the setting is built** (XC-423): no float
         # holds it, so every check that reads a bound as one raised on it (`_real` below did, as
         # the task file loaded), and only code can write one.
@@ -172,18 +264,33 @@ class Param:
                     f"for none"
                 )
         start = self.start
-        if start is not None and (
+        if start is None:
+            return
+        if self.choices:
+            # **A setting of choices starts at one of them** (XC-517): equal to one, as
+            # `Session.set` and the pre-flight judge a value (`in`), and nothing else, a number
+            # included. Choices that cannot be compared refuse the start, never raise past it.
+            try:
+                among = start in self.choices
+            except Exception:  # noqa: BLE001 -- a task's declarations are code's output
+                among = False
+            if not among:
+                raise ValueError(
+                    f"parameter {self.name!r}: a task's starting value is a number, or one of its "
+                    f"choices; {start!r} is not one of the {_count(self.choices)} choices it "
+                    f"offers"
+                )
+            if isinstance(start, bool) or not isinstance(start, (int, float)):
+                return
+        if (
             isinstance(start, bool)
             or not isinstance(start, (int, float))
             or not math.isfinite(start)
         ):
             raise ValueError(
-                f"parameter {self.name!r}: a task's starting value is a number, and "
-                f"{start!r} is not a finite one; a starting appearance is not carried "
-                f"until telemetry publishes one (XC-420)"
+                f"parameter {self.name!r}: a task's starting value is a number, or one of its "
+                f"choices, and {start!r} is no finite number, the setting declaring no choices"
             )
-        if start is None:
-            return
         low, high = _real(self.low), _real(self.high)
         side = (
             "below" if low is not None and start < low
@@ -202,6 +309,115 @@ class Param:
             )
 
 
+#: **The longest a section's name is** (`Param.section`), its `/` included: 60 characters.
+SECTION_LIMIT = 60
+
+#: **The longest a setting's plain name is** (`Param.label`), and a group's title (`Group.name`):
+#: 40 characters, the box's head (the console interface plan's Global Constraints).
+LABEL_LIMIT = 40
+
+#: **How far one press of -/+ moves a setting, by its unit** (the console interface design's call
+#: on steps; the plan's Global Constraints), where the setting declares no step of its own
+#: (`step_of`): a whole setting steps by `WHOLE_STEP`, a unit not listed by `OTHER_STEP`.
+UNIT_STEPS: "dict[str, float]" = {
+    "s": 0.05,
+    "deg": 0.1,
+    "mL": 0.01,
+    "cd/m2": 1.0,
+    "fraction": 0.05,
+    "× disc radius": 0.1,
+    "%": 1.0,
+}
+WHOLE_STEP = 1
+OTHER_STEP = 0.01
+
+
+def step_of(param: Param) -> float:
+    """**How far one press of `param`'s -/+ moves it** (the design's call on steps): the step it
+    declares (`Param.step`), else 1 for a whole setting, else its unit's (`UNIT_STEPS`), else
+    0.01. The console's Shift+click steps ten of these."""
+    if param.step is not None:
+        return param.step
+    if param.whole:
+        return WHOLE_STEP
+    return UNIT_STEPS.get(param.unit, OTHER_STEP)
+
+
+def _one_line(text: object, limit: int) -> bool:
+    """Whether `text` is printable text on one line of `limit` characters at most."""
+    return isinstance(text, str) and text.isprintable() and len(text) <= limit
+
+#: **The sections a setting naming none falls into** (`section_of`; the console settings design's
+#: §7): `TIMING` where its unit is seconds, `OTHER` for the rest.
+TIMING = "Timing"
+OTHER = "Other"
+
+#: **The section the Training tab gathers** (the console settings design's §8): a setting whose
+#: section is this, or under it (`"Training/stages"`), is shown there, not among the sections of
+#: the Task parameters tab (`web._training_params`).
+TRAINING_SECTION = "Training"
+
+#: **The training switch's three positions** (the console settings design's §8; the PI,
+#: 2026-11-16: "both, a freeze training option and a full task option"), as a `link.Shaping`
+#: names them and each change row and trial line writes them: `"on"`, training as declared;
+#: `"frozen"`, the stage, every staircase's level and the pool's pairings held as they are, no
+#: move, no suggestion and no step, and its trials counted toward no bar ("They don't count");
+#: `"full"`, the task's finished version (`Plan.full`). A run starts `"on"`.
+SHAPING = ("on", "frozen", "full")
+
+#: **The section a welfare ceiling's card sits in** (the console settings design's §7): a ceiling
+#: is no task `Param`, so no file names a section for it, and its unit (seconds, say) is no sign
+#: it is a timing setting of the task; the builder's call, so it is not counted among them.
+CEILINGS = "Ceilings"
+
+
+def section_of(param: Param) -> str:
+    """**The section `param` sits in** (the console settings design's §7): the one the task file
+    names (`Param.section`), else `TIMING` for a setting in seconds, else `OTHER`."""
+    if param.section:
+        return param.section
+    return TIMING if param.unit == "s" else OTHER
+
+
+#: **The longest reason a limit is given in** (`Param.why`): one line on a card, as a staircase's
+#: hardest step in words is (`Staircase.hardest`), 120 characters.
+REASON_LIMIT = 120
+
+#: **The units a count is in** (the console settings design's §4: "a count below one where one is
+#: needed" is a limit that stands): a lowest of 1 on a setting in one of these needs no reason of
+#: its own (`limit_reason`).
+COUNT_UNITS = ("objects", "answers", "pairings", "trials")
+
+#: The standard reasons, each for a bound that marks where a value cannot be (§4), so needs no
+#: `Param.why`: a lowest of 0, a count's lowest of 1, and a fraction's highest of 1.
+BELOW_ZERO = "below 0 cannot be"
+BELOW_ONE = "fewer than 1 cannot be: one is needed"
+FRACTION_TOP = "a fraction is at most 1"
+
+
+def limit_reason(param: Param, side: str) -> str | None:
+    """**Why `param`'s limit on `side`** (`"low"` or `"high"`) **stands** (the console settings
+    design's §4; the PI, 2026-11-16, "Hard limits only where impossible"): the standard reason
+    where the bound marks where a value cannot be -- a lowest of 0 (`BELOW_ZERO`), a lowest of 1 on
+    a count (`COUNT_UNITS`, `BELOW_ONE`), a highest of 1 on a fraction (`FRACTION_TOP`) -- else
+    the task's own one line (`Param.why`), else `None`: a limit with no reason, which the load
+    warns of (`check.UNEXPLAINED_LIMIT`). `None` too where the side declares no bound. **The
+    standard reason first** (the builder's call): a lowest of 0 cannot be past, whatever the
+    task's line says of its other side."""
+    if side not in ("low", "high"):
+        raise ValueError(f"a limit's side is 'low' or 'high', not {side!r}")
+    bound = _real(param.low if side == "low" else param.high)
+    if bound is None:
+        return None
+    if side == "low" and bound == 0:
+        return BELOW_ZERO
+    if side == "low" and bound == 1 and param.unit in COUNT_UNITS:
+        return BELOW_ONE
+    if side == "high" and bound == 1 and param.unit == "fraction":
+        return FRACTION_TOP
+    return param.why or None
+
+
 def _real(bound: object) -> float | None:
     """A declared bound a start is held to: a finite real number that is not a `bool`,
     or `None` -- for no bound, and for one `Param` cannot compare, which the pre-flight
@@ -210,6 +426,15 @@ def _real(bound: object) -> float | None:
     if isinstance(bound, bool) or not isinstance(bound, (int, float)):
         return None
     return bound if math.isfinite(bound) else None
+
+
+def _count(choices: object) -> object:
+    """How many `choices` a setting offers, as a refusal says it, or `"declared"` where they are
+    no collection that counts."""
+    try:
+        return len(choices)
+    except TypeError:
+        return "declared"
 
 
 def _past_float(number: int) -> bool:
@@ -665,6 +890,22 @@ class Dots(Appearance):
     color: "Color | P | None" = None
 
 
+#: **A look's kind in people's words, where its class's name is not** (the PI, 2026-11-20, from his
+#: try-out of the page: "ring" everywhere, not "Annulus"): what a console's segment, a summary line,
+#: the changes feed, the moments of a run, a warning and the review say a look of the class by
+#: (`kind_words`; `review.appearance_words`). **The class keeps its name** in a task file and in the
+#: record, which writes an appearance as `{"class": "Annulus", ...}` (`record`), so what wl-preproc
+#: reads is unchanged.
+KIND_WORDS = {"Annulus": "Ring"}
+
+
+def kind_words(looks: object) -> str:
+    """**What people call a look of `looks`'s class** (`KIND_WORDS`), else its class's name.
+    Formatting, not derivation."""
+    name = type(looks).__name__
+    return KIND_WORDS.get(name, name)
+
+
 @dataclass(frozen=True, slots=True)
 class Annulus(Appearance):
     inner: "float | P" = 1.0
@@ -888,8 +1129,9 @@ class RDS(Appearance):
 #: What tells the animal which object of an `Array` is its target (`Array.found_by`; the PI,
 #: 2026-10-31, on the engine C3 plan's Appendix B, item 17, "Refuse only odd-one-out tasks
 #: (Recommended)"): `"look"`, its look alone, the odd one out; or `"cue"`, something else the trial
-#: shows -- a cue, a remembered sample, a place.
-FOUND_BY = ("look", "cue")
+#: shows -- a cue, a remembered sample, a place; or `"none"`, no target at all: a catch, whose right
+#: answer is no look at any object (the pop-out revision design's §8; its plan's Task 4).
+FOUND_BY = ("look", "cue", "none")
 
 
 @dataclass(frozen=True, slots=True)
@@ -929,6 +1171,15 @@ class Array(Appearance):
     #: `"cue"`: something else the trial shows names it -- a cue, a remembered sample, a place --
     #: as in a cued two-choice task, whose target and distractor can look alike by design; the
     #: load then warns that a cue must name the target, and refuses neither (`cued-target`).
+    #: `"none"`: **no target**, a catch (the pop-out revision design's §8): its objects may all
+    #: look alike, since that is the catch, so neither look check judges it, and a structure
+    #: scoring a `SaccadeTo` or a `Hold` on its family's target is refused at load (`bad-array`).
+    #: Its `target` is still the place an odd one would hold, which the record writes as
+    #: `odd_place`.
+    #:
+    #: **A place left empty** is a `Blank` among its looks (`looks` or `among`): the screen draws
+    #: no object there, the record writes that object `drawn: false`, and the layout checks read no
+    #: object there.
     found_by: str = "look"
 
     def positions(
@@ -981,24 +1232,58 @@ class ObjectWindows:
     """
 
     of: str
-    radius: "float | P"
+    #: **The windows' radius in degrees**, every object's alike; or `None` where `scale` gives it.
+    radius: "float | P | None" = None
     eye: str = "both"
+    #: **Each window's radius as a multiple of its own object's radius** (the console settings
+    #: design's §5; the PI, 2026-11-16, "Grows in proportion"): `scale` times half the object's
+    #: size at its own place (STE-05: a size is the full width), so a disc twice as big gets a
+    #: window twice as big, and the ratio means the same whether the size is fixed or scaled by
+    #: eccentricity (`size_at`). 3.0 is a 1.5° window about a 1° disc. Exactly one of `radius`
+    #: and `scale` is declared, refused as built; a `scale` window on an array whose looks have
+    #: no single `size` is refused at load (`check`'s `unsized-window`).
+    scale: "float | P | None" = None
+
+    def __post_init__(self) -> None:
+        if (self.radius is None) == (self.scale is None):
+            given = "both" if self.radius is not None else "neither"
+            raise ValueError(
+                f"the object windows of {self.of!r} declare exactly one of radius, in degrees, "
+                f"and scale, a multiple of each object's radius; these declare {given}")
+
+    def radius_at(self, array: Array, index: int, at: "tuple[float, float]",
+                  values: dict) -> "float | P":
+        """**Object `index`'s window radius**, the object drawn at `at`: `radius` as declared (a
+        setting resolved where a window's is, `gaze`), or `scale` times half that object's own
+        size at its place (`size_at`; STE-05). Between trials, where the windows are built
+        (`expand`), never in a frame. `ValueError` for an object whose look has no single size,
+        which the load refuses (`unsized-window`)."""
+        if self.scale is None:
+            return self.radius
+        looks = _value(array.object_looks(index, values), values)
+        if not isinstance(looks, SIZED_LOOKS):
+            raise ValueError(
+                f"the object windows of {self.of!r} are a multiple of each object's radius, and "
+                f"object {index} is drawn as {type(looks).__name__}, which has no single size")
+        return float(_value(self.scale, values)) * size_at(_value(looks.size, values), at) / 2.0
 
     def expand(self, array: Array, values: dict, at: object = (0.0, 0.0)) -> "list[Window]":
         """Each object's window, centered where the object is drawn: on the array's true circle
         about `at`, the array stimulus's own position in any form (`position_of`; XC-397: each
-        window was on the ring about (0°, 0°) wherever the array was)."""
+        window was on the ring about (0°, 0°) wherever the array was), **each of its own radius**
+        (`radius_at`: by `scale`, each object's own size at its own place)."""
         at = array.positions(values, position_of(at, values))
         target = int(_value(array.target, values))
+        radii = [self.radius_at(array, i, xy, values) for i, xy in enumerate(at)]
         windows = [
-            Window(f"{self.of}.{i}", at=xy, radius=self.radius, on=self.of, eye=self.eye)
+            Window(f"{self.of}.{i}", at=xy, radius=radii[i], on=self.of, eye=self.eye)
             for i, xy in enumerate(at)
         ]
         windows.append(
             Window(
                 f"{self.of}.target",
                 at=at[target],
-                radius=self.radius,
+                radius=radii[target],
                 on=self.of,
                 eye=self.eye,
             )
@@ -1010,7 +1295,7 @@ class ObjectWindows:
                 # alias is judged by the objects it names, every one but the target (the loop's
                 # membership; `gaze.Tracked`'s for a saccade).
                 at=at[target],
-                radius=self.radius,
+                radius=radii[target],
                 on=self.of,
                 eye=self.eye,
             )
@@ -1872,6 +2157,158 @@ class NonAging(Distribution):
     maximum: float
     repeat: "str | None" = None
 
+    @classmethod
+    def between(cls, shortest: float, longest: float, *,
+                repeat: "str | None" = None) -> "NonAging":
+        """**A non-aging wait from its shortest and longest alone, its decay derived** (TSK-15's
+        revision; the PI, 2026-11-16, "Derived from min and max"): its mean `shortest + (longest
+        - shortest) / NONAGING_DECAY`, so its time constant is a third of its range. What a
+        person's draw on a timing card is (`taskd.Session._form`), and what a live change of
+        either end derives again (`variation.with_numbers`). Whether it can be drawn is
+        `check.undrawable`'s to judge, as for any wait."""
+        return cls(shortest, shortest + (longest - shortest) / NONAGING_DECAY, longest, repeat)
+
+
+#: **The non-aging wait's decay, from its range** (TSK-15's revision; the PI, 2026-11-16: "Derived
+#: from min and max", and "Keep drawing again"): its time constant is (longest - shortest) / 3.
+#: **An engineering default, recorded as one**: the literature gives no criterion for choosing it
+#: from a range (`.superpowers/side-2026-11-17/nonaging-decay-report.md`, §0 and §3). Its grounds:
+#: the longest wait then sits at the uncut wait's 95th percentile, one draw in twenty drawn again;
+#: the hazard has one profile at every range; and a range thrice the scale is inside published
+#: practice, the ratio of the one study stating both, 0.33 s over 0.4-1.4 s
+#: [@grabenhorst2019anticipation].
+NONAGING_DECAY = 3
+
+#: **The shapes a person may draw a timing setting from on its card** (the console settings
+#: design's §3; the PI, 2026-11-16): a non-aging wait by its shortest and longest, a uniform by its
+#: ends, a normal cut to a range by its mean, spread and cut, a list played in shuffled passes, and
+#: a list with a weight each. Each is drawn as the task's own distributions are (`variation.draw`).
+SHAPES = ("non_aging", "uniform", "normal", "list", "weights")
+
+
+@dataclass(frozen=True, slots=True)
+class Scaled:
+    """**A size scaled by eccentricity**: `factor` times each object's own eccentricity, its true
+    angle from straight ahead (the console settings design's §5; the PI, 2026-11-16, "Size =
+    factor x eccentricity", 0.3 dva per dva as in his arrays [@westerberg2020priming]; STE-31). A
+    person's form for a size setting (`taskd.Session._form`, `size_settings`), as a draw is a
+    timing setting's: a trial's values carry it for its setting, and each object is drawn at
+    `size_at` its own place (`screen`, `ObjectWindows.radius_at`, `record`), never at a mean."""
+
+    factor: float
+
+
+#: **The appearances drawn at one size**, a `size` field that is their full width (STE-05): what a
+#: size setting is (`size_settings`), what a `Scaled` size is bound on, and what an object window
+#: by `scale` reads its object's radius from.
+SIZED_LOOKS = (Disc, Square, Cross, Polygon)
+
+
+def size_at(value: object, at: "tuple[float, float]") -> float:
+    """**A size, in degrees, at the place `at` it is drawn** (the console settings design's §5): a
+    number as itself; a `Scaled` its factor times `at`'s true eccentricity from straight ahead,
+    `geometry.polar_of_deg` -- `atan(√(tan²x + tan²y))`, never `√(x² + y²)` (the PI, 2026-10-19,
+    no average ppd) -- measured from (0°, 0°), where every lab task fixates (the console settings
+    plan's call), so 0.3 at (8°, 0°) is 2.4° and at the center 0, which is not drawn
+    (`check`'s `scaled-small`)."""
+    if isinstance(value, Scaled):
+        return value.factor * polar_of_deg(float(at[0]), float(at[1]))[0]
+    return float(value)
+
+
+def _looks_of(trial: "Trial") -> "list[tuple[str, object]]":
+    """Every appearance a `Show` or an `Update` gives each stimulus, by the stimulus's name, as
+    written: a setting, an array, or a look."""
+    found: list[tuple[str, object]] = []
+    for _, action in actions_of(trial):
+        if isinstance(action, Show):
+            found.append((action.stimulus.name, action.stimulus.looks))
+        elif isinstance(action, Update) and "looks" in action.changes():
+            found.append((action.stimulus, action.looks))
+    return found
+
+
+def _sizes_in(looks: object, params: dict, inside: frozenset = frozenset()) -> "set[str]":
+    """The size settings `looks` draws by (`size_settings`): a sized look's `size` setting, each of
+    an array's two looks', and each choice's of a look setting, each setting read once."""
+    if isinstance(looks, P):
+        param = params.get(looks.name)
+        if param is None or looks.name in inside:
+            return set()
+        return {name for choice in param.choices
+                for name in _sizes_in(choice, params, inside | {looks.name})}
+    if isinstance(looks, Array):
+        return _sizes_in(looks.looks, params, inside) | _sizes_in(looks.among, params, inside)
+    if isinstance(looks, SIZED_LOOKS) and isinstance(looks.size, P):
+        return {looks.size.name}
+    return set()
+
+
+def size_settings(task: "Task") -> "frozenset[str]":
+    """**The settings a look's `size` names** (the console settings design's §5): each `Disc`'s,
+    `Square`'s, `Cross`'s and `Polygon`'s `size` that is a setting, in any appearance a `Show` or
+    an `Update` of any structure gives -- an array's looks and a look setting's choices among
+    them. What a person may scale by eccentricity on its card (`taskd.Session._form`'s
+    `scaled`), and nothing else."""
+    found: set[str] = set()
+    for structure in task.structures.values():
+        params = {param.name: param for param in structure.params}
+        for _, looks in _looks_of(structure):
+            found |= _sizes_in(looks, params)
+    return frozenset(found)
+
+
+def sized_places(trial: "Trial", values: dict, name: str) -> "list[tuple[str, tuple[float, float]]]":
+    """**Every place `trial` draws a look whose size is the setting `name`, at `values`**: each
+    stimulus a `Show` gives (an `Update` changing a stimulus's look, at the place its `Show`
+    gives), as `"stimulus 'fix'"`, and each object of an array as `"array 'search'"`, by the
+    look it draws there (`Array.object_looks`), each with its per-axis place in degrees
+    (`position_of`, `Array.positions`). A look setting `values` gives is read at its value, one
+    it does not at each of its choices; a stimulus a setting places that `values` does not give
+    is left out. What a scaled size is judged at (`check.laid_out`'s `scaled-small`) and a card
+    says it gives (`taskd.Session.parameters`). Between trials, never in a frame."""
+    params = {param.name: param for param in trial.params}
+    shown = {action.stimulus.name: action.stimulus for _, action in actions_of(trial)
+             if isinstance(action, Show)}
+
+    def options(looks: object, inside: frozenset = frozenset()) -> list:
+        if isinstance(looks, P):
+            if looks.name in values:
+                return [values[looks.name]]
+            param = params.get(looks.name)
+            if param is None or looks.name in inside:
+                return []
+            return [one for choice in param.choices
+                    for one in options(choice, inside | {looks.name})]
+        return [looks]
+
+    def sized(looks: object) -> bool:
+        return (isinstance(looks, SIZED_LOOKS) and isinstance(looks.size, P)
+                and looks.size.name == name)
+
+    found: list[tuple[str, tuple[float, float]]] = []
+    for stimulus_name, written in _looks_of(trial):
+        stimulus = shown.get(stimulus_name)
+        if stimulus is None:
+            continue
+        for looks in options(written):
+            try:
+                center = position_of(stimulus.at, values)
+                if isinstance(looks, Array):
+                    places = looks.positions(values, center)
+                    for index, place in enumerate(places):
+                        if any(sized(one) for one in options(looks.object_looks(index, values))):
+                            found.append((f"array {stimulus_name!r}", place))
+                elif sized(looks):
+                    found.append((f"stimulus {stimulus_name!r}", center))
+            except (KeyError, TypeError, ValueError, IndexError, ArithmeticError):
+                continue
+    unique: list[tuple[str, tuple[float, float]]] = []
+    for one in found:
+        if one not in unique:
+            unique.append(one)
+    return unique
+
 
 # --- Plans and blocks (engine spec §13.1, §13.3, §13.5, §13.8; engine build C2b) --------------
 #
@@ -2475,6 +2912,31 @@ def rule_at(rule: "tuple | None", values: "dict | None") -> "tuple[float, int] |
 
 
 @dataclass(frozen=True, slots=True)
+class FullTask:
+    """**A plan's finished version** (`Plan.full`; the console settings design's §8, "full task:
+    the task's finished version, which the task declares"; the PI, 2026-11-16): what the training
+    switch's `"full"` plays -- **its `block`**, one of the plan's own by name, as a block of its
+    own, with no move, no suggestion and no step; **every staircase held at its hardest level**,
+    its last; and **`values` over its conditions**, by setting, each trial's line marking each
+    value it gives `drawn: "full"`. A full task's value sits where a condition's own value would
+    (it replaces the block's conditions), under a person's value and a person's draw, since "the
+    experimenter needs free control" (the controller's ruling on the plan's pre-flight); a pool's
+    setting among them gives its pairings (`Pool`). Its shape is refused as it is built; what it
+    names is checked at load (`check.check_task`, `bad-full-task`): a block the plan has, settings
+    the task declares, each value inside its limits, a pool's value naming a pool."""
+
+    block: str
+    values: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.block, str) or not self.block:
+            raise ValueError(f"a full task names its block by text, not {self.block!r}")
+        if not isinstance(self.values, dict) or not all(
+                isinstance(name, str) and name for name in self.values):
+            raise ValueError("a full task's values are a dict of setting names to values")
+
+
+@dataclass(frozen=True, slots=True)
 class Plan:
     """One plan (engine spec §13.1): its block types (`blocks`), how they follow one another
     (`order`, `Fixed()` by default), and **a run time limit** (`time_limit_s`, in seconds of trials
@@ -2488,11 +2950,17 @@ class Plan:
     blocks: "list[Block]"
     order: BlockOrder = field(default_factory=Fixed)
     time_limit_s: "float | None" = None
+    #: **Its finished version** (`FullTask`; the console settings design's §8), which the training
+    #: switch's *full task* plays; `None`, none, and the switch offers no full task.
+    full: "FullTask | None" = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.blocks, list) or not all(
                 isinstance(block, Block) for block in self.blocks):
             raise ValueError("a plan's blocks are a list of Blocks")
+        if self.full is not None and not isinstance(self.full, FullTask):
+            raise ValueError(f"a plan's full task is a FullTask, or None, not "
+                             f"{type(self.full).__name__}")
         if not isinstance(self.order, BlockOrder):
             raise ValueError(
                 "a plan's order is a BlockOrder: Fixed(), Cyclic(), Balanced(), Random() or "
@@ -2515,8 +2983,55 @@ def _set_color(look: object) -> "str | None":
     """**The name of a look's color in its color set** (`photometry.ColorSetLight.color`): the
     look's own where it is a color-set light, or its `color`'s where that is one (a `Disc`'s, a
     `Square`'s); else `None`. For a pool's names (`Pool.named`)."""
+    color = set_light(look)
+    return None if color is None else color.color
+
+
+def set_light(look: object) -> "ColorSetLight | None":
+    """**The color-set light a look shows** (`photometry.ColorSetLight`): the look itself where it
+    is one, or its `color` where that is one (a `Disc`'s, a `Square`'s); else `None`."""
     color = look if isinstance(look, ColorSetLight) else getattr(look, "color", None)
-    return color.color if isinstance(color, ColorSetLight) else None
+    return color if isinstance(color, ColorSetLight) else None
+
+
+def color_choices(param: object) -> "dict[tuple[str, str], object] | None":
+    """**A setting's choices by the set and the hue of their light** (the console settings design's
+    §6: "you select a set, and then you have hue options from the set"): each choice by `(set
+    name, color name)` of the color-set light it shows (`set_light`: a look's `color`, or the
+    choice itself), in the order declared -- what a console's pick names (`link.SetColor`), mapped
+    back to the one declared choice it is (`taskd.Session._color`). **`None` unless every choice
+    shows one**, and for a setting with no choices. **A key two choices share is left out**, since
+    a pick naming it could be either (the load warns, `ambiguous-color-choice`); `None` where that
+    leaves none. At load or between trials, never in a frame."""
+    choices = getattr(param, "choices", ())
+    if not choices:
+        return None
+    found: dict[tuple[str, str], object] = {}
+    shared: set[tuple[str, str]] = set()
+    for choice in choices:
+        light = set_light(choice)
+        if light is None:
+            return None
+        key = (light.colorset.name, light.color)
+        if key in found:
+            shared.add(key)
+        else:
+            found[key] = choice
+    for key in shared:
+        del found[key]
+    return found or None
+
+
+def shared_color_choices(param: object) -> "list[tuple[str, str]]":
+    """**The `(set, hue)` keys two or more of a setting's choices share** (`color_choices` leaves
+    them out), in the order first met; empty unless every choice shows a color-set light. What
+    the load warns of, `ambiguous-color-choice`."""
+    choices = getattr(param, "choices", ())
+    lights = [set_light(choice) for choice in choices]
+    if not choices or any(light is None for light in lights):
+        return []
+    keys = [(light.colorset.name, light.color) for light in lights]
+    return list(dict.fromkeys(key for key in keys if keys.count(key) > 1))
 
 
 @dataclass(frozen=True, slots=True)
@@ -2628,6 +3143,141 @@ class Pool:
 
 
 @dataclass(frozen=True, slots=True)
+class Group:
+    """**Settings that share one box and one Apply** (the console interface design's goal 8; the
+    PI, 2026-11-19, "One box after Timing"): `name` the box's title, `settings` the names of the
+    settings it holds, in the box's order, and, where it reads as one, `sentence`, the box read as
+    words with each setting's field in its place, `{move_up_bar}` (the format parser's places,
+    `{{` a brace): "Move up when at least {move_up_bar} of the last {move_up_window} answers are
+    right". **Its shape is refused as it is built**: a title of one printable line of
+    `LABEL_LIMIT` at most; one setting at least, each named once; a sentence placing each of its
+    settings exactly once, with no format or conversion, its words, the places left out, one
+    printable line of `REASON_LIMIT` at most. What needs the task, at load (`check`'s
+    `bad-group`): each a setting the task declares, in one group only, and never a ceiling."""
+
+    name: str
+    settings: "tuple[str, ...]"
+    sentence: str = ""
+
+    def __post_init__(self) -> None:
+        if not (_one_line(self.name, LABEL_LIMIT) and self.name.strip()):
+            raise ValueError(
+                f"a group's title is one printable line of {LABEL_LIMIT} characters at most, "
+                f"and not empty, not {self.name!r}"
+            )
+        if not (
+            isinstance(self.settings, tuple)
+            and self.settings
+            and all(isinstance(name, str) and name for name in self.settings)
+        ):
+            raise ValueError(
+                f"group {self.name!r} names its settings as a tuple of their names, one at least, "
+                f"not {self.settings!r}"
+            )
+        for name in self.settings:
+            if self.settings.count(name) > 1:
+                raise ValueError(f"group {self.name!r} names {name!r} twice; a box holds it once")
+        if self.sentence == "":
+            return
+        if not isinstance(self.sentence, str):
+            raise ValueError(
+                f"group {self.name!r}: its sentence's words are one printable line of "
+                f"{REASON_LIMIT} characters at most, not {self.sentence!r}"
+            )
+        try:
+            parts = list(string.Formatter().parse(self.sentence))
+        except ValueError as unread:
+            raise ValueError(
+                f"group {self.name!r}: its sentence is not read as words and places ({unread}); "
+                f"a place is a setting's name in braces, and a brace itself is written twice"
+            ) from None
+        words = "".join(literal for literal, _, _, _ in parts)
+        if not _one_line(words, REASON_LIMIT):
+            raise ValueError(
+                f"group {self.name!r}: its sentence's words are one printable line of "
+                f"{REASON_LIMIT} characters at most, its places left out, not {words!r}"
+            )
+        placed: list[str] = []
+        for _, place, spec, conversion in parts:
+            if place is None:
+                continue
+            if place not in self.settings:
+                raise ValueError(
+                    f"group {self.name!r}: its sentence has a place for {place!r}, which is not "
+                    f"one of its settings ({', '.join(self.settings)})"
+                )
+            if place in placed:
+                raise ValueError(
+                    f"group {self.name!r}: its sentence has a place for {place!r} twice; each "
+                    f"setting's field sits in it once"
+                )
+            if spec or conversion:
+                raise ValueError(
+                    f"group {self.name!r}: its sentence's place for {place!r} carries a format or "
+                    f"a conversion; a place is the setting's name alone, its box showing the "
+                    f"field"
+                )
+            placed.append(place)
+        for name in self.settings:
+            if name not in placed:
+                raise ValueError(
+                    f"group {self.name!r}: its sentence has no place for {name!r}; a sentence "
+                    f"places each of its settings once"
+                )
+
+
+#: **A trial that is no special kind** (`Special`; the pop-out revision design's §4): what each
+#: trial line's `trial_kind` says of it in a task that declares special trials (wl-preproc's
+#: answer of 2026-11-19, XC-543), and so a name no special kind may take.
+NORMAL = "normal"
+
+#: **The unit a special kind's percentage is in** (`Special.share`): the setting it names is in
+#: percent of trials, from 0 to 100 (`check`'s `bad-special`).
+SPECIAL_UNIT = "percent"
+
+
+@dataclass(frozen=True, slots=True)
+class Special:
+    """**A kind of special trial** (the pop-out revision design's §4; the PI, 2026-11-16, "A
+    percentage per kind"): `kind` its name, as each trial line's `trial_kind` writes it; `share`
+    the setting giving its percentage of trials (`SPECIAL_UNIT`, 0 to 100); `structure` the trial
+    structure it plays in place of the task's default. Each trial of the default structure is drawn
+    special or normal between trials, from the run's seed (`taskd.Session._special`); a special
+    trial otherwise follows its stage -- its values, its staircase's value and its pairing -- and is
+    counted in its bars, but steps no staircase ("Only normal trials move it"). **Its shape is
+    refused as it is built**: a kind of printable text of 1 to `LABEL_LIMIT` characters, never
+    `NORMAL`; a share that names a setting (`P`); a structure named by text. What needs the task,
+    at load (`check`'s `bad-special`): a structure the task has and not its default, and a share
+    in percent from 0 to 100."""
+
+    kind: str
+    share: P
+    structure: str
+
+    def __post_init__(self) -> None:
+        if not (_one_line(self.kind, LABEL_LIMIT) and self.kind):
+            raise ValueError(
+                f"a special kind is named by printable text of 1 to {LABEL_LIMIT} characters, "
+                f"not {self.kind!r}"
+            )
+        if self.kind == NORMAL:
+            raise ValueError(
+                f"a special kind is not named {NORMAL!r}: that is what a trial line calls a trial "
+                f"of no special kind"
+            )
+        if not isinstance(self.share, P):
+            raise ValueError(
+                f"special kind {self.kind!r} names the setting its share of trials is read from, "
+                f"P('name'), not {self.share!r}"
+            )
+        if not isinstance(self.structure, str) or not self.structure:
+            raise ValueError(
+                f"special kind {self.kind!r} names the trial structure it plays by text, not "
+                f"{self.structure!r}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class Task:
     """One task (engine spec §3.5): its trial structures by name (§13.3), `default` the one the
     plain run plays and a condition naming no structure plays, its plans by name (§13.1; engine
@@ -2661,6 +3311,15 @@ class Task:
     #: nor gives the setting by its conditions. Empty, nothing drawn. Its shape is refused as it is
     #: built; what each draw declares, at load (`check.check_task`).
     draws: "dict[str, Distribution]" = field(default_factory=dict)
+    #: **Its groups of settings that share one box and one Apply** (`Group`; the console interface
+    #: design's goal 8). Empty, none: each setting has a box of its own. A tuple of `Group`s,
+    #: refused otherwise as it is built; what each names, at load (`check`'s `bad-group`).
+    groups: "tuple[Group, ...]" = ()
+    #: **Its kinds of special trial** (`Special`; the pop-out revision design's §4), in the order
+    #: their shares are cumulated as each trial is drawn. Empty, none: every trial is normal and
+    #: its line's `trial_kind` null. A tuple of `Special`s, no two of one kind or one structure,
+    #: refused otherwise as it is built; what each names, at load (`check`'s `bad-special`).
+    specials: "tuple[Special, ...]" = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.structures, dict) or not self.structures:
@@ -2708,6 +3367,25 @@ class Task:
                     f"draw {name!r} is a Distribution (Uniform, Weighted, TruncatedNormal, "
                     f"Listed or NonAging), not {type(drawn).__name__}"
                 )
+        if not (isinstance(self.groups, tuple)
+                and all(isinstance(group, Group) for group in self.groups)):
+            raise ValueError(
+                f"a task's groups are a tuple of Groups, each a box's settings, not "
+                f"{self.groups!r}"
+            )
+        if not (isinstance(self.specials, tuple)
+                and all(isinstance(special, Special) for special in self.specials)):
+            raise ValueError(
+                f"a task's specials are a tuple of Specials, each a kind of special trial, not "
+                f"{self.specials!r}"
+            )
+        for what in ("kind", "structure"):
+            named = [getattr(special, what) for special in self.specials]
+            for name in dict.fromkeys(named):
+                if named.count(name) > 1:
+                    raise ValueError(
+                        f"two special kinds share the {what} {name!r}; each kind has its own"
+                    )
 
     @property
     def trial(self) -> Trial:
