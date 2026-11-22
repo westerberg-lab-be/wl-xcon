@@ -799,6 +799,189 @@ def test_each_mutation_job_runs_every_shard_of_its_own_count_once(job, n):
     assert _gate_shards(job) == [(k, n) for k in range(1, n + 1)]
 
 
+# ---------------------------------------------------------------------------
+# The CI-time build's wiring (the PI, 2026-11-21: a cap on mutation jobs at once,
+# and a night on which nothing changed skipped; Q3, "All three unchanged"). Each
+# piece is a line of YAML that nothing else reads, so a dropped `if` or `needs`
+# would be silent: a skip on a dispatch, a pass saved before every shard ran.
+# ---------------------------------------------------------------------------
+
+_NEIGHBORS = {"preproc": "westerberg-lab-be/wl-preproc", "xtasks": "westerberg-lab-be/wl-xtasks"}
+_KEY = ".mutation-full-passed"
+
+
+def _jobs() -> dict:
+    import yaml  # the `contract` extra, which every CI job installs
+
+    return yaml.safe_load(_WORKFLOW.read_text())["jobs"]
+
+
+def _workflow() -> dict:
+    import yaml
+
+    return yaml.safe_load(_WORKFLOW.read_text())
+
+
+def _step(job: dict, **match) -> dict:
+    """The one step of `job` whose keys (or, for `repository`, whose `with`) match."""
+    found = [
+        step
+        for step in job["steps"]
+        if all(
+            (step.get("with", {}).get(k) if k == "repository" else step.get(k)) == v
+            for k, v in match.items()
+        )
+    ]
+    assert len(found) == 1, (match, found)
+    return found[0]
+
+
+def _needs(job: dict) -> list[str]:
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def test_the_mutation_jobs_are_capped_at_8_nightly_and_4_a_push():
+    """The PI's cap (2026-11-21): the check "is holding up other repos on
+    occasion". The nightly's 36 jobs run 8 at a time, a push's 12 run 4."""
+    jobs = _jobs()
+    assert jobs["mutation-full"]["strategy"]["max-parallel"] == 8
+    assert jobs["mutation"]["strategy"]["max-parallel"] == 4
+
+
+def test_every_nightly_shard_checks_out_the_neighbors_nightly_plan_pinned():
+    """With 8 at a time the last wave starts hours after the first, so each shard
+    reading the neighbors' heads for itself would sweep different trees in one
+    run, and the skip's key would name SHAs some shards never saw."""
+    jobs = _jobs()
+    plan = jobs["nightly-plan"]
+    pins = _step(plan, id="pins")
+    for name, repository in _NEIGHBORS.items():
+        assert (
+            f"git ls-remote https://github.com/{repository}.git refs/heads/main" in pins["run"]
+        ), repository
+        assert plan["outputs"][name] == f"${{{{ steps.pins.outputs.{name} }}}}"
+    (key_line,) = [line for line in pins["run"].splitlines() if "key=" in line]
+    assert "mutation-full-passed-${{ github.sha }}-" in key_line
+    assert "$preproc" in key_line and "$xtasks" in key_line
+    assert plan["outputs"]["key"] == "${{ steps.pins.outputs.key }}"
+
+    full = jobs["mutation-full"]
+    assert "nightly-plan" in _needs(full)
+    for name, repository in _NEIGHBORS.items():
+        checkout = _step(full, repository=repository)
+        assert checkout["with"]["ref"] == f"${{{{ needs.nightly-plan.outputs.{name} }}}}"
+
+
+def _run_pins(tmp_path, heads: dict[str, str]) -> tuple[subprocess.CompletedProcess, str]:
+    """The `pins` step's script, run by bash as a runner would (`bash -e`), with
+    `${{ github.sha }}` filled in and a stand-in `git` that answers `ls-remote`
+    for each repository in `heads` with what it is given, and nothing for any
+    other URL."""
+    script = _step(_jobs()["nightly-plan"], id="pins")["run"]
+    script = script.replace("${{ github.sha }}", "a" * 40)
+    assert "${{" not in script, script
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    answers = "\n".join(
+        f'  "https://github.com/{_NEIGHBORS[name]}.git refs/heads/main") '
+        f"printf '%s\\trefs/heads/main\\n' {shlex.quote(sha)} ;;"
+        for name, sha in heads.items()
+    )
+    fake = bin_dir / "git"
+    fake.write_text(
+        '#!/bin/sh\n[ "$1" = ls-remote ] || exit 2\ncase "$2 $3" in\n'
+        f"{answers}\n  *) exit 0 ;;\nesac\n"
+    )
+    fake.chmod(0o755)
+    output = tmp_path / "github_output"
+    output.write_text("")
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+           "GITHUB_OUTPUT": str(output)}
+    done = subprocess.run(
+        ["bash", "-e", "-c", script], env=env, capture_output=True, text=True, timeout=30
+    )
+    return done, output.read_text()
+
+
+def test_the_pins_step_outputs_both_heads_and_the_key_and_refuses_anything_else(tmp_path):
+    """Two good heads give the three outputs; a head that is not 40 hex
+    characters (an empty answer, a moved repository, an error page) fails the
+    step and writes nothing, so no shard checks out a guess."""
+    preproc, xtasks = "1" * 40, "2" * 40
+    done, written = _run_pins(tmp_path, {"preproc": preproc, "xtasks": xtasks})
+    assert done.returncode == 0, done.stderr
+    assert written.splitlines() == [
+        f"preproc={preproc}",
+        f"xtasks={xtasks}",
+        f"key=mutation-full-passed-{'a' * 40}-{preproc}-{xtasks}",
+    ]
+
+    for heads in ({"preproc": preproc}, {"preproc": preproc, "xtasks": "main"}):
+        bad = tmp_path / str(len(heads)) / heads.get("xtasks", "none")
+        bad.mkdir(parents=True)
+        done, written = _run_pins(bad, heads)
+        assert done.returncode != 0, heads
+        assert written == "", heads
+
+
+def test_a_quiet_night_is_looked_up_on_a_schedule_only_and_fails_closed():
+    """Looked up on `schedule` alone, so a hand dispatch always sweeps; and an
+    error in the lookup is not a failed plan (`continue-on-error`) but an empty
+    `cache-hit`, which is not `'true'`, so the sweep runs."""
+    jobs = _jobs()
+    plan = jobs["nightly-plan"]
+    assert "github.event_name == 'schedule'" in plan["if"]
+    assert "github.event_name == 'workflow_dispatch'" in plan["if"]
+    passed = _step(plan, id="passed")
+    assert passed["uses"] == "actions/cache/restore@v6"
+    assert passed["continue-on-error"] is True
+    assert passed["if"] == "github.event_name == 'schedule'"
+    assert passed["with"]["lookup-only"] is True
+    assert passed["with"]["key"] == "${{ steps.pins.outputs.key }}"
+    assert passed["with"]["path"] == _KEY
+    assert plan["outputs"]["hit"] == "${{ steps.passed.outputs.cache-hit }}"
+
+    full = jobs["mutation-full"]
+    assert "needs.nightly-plan.outputs.hit != 'true'" in full["if"]
+    assert "github.event_name == 'schedule'" in full["if"]
+    assert "github.event_name == 'workflow_dispatch'" in full["if"]
+
+
+def test_the_pass_is_saved_only_after_every_shard_of_a_scheduled_sweep():
+    """A key saved after a partial sweep would skip the next night on a tree
+    nobody fully checked. The save needs every shard (`mutation-full`'s result)
+    and runs on `schedule` alone, at the key the lookup reads."""
+    jobs = _jobs()
+    saved = jobs["mutation-full-passed"]
+    assert saved["needs"] == ["nightly-plan", "mutation-full"]
+    assert "github.event_name == 'schedule'" in saved["if"]
+    assert "needs.mutation-full.result == 'success'" in saved["if"]
+    save = _step(saved, uses="actions/cache/save@v6")
+    assert save["with"]["key"] == "${{ needs.nightly-plan.outputs.key }}"
+    restore = _step(jobs["nightly-plan"], id="passed")
+    assert save["with"]["path"] == restore["with"]["path"] == _KEY
+    before = saved["steps"][: saved["steps"].index(save)]
+    assert any(_KEY in step.get("run", "") for step in before), before
+
+
+def test_scheduled_runs_queue_behind_each_other():
+    """A nightly still running when the next one fires: the second waits rather
+    than cancelling the first, and so sees the first's pass if it saved one."""
+    concurrency = _workflow()["concurrency"]
+    assert concurrency["cancel-in-progress"] is False
+    assert "github.event_name == 'schedule'" in concurrency["group"]
+
+
+def test_the_test_job_still_runs_every_night():
+    """The suite on three Pythons is cheap, and on a skipped night it is what still
+    sees the neighbors drift. Neither it nor the push gate waits on the plan."""
+    jobs = _jobs()
+    assert "if" not in jobs["test"]
+    assert "needs" not in jobs["test"]
+    assert "needs" not in jobs["mutation"]
+
+
 def test_main_with_a_shard_past_the_function_count_says_so_and_passes(monkeypatch, capsys):
     n = len(_targets()) + 3
     monkeypatch.setattr(gate.subprocess, "run", _no_subprocess)

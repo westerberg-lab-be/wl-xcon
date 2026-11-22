@@ -17,7 +17,28 @@ on:
     # the alternative when thirty-six parallel Actions jobs are not available (a local
     # sweep run as parallel lanes in separate `git archive` copies of the tree; the
     # harness mutates files in place, so separate copies are what let the lanes run
-    # at once).
+    # at once). A dispatch is capped at 8 jobs at once as the nightly is (same job,
+    # `mutation-full`), and it never looks up a quiet night (`nightly-plan`): a hand
+    # dispatch always sweeps.
+
+# **Scheduled runs queue behind each other** (the CI-time build, 2026-11-21). A
+# nightly under the cap of 8 takes about 11 h of wall time -- an estimate (the CI-time
+# design §7), which the first nightly under this build measures -- so one that runs
+# long could still be going when the next fires. Two at once would each sweep, and
+# neither would see the other's saved pass. So every `schedule` run shares one group,
+# and `cancel-in-progress: false` makes the newer one wait rather than cancel the
+# older. GitHub's docs (workflow syntax, `concurrency`, read 2026-11-21): "there can be
+# at most one running job or workflow in a concurrency group at any time", the queued
+# one is `pending`, and "by default, any existing `pending` job or workflow in the same
+# concurrency group will be canceled and the new queued job or workflow will take its
+# place" (`queue: single`, the default) -- so a third nightly fired while one runs and
+# one waits replaces the waiting one, which is the right one to drop: the newest night
+# sweeps the newest tree. The group is repository-wide (same page), and an expression
+# in it may use the `github` context. Every other event gets a group of its own run id,
+# so pushes, pull requests and dispatches are not held by it at all.
+concurrency:
+  group: "${{ github.event_name == 'schedule' && 'nightly-mutation' || format('run-{0}', github.run_id) }}"
+  cancel-in-progress: false
 
 # Every job below needs a `wl-preproc` checkout, and getting one has failed three
 # different ways. Recorded here because each looked fixed and was not:
@@ -173,10 +194,21 @@ jobs:
     # survived, after the branch's sharded full sweep had already passed on the
     # same code. A small selection leaves most shards empty, and an empty shard
     # passes at once (`mutation gate: 0 module(s)`, or `shard K/12 is empty`).
+    #
+    # **Four at once since 2026-11-21** (the CI-time build; the PI: the check "is holding
+    # up other repos on occasion"). `max-parallel` sets "the maximum number of jobs that
+    # can run simultaneously when using a `matrix` job strategy"; without it "GitHub
+    # will maximize the number of jobs run in parallel depending on runner
+    # availability" (GitHub's matrix how-to and workflow syntax, read 2026-11-21). It
+    # saves no runner-hours, only the share of the account's runners a push takes at
+    # once; a big merge push whose twelve shards are all full could take three waves.
+    # A push's shard is often under `MAP_FROM` functions (`tools/mutation_gate.py`), and
+    # then each module it touches runs its own baseline and restored suite as before.
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
@@ -225,8 +257,10 @@ jobs:
       - run: pip install -e ".[dev,contract,console,signin]"
       - name: Mutation gate (changed modules only, function shard ${{ matrix.shard }}/12)
         # WLX_REQUIRE_PREPROC applies to every sweep now, not just the two that named
-        # it: each sweep runs the whole suite as its baseline, and a baseline with the
-        # contract tests skipped is a baseline that proves less than it appears to.
+        # it: each job runs the whole suite as its baseline (the map's run under
+        # coverage, from `MAP_FROM` functions; each module's own baseline below it),
+        # and a baseline with the contract tests skipped is a baseline that proves
+        # less than it appears to.
         env:
           WLX_REQUIRE_PREPROC: "1"
           WLX_REQUIRE_XTASKS: "1"
@@ -246,6 +280,85 @@ jobs:
           fi
           python tools/mutation_gate.py --changed-only --base "$base" --shard ${{ matrix.shard }}/12
 
+  nightly-plan:
+    # What the full sweep (`mutation-full`) will check, decided once, before any shard
+    # starts (the CI-time build, 2026-11-21).
+    #
+    # **The pins.** Each shard used to check out wl-preproc's and wl-xtasks' `main` as it
+    # stood when that shard started. Under the cap of 8 the last of the 36 starts hours
+    # after the first, so one run could sweep against several neighbor trees, and a
+    # pass would name none of them. `pins` reads both heads once, with `git ls-remote`
+    # (both repositories are public, so it needs no token: see the checkout notes at
+    # the top; Git is on `ubuntu-latest`, Ubuntu 24.04, per actions/runner-images'
+    # readme, read 2026-11-21), and refuses anything that is not 40 hex characters --
+    # an empty answer, two lines, an error page -- so no shard checks out a guess. Every
+    # shard then checks out those exact SHAs (`actions/checkout@v7`'s `ref` is "the
+    # branch, tag or SHA to checkout", its `action.yml`, read 2026-11-21). A failed
+    # `pins` fails this job, and `mutation-full`, which needs it, is then skipped ("If a
+    # job fails or is skipped, all jobs that need it are skipped", workflow syntax,
+    # `needs`, read 2026-11-21): the run reads red, never a green that swept nothing.
+    #
+    # **The skip (Q3, the PI 2026-11-21: "All three unchanged").** A night is skipped
+    # only when our `main`, wl-xtasks' and wl-preproc's are all unchanged since the
+    # last fully passing nightly. The key names all three: `github.sha` (on `schedule`,
+    # "Last commit on default branch", events that trigger workflows, read 2026-11-21)
+    # and the two pins. `mutation-full-passed` saves it after a scheduled sweep whose
+    # every shard succeeded; `passed` looks it up, on `schedule` only, so a hand
+    # dispatch always sweeps. Floating pip dependencies are not in the key (the design
+    # §8 accepts it: a dispatch, and the next change to `main`, cover them).
+    #
+    # **It fails closed.** `actions/cache/restore@v6` (its `restore/action.yml`, v6.1.0,
+    # read 2026-11-21; `using: node24`) with `lookup-only` "check[s] if a cache entry
+    # exists ... without downloading", and its `cache-hit` output is "a boolean value to
+    # indicate an exact match was found for the primary key". Its source
+    # (`src/restoreImpl.ts` at v6, read 2026-11-21) sets `cache-hit` only when an entry
+    # was found -- on a miss "`cache-hit` is intentionally not set" -- and on an error
+    # it marks the step failed without setting it. `continue-on-error: true` keeps that
+    # error from failing the plan ("Prevents a job from failing when a step fails",
+    # workflow syntax). So a miss, an error, an entry evicted ("not been accessed in
+    # over 7 days", dependency caching reference, read 2026-11-21), a skipped lookup
+    # (any dispatch) or any new SHA leaves `hit` empty or `false` -- "If an output
+    # evaluates to an empty string, the output is not set" (workflow syntax, job
+    # outputs) -- and `mutation-full` runs on anything but the string `'true'`. A
+    # scheduled run may read and write caches in the default branch's scope
+    # (`schedule` is among the triggers that "can create or overwrite caches in the
+    # default branch's scope", dependency caching reference, read 2026-11-21).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      preproc: ${{ steps.pins.outputs.preproc }}
+      xtasks: ${{ steps.pins.outputs.xtasks }}
+      key: ${{ steps.pins.outputs.key }}
+      hit: ${{ steps.passed.outputs.cache-hit }}
+    steps:
+      - name: Pin wl-preproc's and wl-xtasks' heads for every shard
+        id: pins
+        run: |
+          preproc="$(git ls-remote https://github.com/westerberg-lab-be/wl-preproc.git refs/heads/main | cut -f1)"
+          xtasks="$(git ls-remote https://github.com/westerberg-lab-be/wl-xtasks.git refs/heads/main | cut -f1)"
+          for sha in "$preproc" "$xtasks"; do
+            if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::git ls-remote gave '$sha' for a neighbor's main, not a 40-hex SHA; refusing to sweep against a guess"
+              exit 1
+            fi
+          done
+          echo "wl-preproc main: $preproc"
+          echo "wl-xtasks main: $xtasks"
+          {
+            echo "preproc=$preproc"
+            echo "xtasks=$xtasks"
+            echo "key=mutation-full-passed-${{ github.sha }}-$preproc-$xtasks"
+          } >> "$GITHUB_OUTPUT"
+      - name: Look up a full pass of these three SHAs (schedule only)
+        id: passed
+        if: github.event_name == 'schedule'
+        uses: actions/cache/restore@v6
+        continue-on-error: true
+        with:
+          path: .mutation-full-passed
+          key: ${{ steps.pins.outputs.key }}
+          lookup-only: true
+
   mutation-full:
     # The full sweep -- every module in RETURNS, nothing left out by a diff -- split
     # thirty-six ways so no single job reaches the six-hour default that made this
@@ -255,7 +368,7 @@ jobs:
     # for 03:17 UTC to get the check `--changed-only` cannot give it -- including a
     # GLOBAL change, which the `mutation` job now explicitly does not cover.
     # `fail-fast: false` so one red shard does not cancel, and hide, the other
-    # twenty-three's results.
+    # thirty-five's results.
     #
     # **By function since 2026-09-30, twelve ways then** (PI; six ways by whole
     # module before): `serve` alone held a shard for 2h42m in run 36737681413. Each
@@ -287,10 +400,38 @@ jobs:
     # minutes) had 4 of its 24 shards cancelled at six hours, about 23 functions
     # unjudged, 1443 caught and none surviving. The PI chose "36 jobs, re-run first"
     # (2026-11-09): about two-thirds the work a shard. Push runs stay at 12.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    #
+    # **Likely tests first, since 2026-11-21** (the CI-time build). Each shard holds
+    # well over `MAP_FROM = 15` functions, so `tools/mutation_gate.py` first builds a
+    # map: the whole suite once under coverage, each function's lines tied to the
+    # tests that ran them (`tools/mutate.py --build-map`). A mutant then runs those
+    # tests first. A catch there is confirmed by running the same tests on the unbroken
+    # code (Q1, the PI: "Confirm each catch"), so a test that fails on its own is never
+    # read as a catch; every other outcome runs today's full suite, with today's
+    # verdicts. The map's run is the job's one unbroken baseline, and one restored
+    # suite runs at the end (Q2, "In this build"), where each module the shard touched
+    # used to run both. The verdict column is unchanged; a tag says where each verdict
+    # came from, and a closing tally gives each kind's count and seconds.
+    #
+    # **Eight at once since 2026-11-21** (the PI: the check "is holding up other repos
+    # on occasion"; `max-parallel` cited at `mutation` above). It caps the share of the
+    # account's runners a sweep takes, at the cost of wall time; it applies to the hand
+    # dispatch too, which is the same job. The estimates, each the CI-time design's §7
+    # and none of them measured: about 85 runner-hours a sweep with the map, against
+    # about 153 before, and about 11 h of wall time under the cap. The first nightly
+    # under this build measures all of them, and the map's log line prints its own time.
+    # GitHub's concurrent-job limit for the account's plan is UNVERIFIED (the design §5).
+    #
+    # **Run unless the plan found a pass** (`nightly-plan`): on `schedule` a night whose
+    # three SHAs already passed is skipped; on `workflow_dispatch` there is no lookup,
+    # so `hit` is empty and the sweep runs. Its two neighbor checkouts take the plan's
+    # pinned SHAs, so all 36 shards sweep one tree.
+    needs: nightly-plan
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.nightly-plan.outputs.hit != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 8
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
                 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
@@ -300,16 +441,17 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
-      - name: Check out wl-preproc inside the workspace
+      - name: Check out wl-preproc at the plan's pin inside the workspace
         uses: actions/checkout@v7
         with:
           repository: westerberg-lab-be/wl-preproc
+          ref: ${{ needs.nightly-plan.outputs.preproc }}
           path: wl-preproc
-      - name: Check out wl-xtasks's main inside the workspace
+      - name: Check out wl-xtasks at the plan's pin inside the workspace
         uses: actions/checkout@v7
         with:
           repository: westerberg-lab-be/wl-xtasks
-          ref: main
+          ref: ${{ needs.nightly-plan.outputs.xtasks }}
           path: wl-xtasks
       - name: Install wl-sync at wl-preproc's own pin
         # wl-preproc's contract readers import wl_sync at module level (since
@@ -340,3 +482,33 @@ jobs:
           WLX_REQUIRE_PREPROC: "1"
           WLX_REQUIRE_XTASKS: "1"
         run: python tools/mutation_gate.py --all --shard ${{ matrix.shard }}/36
+
+  mutation-full-passed:
+    # Saves the key `nightly-plan` looks up, after a scheduled sweep whose every shard
+    # succeeded, and only then: a key saved after a partial sweep would skip the next
+    # night on a tree nobody fully checked. `needs` both jobs (the key is the plan's
+    # output); with no status function in `if`, GitHub applies `success()` as well ("A
+    # default status check of `success()` is applied unless you include one of these
+    # functions", expressions, read 2026-11-21), so a failed, cancelled or skipped
+    # `mutation-full` -- a skipped night included -- skips this job too. That a matrix
+    # job's `result` is `success` only when every one of its jobs succeeded is not
+    # stated on the docs pages read (UNVERIFIED as documentation; `needs.<job_id>.result`
+    # is one of `success`, `failure`, `cancelled` or `skipped`, contexts, read
+    # 2026-11-21). A dispatch never saves, so the skip is first exercised by the
+    # scheduled night after a fully passing nightly with nothing changed.
+    #
+    # The entry holds the run id, for whoever wonders which run passed. A save that
+    # fails is only a warning (`actions/cache/save@v6`'s `src/saveImpl.ts` logs it and
+    # returns; `save/action.yml`, v6.1.0, `using: node24`, read 2026-11-21), so it never
+    # turns a passing sweep red; the cost is that the next quiet night sweeps anyway.
+    needs: [nightly-plan, mutation-full]
+    if: github.event_name == 'schedule' && needs.mutation-full.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record which run passed
+        run: echo "${{ github.run_id }}" > .mutation-full-passed
+      - name: Save the pass under the three SHAs' key
+        uses: actions/cache/save@v6
+        with:
+          path: .mutation-full-passed
+          key: ${{ needs.nightly-plan.outputs.key }}
