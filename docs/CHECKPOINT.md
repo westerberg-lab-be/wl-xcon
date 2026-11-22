@@ -96,9 +96,13 @@ is settled from his stated principles and told to him in one line; every merge w
   no:cacheprovider -n auto` (a `wl-preproc` checkout or link at the root, at `d8fe06b` or later, and a `wl-xtasks`
   one, git-ignored at `/wl-xtasks`; wl-sync at the commit `wl-preproc/pyproject.toml` pins). **6660 passed on
   `main`**; none skipped.
-- **CI**: each push sweeps the changed modules with mutants (`tools/mutation_gate.py`), the nightly all, in 36 shards;
-  a big branch runs that sweep by hand before its merge (`gh workflow run ci.yml --ref <branch>`). Read every shard's
-  log to its closing line; the run's summary can be wrong.
+- **CI**: each push sweeps the changed modules with mutants (`tools/mutation_gate.py`), the nightly all, in 36 shards,
+  8 at once, skipping a night on which our `main`, wl-preproc and wl-xtasks are unchanged since the last full pass.
+  A job of 15 functions or more builds one coverage map first, runs each mutant's mapped tests before the full suite
+  (each quick catch confirmed unmutated) and one restored suite at its end; its tally, `SELECTION NOT INDEPENDENT`
+  and `QUICK AND FULL DISAGREE` lists say how each verdict was reached (`tools/mutate.py --map`). A big branch runs
+  the sweep by hand before its merge (`gh workflow run ci.yml --ref <branch>`). Read every shard's log to its closing
+  line; the run's summary can be wrong.
 - **The neighbors** are read weekly, by their handover files (the PI, 2026-11-07): wl-preproc, wl-sync, wl-works,
   wl-xtasks. Last read: 2026-11-07, by the audit; wl-preproc answered XC-491 and XC-502 on 2026-11-14 and its
   handover was read at `d8fe06b`. Open asks of each: `docs/pending-*-amendments.md`.

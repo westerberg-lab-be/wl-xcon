@@ -15,7 +15,7 @@ No ` — ` inside a field. Link a section, not a file, where one exists. `tests/
 
 **Finding one.** Grep the ID, a package (`P9`, `b3`), a repository (`wl-sync`) or a file. The sections: brainstorms the PI asked to have later; features no plan covers yet; defects and review findings deliberately not fixed; debt (cleanup, stale wording, test hygiene); anything that needs the rig or other hardware, measurements included; and asks of, or waits on, other repositories.
 
-**Next free ID: XC-556.**
+**Next free ID: XC-557.**
 
 ## Brainstorms queued for the PI
 
@@ -325,6 +325,7 @@ No ` — ` inside a field. Link a section, not a file, where one exists. `tests/
 - **XC-553** Watch `tests/test_page_browser.py::test_withdraw_on_one_box_says_it_takes_back_the_whole_act` in WebKit by name: its `Page.goto` timed out under the suite's load in the summary and editor build, then passed (that build's Task 3 report), as XC-541 is watched. — 2026-11-19, [summary and editor design](superpowers/specs/2026-11-19-params-summary-editor-design.md) — waits on: nothing
 - **XC-554** A welfare ceiling's row has no plain name or help, so the pop-out's `reward_correct` reads by its code name on the Ceilings line and box: no part of the task format names a ceiling (a `Reward` names its bounded-config entry only), and the words for it wait on a place to put them, outside the welfare-listed `bounds.py` (the pop-out revision's whole-build review, M9). The PI approved the drafted words on 2026-11-20, asked in the UI after his try-out: plain name "Reward for a right answer", help "The fluid for each right look at the odd disc and each catch held; its size and cap come from the animal's bounds." (the revision's `fix-wave-report.md`). — 2026-11-19, [pop-out revision plan](superpowers/plans/2026-11-16-popout-revision.md) — waits on: a place for a ceiling's words outside `bounds.py`
 - **XC-555** Tune `tools/mutation_gate.py`'s `MAP_FROM = 15` from the first nightlies' map times and tallies. — 2026-11-21, [the CI time design §4.5](superpowers/specs/2026-11-21-ci-time-design.md#45-mutation_gaterun) — waits on: the first nightly under selection
+- **XC-556** Read each nightly's `QUICK AND FULL DISAGREE` lists: a test named there gave one result in a mutant's selected order and another in the full order, under the same mutant, so it is a leaky test to fix, and through such a test a quick catch can be a mutant the full suite would call a survivor (the PI, 2026-11-22, "Accept, and look for leaks"). — 2026-11-22, [the CI time design §1](superpowers/specs/2026-11-21-ci-time-design.md#1-intent) — waits on: the first nightly
 
 ## Needs the rig
 

@@ -17,6 +17,17 @@ This design says how each one is built without making any verdict less strict. A
 must still mean that a test failed under the mutant and would also have failed in the full suite as it
 runs today.
 
+**Amended 2026-11-22** (the whole-build review's I1; the PI, asked in the UI: "Accept, and look for
+leaks"). The build guarantees less than the sentence above. A quick catch fails with the mutant and
+passes without it, in the same selected order. A test whose catch the full order masks (a test before
+it leaves state that hides the mutant) is a leaky test, which the full suite would not flag either,
+and through one a quick catch can be a mutant the full suite would call `SURVIVED`. The PI accepted
+that and asked to look for leaks: whenever a mutant falls through to the full run, each selected
+test's result in the selected run is compared with its result in the full run, and a test whose
+results disagree is listed under `QUICK AND FULL DISAGREE`, with a count in the closing tally. It is
+a listing, never a verdict change, and it costs no extra run. §6's "the map's accuracy can only change
+speed" holds except in that case.
+
 ## 2. What the logs say (run 44746169158, 5 of its 36 successful shards: 1, 9, 14, 26, 27)
 
 - **The unmutated runs cost more than expected.** Each shard runs one baseline and one restored suite
@@ -127,6 +138,14 @@ Without `--map`, mutate behaves exactly as today. The gate always passes it when
    end `caught`, `SURVIVED` or `TIMED OUT`. A selected run never produces a `TIMED OUT` on its own,
    because the full suite might still catch the mutant on the way to the hang.
 
+**Amended 2026-11-22** (the whole-build review's I2 and M3). The selected run and the confirmation are
+stopped at `max(SUITE_TIMEOUT_SECONDS, LIMIT_FACTOR x` their tests' share of the map's run`)`, never
+over `limit`. The share is the selected tests' own times in the map's run, plus the part of that run
+no test held. The full run keeps `limit` (Call 2). Before this, a mutant that hung its own selected
+tests waited out the whole limit twice. A selected run stopped before any failure still falls through,
+so the shorter limit costs a full run, never a verdict. And a confirmation counts only if it ran every
+test that failed in the selected run. §10's "the same limit" is superseded by this.
+
 ### 4.4 The verdict line
 
 The verb column is unchanged (`caught` / `SURVIVED` / `TIMED OUT`), so existing readers still parse
@@ -161,6 +180,10 @@ it first". No pytest-cov: the switching it would do is the four lines of §4.1.
   2026-11-21). GitHub's limit is 20 concurrent jobs on Free, 40 on Pro and 60 on Team (Actions limits
   page, read 2026-11-21). The account's plan is UNVERIFIED: `gh api user` shows none to this token.
   The cap also applies to the pre-merge hand dispatch, since that is the same job.
+  **Amended 2026-11-22** (the whole-build review's M9): the jobs run in the `westerberg-lab-be`
+  organization, so the limit that matters is that organization's, shared by its repositories, and
+  `gh api user` is the wrong probe. A hand dispatch is in no concurrency group, so one during a
+  nightly runs 8 + 8 mutation jobs plus up to 4 for a push: 20, Free's whole limit.
 - **Skip (Q3):** a new job, `nightly-plan` (schedule and dispatch), runs before `mutation-full`. It
   resolves wl-preproc's and wl-xtasks' head SHAs with `git ls-remote` (both repos are public) and
   outputs them. Every shard then checks out those exact SHAs. Today each shard checks out whatever head

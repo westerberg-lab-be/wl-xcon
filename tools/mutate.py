@@ -49,11 +49,17 @@ time, and the first nightly under the CI-time build is the measurement.
 
 **A mutant's likely tests first** (`--map PATH`; §4.3). With a map, each mutant first runs
 only the tests the map says reach it, and a failure there is a catch only once those tests
-pass on the unbroken code (the PI's Q1, "Confirm each catch"). Every other outcome runs the
-full suite exactly as without a map, so the map decides how fast a verdict comes, never
-what it is (`mutate` gives the argument). The map's run is the call's baseline (Q2, "In this
-build"): no baseline and no restored suite run here, and the map is refused unless the tree
-still hashes as it did when the map was built. The caller runs the one restored suite:
+pass on the unbroken code (the PI's Q1, "Confirm each catch"): a quick catch fails with the
+mutant and passes without it, in the same selected order. Every other outcome runs the full
+suite exactly as without a map. That is all a quick catch guarantees: a leaky test, whose
+catch the full order would mask, can make a quick catch of a mutant the full suite would
+call a survivor -- and the full suite would not flag that test either. The PI accepted
+that on 2026-11-22 ("Accept, and look for leaks"), so each mutant that does run the full
+suite has its selected tests' results compared across the two runs, and a test that
+disagrees is listed under `QUICK AND FULL DISAGREE` (`mutate` gives the argument). The
+map's run is the call's baseline (Q2, "In this build"): no baseline and no restored suite
+run here, and the map is refused unless the tree still hashes as it did when the map was
+built. The caller runs the one restored suite:
 
     python3 tools/mutate.py --all --map .mutation-map.json wl_xcon/check.py
     python3 tools/mutate.py --restored
@@ -288,11 +294,14 @@ class SuiteRun(NamedTuple):
     selected: int | None = None
     #: pytest's exit code; `None` when the run was killed.
     returncode: int | None = None
+    #: `(node id, seconds)` for each test that finished, from its start to its teardown,
+    #: in run order (`Progress.took`).
+    took: tuple[tuple[str, float], ...] = ()
 
 
 def _suite_env() -> dict[str, str]:
     """This process's environment without anything that would make a suite measured, or
-    labelled, or selected, by a run around this one (Call 9 of the CI-time plan).
+    labeled, or selected, by a run around this one (Call 9 of the CI-time plan).
 
     The nightly's map run executes this file's own tests, and those build toy maps: a
     coverage run inside a coverage run. Inherited, `WLX_COV_CONTEXT` would become the
@@ -388,6 +397,7 @@ def _run_suite(
                 ran=seen.ran,
                 wanted=seen.wanted,
                 selected=seen.selected,
+                took=seen.took,
             )
         seconds = time.monotonic() - start
         seen = _read_progress(progress.read_text(encoding="utf-8"), time.time())
@@ -407,6 +417,7 @@ def _run_suite(
         wanted=seen.wanted,
         selected=seen.selected,
         returncode=result.returncode,
+        took=seen.took,
     )
 
 
@@ -421,6 +432,8 @@ class Progress(NamedTuple):
     ran: tuple[str, ...] = ()
     wanted: int | None = None
     selected: int | None = None
+    #: `(node id, seconds)` for each test whose `finished` line carries its time.
+    took: tuple[tuple[str, float], ...] = ()
 
 
 def _read_progress(text: str, now: float) -> Progress:
@@ -438,6 +451,7 @@ def _read_progress(text: str, now: float) -> Progress:
     """
     started: dict[str, float] = {}
     finished: set[str] = set()
+    took: dict[str, float] = {}
     failed: dict[str, str] = {}
     chose: dict = {}
     lines = [line for line in text.splitlines() if line.strip()]
@@ -456,6 +470,8 @@ def _read_progress(text: str, now: float) -> Progress:
             started.setdefault(nodeid, record["at"])
         elif record["event"] == "finished":
             finished.add(nodeid)
+            if "at" in record and nodeid in started:
+                took.setdefault(nodeid, max(0.0, record["at"] - started[nodeid]))
         elif record["event"] == "failed":
             failed.setdefault(nodeid, "FAILED" if record["when"] == "call" else "ERROR")
     unfinished = [nodeid for nodeid in started if nodeid not in finished]
@@ -469,6 +485,7 @@ def _read_progress(text: str, now: float) -> Progress:
         ran=tuple(started),
         wanted=chose.get("wanted"),
         selected=chose.get("found"),
+        took=tuple(took.items()),
     )
 
 
@@ -696,6 +713,10 @@ SELECTED = "selected"
 FULL_AFTER = "full, after selected"
 FULL_NO_TEST = "full: no test in the map"
 FULL_NOT_INDEPENDENT = "full: selected failed unmutated too"
+#: The tag, tallied as `FULL_NOT_INDEPENDENT`, of a confirmation that passed without
+#: running a test the selected run saw fail (the review's M3), so the tag does not say
+#: "failed" of a test that never ran.
+FULL_NOT_RERUN = "full: selected failure not rerun unmutated"
 _KINDS = (SELECTED, FULL_AFTER, FULL_NO_TEST, FULL_NOT_INDEPENDENT)
 
 
@@ -705,7 +726,9 @@ class Tally:
 
     `not_independent` lists each mutant whose selected failure came back on the unbroken
     code, `"name (id, id)"`; `missing` counts selected ids a run did not collect (Review
-    Focus 3: counted, never fatal).
+    Focus 3: counted, never fatal). `disagree` lists each selected test whose result in
+    a mutant's selected run and in its full run differ, `"id (selected: R, full: R;
+    mutating name)"` (`_disagreements`): a listing, never a verdict.
     """
 
     def __init__(self) -> None:
@@ -713,6 +736,7 @@ class Tally:
         self.seconds = dict.fromkeys(_KINDS, 0.0)
         self.not_independent: list[str] = []
         self.missing = 0
+        self.disagree: list[str] = []
 
     def add(self, kind: str, seconds: float) -> None:
         if kind not in self.count:
@@ -724,6 +748,7 @@ class Tally:
         return [
             *(f"{kind}: {self.count[kind]} in {self.seconds[kind]:.0f}s" for kind in _KINDS),
             f"selected ids not collected: {self.missing}",
+            f"quick and full disagree: {len(self.disagree)}",
         ]
 
 
@@ -775,6 +800,39 @@ def _failed_ids(run: SuiteRun) -> list[str]:
     return found
 
 
+def _results(run: SuiteRun) -> dict[str, str]:
+    """Each test `run` gave a result, by node id: `failed` when a failure line names it
+    (`_failed_ids`), else `passed` -- it finished and nothing failed, a skip included. A
+    test still running when the run was killed had no result, and is left out."""
+    failed = set(_failed_ids(run))
+    return {
+        test_id: "failed" if test_id in failed else "passed"
+        for test_id in run.ran
+        if test_id in failed or test_id != run.running
+    }
+
+
+def _disagreements(picked: SuiteRun, full: SuiteRun, function: str) -> list[str]:
+    """Each test of the selected run `picked` that the full run `full` also gave a
+    result, where the two results differ, in `picked`'s order: `"id (selected: R, full:
+    R; mutating function)"`, the id cut by `_short` (XC-331's 65 KB id).
+
+    **Looking for leaks** (the PI, 2026-11-22, "Accept, and look for leaks"). Both runs
+    hold the same mutant, so a test whose result differs between them depends on what
+    ran before it: a leaky test. A selected catch is confirmed only in the selected
+    order, so a leaky test is the one way it can differ from the full suite's verdict.
+    That catch cannot be compared without a full run it was spared, but its tests are
+    the same ones that disagree here, on any mutant that does fall through. Free, since
+    both runs happened; a listing, since the verdict is the full run's either way.
+    """
+    after = _results(full)
+    return [
+        f"{_short(test_id)} (selected: {before}, full: {after[test_id]}; mutating {function})"
+        for test_id, before in _results(picked).items()
+        if test_id in after and after[test_id] != before
+    ]
+
+
 def _up_to_last_failure(run: SuiteRun, selection: Sequence[str]) -> list[str]:
     """What the confirmation runs (Q1): the selected run's tests up to and including
     the last one that failed, in the order they ran. When no failure names a test that
@@ -793,6 +851,7 @@ def mutate(
     of: int | None = None,
     selection: Sequence[str] | None = None,
     tally: Tally | None = None,
+    selected_limit: float | None = None,
 ) -> tuple[bool | str | None, str]:
     """`(verdict, the line's text)` for neutering `function`.
 
@@ -820,31 +879,42 @@ def mutate(
 
     **With a `selection`** (`--map`; CI-time design §4.3), the map's tests for this
     function run first, and the text starts with a tag saying where the verdict came
-    from (§4.4). The argument that this changes no verdict (§6): a `caught` from the
-    selection needs a named test that fails with the mutant and passes without it, in
-    the same selected order. Every other outcome -- the selected tests passed, were
-    stopped at the limit before any failure, named no failure at all, or failed again
-    unmutated -- runs the full suite, through exactly the code a run without a map takes,
-    to exactly its verdicts. So the map's accuracy can only change how long a verdict
-    takes. The steps:
+    from (§4.4). **What a verdict from the selection guarantees** (§6, as the PI accepted
+    it on 2026-11-22): a quick catch names a test that fails with the mutant and passes
+    without it, in the same selected order. Every other outcome -- the selected tests
+    passed, were stopped at their limit before any failure, named no failure at all, or
+    failed again unmutated -- runs the full suite, through exactly the code a run
+    without a map takes, to exactly its verdicts. So the map's accuracy changes only how
+    long a verdict takes, **but for one case**: a leaky test, whose catch the full order
+    masks (a test before it leaves state that hides the mutant), is a quick catch where
+    the full suite would read `SURVIVED`. The full suite would not flag that leaky test
+    either. It is looked for, never ruled out: each mutant that runs the full suite after
+    a selection has every selected test's result compared across the two runs, and a
+    test that disagrees is listed under `QUICK AND FULL DISAGREE` (`_disagreements`),
+    without touching the verdict and without an extra run. The steps:
 
     - **No test in the map** (`selection` empty): the full suite at once, `[full: no
       test in the map]`. Code that runs only at import, or only in a child that lost
       its environment, lands here.
-    - **The selected run**: the mutant on disk with its sentinel, the same `limit` and
-      `--maxfail`, the selected files as pytest's positional arguments and the ids in
-      the file `WLX_SUITE_SELECT` names, never on argv (one id reached 65 KB, XC-331).
+    - **The selected run**: the mutant on disk with its sentinel, `--maxfail` as the full
+      run has it, and `selected_limit`, its tests' share of the map's run (never over
+      `limit`; `SuiteMap.selected_limit` says why that is verdict-safe). The selected
+      files are pytest's positional arguments and the ids go in the file
+      `WLX_SUITE_SELECT` names, never on argv (one id reached 65 KB, XC-331).
       **It is a catch only if a failure or error is named.** An exit code alone is not:
       a usage error (4) or "no tests ran" (5) is the harness, not a test. Ids not
       collected are counted in the tally, never fatal (Review Focus 3).
     - **The confirmation** (the PI's Q1, "Confirm each catch"): the file restored and
       the sentinel gone, the same files and the selected tests up to and including the
-      last that failed, with **no `--maxfail` and the same `limit`** (Call 6). Green, the
-      verdict is `[selected N of M]` (`N` the run's `selected`, `M` is `of`). Red, the
-      failure did not need the mutant -- a test that passes in file order and fails on
-      its own -- so the mutant goes to the full suite, `[full: selected failed unmutated
-      too]`, and the test is listed under `SELECTION NOT INDEPENDENT`. A confirmation
-      that times out is not a confirmation, and is listed "(timed out)".
+      last that failed, with **no `--maxfail` and the selected run's limit** (Call 6).
+      Green, and having run every test the selected run saw fail (the review's M3), the
+      verdict is `[selected N of M]` (`N` the run's `selected`, `M` is `of`). Green without
+      one of them, it asked that test nothing: `[full: selected failure not rerun
+      unmutated]`, listed as "not run unmutated". Red, the failure did not need the
+      mutant -- a test that passes in file order and fails on its own -- so the mutant
+      goes to the full suite, `[full: selected failed unmutated too]`, and the test is
+      listed under `SELECTION NOT INDEPENDENT`. A confirmation that times out is not a
+      confirmation, and is listed "(timed out)".
     - **The full suite**, after a selection that did not catch: `[full, after N selected
       passed in Ss]`, or, so a tag never says "passed" for a run that did not
       (Call 5), `timed out in Ss` or `ended with no test named (exit C) in Ss`. **A
@@ -853,7 +923,9 @@ def mutate(
 
     The sentinel is on disk exactly while the file is mutated: through the selected run
     and the full run, and not through the confirmation. `tally` takes each mutant's kind
-    and the seconds all its suites took; without one the counts are dropped.
+    and the seconds all its suites took, and the tests the two runs disagree on; without
+    one they are dropped. `selected_limit` is `main`'s `SuiteMap.selected_limit`; without
+    one the selected run and the confirmation have `limit`, as the full run does.
     """
     original = path.read_text()
     if _already_inert(original, function, args_returns):
@@ -871,6 +943,7 @@ def mutate(
         return _mutate_selected(
             path, function, original, mutated, tuple(selection),
             limit=limit, of=of, tally=Tally() if tally is None else tally,
+            quick=limit if selected_limit is None else min(limit, selected_limit),
         )
     try:
         _hold(path, original, mutated)
@@ -889,15 +962,20 @@ def _mutate_selected(
     limit: float,
     of: int | None,
     tally: Tally,
+    quick: float,
 ) -> tuple[bool | str, str]:
-    """`mutate` with a selection: §4.3's steps 2-5, as `mutate`'s docstring gives them."""
+    """`mutate` with a selection: §4.3's steps 2-5, as `mutate`'s docstring gives them.
+    `quick` limits the selected run and the confirmation, `limit` the full run."""
     spent = 0.0
+    picked: SuiteRun | None = None
 
     def full(tag: str, kind: str) -> tuple[bool | str, str]:
         # The mutant is on disk with its sentinel here, as `mutate` without a map has it.
         nonlocal spent
         run = _run_suite(timeout=limit, maxfail=MUTANT_MAXFAIL)
         spent += run.seconds
+        if picked is not None:
+            tally.disagree.extend(_disagreements(picked, run, function))
         verdict, text = _judge(run, of)
         tally.add(kind, spent)
         return verdict, f"[{tag}] {text}"
@@ -908,7 +986,7 @@ def _mutate_selected(
             return full(FULL_NO_TEST, FULL_NO_TEST)
         files = _selected_files(selection)
         picked = _run_suite(
-            timeout=limit, maxfail=MUTANT_MAXFAIL, paths=files, select=list(selection)
+            timeout=quick, maxfail=MUTANT_MAXFAIL, paths=files, select=list(selection)
         )
         spent += picked.seconds
         if picked.wanted is not None:
@@ -925,23 +1003,30 @@ def _mutate_selected(
 
         _release(path, original)
         confirm = _run_suite(
-            timeout=limit, paths=files, select=_up_to_last_failure(picked, selection)
+            timeout=quick, paths=files, select=_up_to_last_failure(picked, selection)
         )
         spent += confirm.seconds
-        if confirm.passed:
+        # Confirmed only if every test that failed under the mutant ran again unmutated
+        # (the review's M3): a confirmation that dropped one -- an id that differs from one
+        # collection to the next -- passed without asking it anything.
+        unasked = [test_id for test_id in _failed_ids(picked) if test_id not in confirm.ran]
+        if confirm.passed and not unasked:
             tally.add(SELECTED, spent)
             return True, f"[selected {chosen} of {of}] {_judge(picked, chosen)[1]}"
 
-        # Named as a verdict line names them (`_caught_by`), so a collection error
-        # in the confirmation is listed by its file.
+        # Named as a verdict line names them (`_caught_by`), so a collection error in the
+        # confirmation is listed by its file.
         again = [_short(line.split(" ", 1)[1].split(" - ", 1)[0]) for line in confirm.failures]
         if confirm.timed_out:
             again.append("timed out")
-        if not again:
+        # The tag says "failed unmutated too" only of a confirmation that failed.
+        tag = FULL_NOT_RERUN if unasked and not again else FULL_NOT_INDEPENDENT
+        again += [f"{_short(test_id)} not run unmutated" for test_id in unasked]
+        if not confirm.passed and not confirm.failures and not confirm.timed_out:
             again.append(f"exit {confirm.returncode}")
         tally.not_independent.append(f"{function} ({', '.join(again)})")
         _hold(path, original, mutated)
-        return full(FULL_NOT_INDEPENDENT, FULL_NOT_INDEPENDENT)
+        return full(tag, FULL_NOT_INDEPENDENT)
     finally:
         _release(path, original)
 
@@ -1031,8 +1116,10 @@ class SuiteMap(NamedTuple):
     `tests` is every test the run started, in its order; `functions` maps a module's
     path (`"wl_xcon/x.py"`) and a function's name to indices into `tests`; `unmatched`
     counts the labels that were not a recorded node id, which select nothing. `seconds`
-    and `started` are the run's, so a later call can take its baseline from the map. A
-    `NamedTuple` for the reason `SuiteRun` gives.
+    and `started` are the run's, so a later call can take its baseline from the map;
+    `took` is each test's own time in it, start to teardown, in `tests` order, so a
+    selection's limit can be its tests' share (`selected_limit`). A `NamedTuple` for the
+    reason `SuiteRun` gives.
     """
 
     tree: str
@@ -1042,16 +1129,50 @@ class SuiteMap(NamedTuple):
     tests: tuple[str, ...]
     functions: dict[str, dict[str, tuple[int, ...]]]
     unmatched: int
+    took: tuple[float, ...] = ()
 
     def tests_for(self, module: str, function: str) -> tuple[str, ...]:
         """The node ids that reached `function` in `module`, in `tests` order; `()`
         when none did or the map does not know it."""
         return tuple(self.tests[i] for i in self.functions.get(module, {}).get(function, ()))
 
+    def selected_limit(self, module: str, function: str, limit: float) -> float:
+        """How long `function`'s selected run, and its confirmation, may take: `LIMIT_FACTOR`
+        times its tests' share of the map's run, never under `SUITE_TIMEOUT_SECONDS`, and
+        never over `limit`, the full run's (the whole-build review's I2, 2026-11-22).
+
+        **Why it is not simply `limit`.** `limit` is `LIMIT_FACTOR` times the whole suite
+        under coverage, and a mutant that hangs its own tests -- the XC-140 class, counts
+        that stop advancing -- hangs exactly the tests the map selects. At `limit` the
+        selected run waited out a whole-suite limit and the full run then waited out
+        another, so one hang cost two. Scaled, the selected run gives up at about what
+        its tests should take.
+
+        **The share is its tests' own times** (`took`, from the progress file's `start` and
+        `finished` lines), plus the part of the map's run that no test held -- start-up
+        and collection, which a selected run pays again, in part. Not `seconds x N /
+        started`: a test's time is not the suite's average, and a selection is the tests
+        that reach one function, not a sample, so a count share could give a selection of
+        slow tests less than they take. Under coverage, so no shorter than a plain run of
+        them needs.
+
+        **It cannot change a verdict.** A selected run stopped here before any failure
+        falls through to the full run, at `limit`, through today's code: it is never
+        `TIMED OUT` on its own. One stopped after a failure is judged on the failures it
+        had, which a longer run would also have had, and still needs its confirmation.
+        A confirmation stopped here is not a confirmation, and the full run decides. So
+        a limit too short costs a full run, never a verdict.
+        """
+        chosen = self.functions.get(module, {}).get(function, ())
+        unheld = max(0.0, self.seconds - sum(self.took))
+        share = unheld + sum(self.took[i] for i in chosen if i < len(self.took))
+        return min(limit, max(SUITE_TIMEOUT_SECONDS, LIMIT_FACTOR * share))
+
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         record = self._asdict()
         record["tests"] = list(self.tests)
+        record["took"] = list(self.took)
         record["functions"] = {
             module: {name: list(indices) for name, indices in names.items()}
             for module, names in self.functions.items()
@@ -1155,6 +1276,7 @@ def build_map(out: Path, cwd: Path = ROOT) -> SuiteMap:
         tests=run.ran,
         functions=functions,
         unmatched=len(labels - set(index)),
+        took=tuple(dict(run.took).get(test, 0.0) for test in run.ran),
     )
     made.save(out)
     print(
@@ -1181,7 +1303,10 @@ def load_map(path: Path, cwd: Path = ROOT) -> SuiteMap:
                 for module, names in record["functions"].items()
             },
             unmatched=int(record["unmatched"]),
+            took=tuple(float(seconds) for seconds in record["took"]),
         )
+        if len(made.took) != len(made.tests):
+            raise ValueError(f"{len(made.took)} test times for {len(made.tests)} tests")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise SystemExit(f"cannot read the map {path}: {exc}") from None
     now = tree_hash(cwd)
@@ -1315,7 +1440,17 @@ def main() -> int:
         f"baseline: {source}; mutants stopped after {limit:.0f}s "
         f"({LIMIT_FACTOR} x this run's {seconds:.0f}s, never under "
         f"{SUITE_TIMEOUT_SECONDS}s) or at {MUTANT_MAXFAIL} failures "
-        f"(--maxfail={MUTANT_MAXFAIL})\n"
+        f"(--maxfail={MUTANT_MAXFAIL})"
+        + (
+            ""
+            if suite_map is None
+            else (
+                f"; a mutant's selected run and its confirmation after {LIMIT_FACTOR} x "
+                f"its tests' share of the map's run, never under {SUITE_TIMEOUT_SECONDS}s "
+                f"(SuiteMap.selected_limit)"
+            )
+        )
+        + "\n"
     )
 
     survivors = []
@@ -1329,6 +1464,7 @@ def main() -> int:
             caught, summary = mutate(
                 path, name, args.returns, limit=limit, of=started,
                 selection=suite_map.tests_for(module, name), tally=tally,
+                selected_limit=suite_map.selected_limit(module, name, limit),
             )
         if caught is None:
             skipped.append(name)
@@ -1368,6 +1504,12 @@ def main() -> int:
             # A test named here fails on its own, unmutated, in its selected order: a
             # selection cannot judge the mutants it reaches, so they ran the full suite.
             print(f"\nSELECTION NOT INDEPENDENT: {', '.join(tally.not_independent)}")
+        if tally.disagree:
+            # A listing, never a verdict (the PI, 2026-11-22, "Accept, and look for
+            # leaks"): a test named here gave one result in a mutant's selected order
+            # and another in the full order, under the same mutant, so it depends on
+            # what ran before it. Each one is a leaky test to fix (`_disagreements`).
+            print(f"\nQUICK AND FULL DISAGREE: {', '.join(tally.disagree)}")
     if inert:
         # Printed, never fatal, and never silent: these are functions no mutation
         # can reach, and a reader has to be able to tell that from coverage.

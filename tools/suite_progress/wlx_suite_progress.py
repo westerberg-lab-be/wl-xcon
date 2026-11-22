@@ -144,7 +144,9 @@ def pytest_runtest_logreport(report):
     if report.failed:
         _write({"event": "failed", "nodeid": report.nodeid, "when": report.when})
     if report.when == "teardown":
-        _write({"event": "finished", "nodeid": report.nodeid})
+        # `at` too, so `mutate.build_map` can keep each test's own time, start to
+        # teardown, and give a mutant's selected run a limit scaled to its tests.
+        _write({"event": "finished", "nodeid": report.nodeid, "at": time.time()})
 
 
 def pytest_runtest_logfinish(nodeid, location):

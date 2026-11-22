@@ -485,7 +485,7 @@ def test_dry_run_prints_each_module_of_the_shard_and_the_functions_it_would_run(
         assert f"    {module} ({len(names)}): {', '.join(names)}" in out
     count = sum(len(names) for _, names in plan)
     assert count >= _MAP_FROM, "a push's shard of the real package is under MAP_FROM"
-    assert f"map: built for {count} function(s) (MAP_FROM = {_MAP_FROM})" in out
+    assert f"map: would build for {count} function(s) (MAP_FROM = {_MAP_FROM})" in out
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +551,8 @@ def test_a_shard_of_at_least_map_from_functions_builds_one_map_and_passes_it_to_
     assert not where.exists() and not where.parent.exists(), "the map's directory was left"
     out = capsys.readouterr().out
     count = sum(len(names) for _, names in plan)
-    assert f"map: built for {count} function(s) (MAP_FROM = {_MAP_FROM})" in out
+    assert f"map: building for {count} function(s) (MAP_FROM = {_MAP_FROM})" in out
+    assert "map: built" not in out, "the gate claimed a map before mutate.py built it"
     assert "mutation gate passed" in out
 
 
@@ -604,7 +605,7 @@ def test_a_shard_under_map_from_runs_exactly_as_before(
             _module_command("second", None, mapped),
             [*_MUTATE, "--restored"],
         ]
-        assert f"map: built for {total} function(s) (MAP_FROM = {_MAP_FROM})" in out
+        assert f"map: building for {total} function(s) (MAP_FROM = {_MAP_FROM})" in out
 
 
 def test_a_failed_map_build_fails_the_job_and_runs_no_mutant(monkeypatch, capsys):
@@ -625,6 +626,7 @@ def test_a_failed_map_build_fails_the_job_and_runs_no_mutant(monkeypatch, capsys
     assert len(commands) == 1 and "--build-map" in commands[0], commands
     out = capsys.readouterr().out
     assert "MAP BUILD FAILED" in out
+    assert "\nMUTATION GATE FAILED: map build\n" in out, out
     assert "mutation gate passed" not in out
 
 
@@ -645,6 +647,7 @@ def test_a_red_restored_suite_fails_the_job(monkeypatch, capsys):
     assert commands[-1] == [*_MUTATE, "--restored"]
     out = capsys.readouterr().out
     assert "MUTATION GATE FAILED: restored suite" in out
+    assert "RESTORED SUITE RED: this job's verdicts are void." in out, out
     assert "mutation gate passed" not in out
 
 

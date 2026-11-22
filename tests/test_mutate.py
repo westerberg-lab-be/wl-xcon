@@ -1351,6 +1351,53 @@ def test_a_missing_or_corrupt_map_is_refused(tmp_path):
         mutate_tool.load_map(tmp_path / "corrupt.json", tmp_path)
 
 
+def test_a_map_records_each_tests_own_time_and_refuses_times_that_do_not_match(
+    map_env, tmp_path
+):
+    """The whole-build review's I2: a selection's limit is its tests' share of the map's
+    run, so the map keeps each test's time, start to teardown, in `tests` order, from
+    the progress file's `start` and `finished` lines; a map whose times are not one a
+    test is refused, as a corrupt map is."""
+    tree = _toy_tree(
+        tmp_path,
+        _TOY_TESTS + "\n\ndef test_slow():\n    import time\n    time.sleep(0.5)\n",
+    )
+    out = tmp_path / "map.json"
+
+    m = mutate_tool.build_map(out, tree)
+
+    assert len(m.took) == len(m.tests) == 3, m
+    slow = m.tests.index("tests/test_toy.py::test_slow")
+    assert 0.5 <= m.took[slow] < m.seconds, m.took
+    assert all(0.0 <= seconds < 0.5 for n, seconds in enumerate(m.took) if n != slow), m.took
+    assert mutate_tool.load_map(out, tree).took == m.took
+    record = json.loads(out.read_text())
+    record["took"] = record["took"][:-1]
+    out.write_text(json.dumps(record))
+    with pytest.raises(SystemExit, match="cannot read the map .*2 test times for 3 tests"):
+        mutate_tool.load_map(out, tree)
+
+
+def test_a_selected_limit_is_its_tests_share_never_under_the_floor_nor_over_the_full_limit():
+    """`SuiteMap.selected_limit`: `LIMIT_FACTOR` x (the run's time no test held + the
+    selected tests' own times), at least `SUITE_TIMEOUT_SECONDS`, at most `limit`."""
+    made = mutate_tool.SuiteMap(
+        tree="", summary="", seconds=1000.0, started=3, tests=("a", "b", "c"),
+        functions={"m.py": {"quick": (0,), "slow": (2,), "all": (0, 1, 2), "none": ()}},
+        unmatched=0, took=(10.0, 90.0, 400.0),
+    )
+    limit = mutate_tool._mutant_limit(made.seconds)
+
+    assert limit == 2000.0
+    # 500 s that no test held, start-up and collection, is paid by every selection.
+    assert made.selected_limit("m.py", "slow", limit) == 2 * (500.0 + 400.0)
+    assert made.selected_limit("m.py", "quick", limit) == 2 * (500.0 + 10.0)
+    assert made.selected_limit("m.py", "all", limit) == limit
+    assert made.selected_limit("m.py", "all", 1500.0) == 1500.0
+    small = made._replace(seconds=20.0, took=(1.0, 1.0, 1.0))
+    assert small.selected_limit("m.py", "quick", 300.0) == mutate_tool.SUITE_TIMEOUT_SECONDS
+
+
 def test_a_suite_red_under_coverage_refuses_the_map(map_env, tmp_path):
     """Review Focus 5. The map's run is the job's baseline, so a test that passes
     plainly and fails under the tracer refuses the map by name, and none is written."""
@@ -1396,7 +1443,7 @@ def test_a_map_built_inside_a_measured_suite_starts_clean(map_env, monkeypatch, 
     m = mutate_tool.build_map(tmp_path / "nested.json", tree)
 
     def timeless(made):
-        return made._replace(seconds=0.0, summary=made.summary.split(" in ")[0])
+        return made._replace(seconds=0.0, summary=made.summary.split(" in ")[0], took=())
 
     assert timeless(m) == timeless(clean), (m, clean)
     assert m.tests_for("wl_xcon/toy.py", "in_child") == ("tests/test_toy.py::test_child",), m
@@ -1499,9 +1546,10 @@ def test_the_plugin_sets_no_context_without_coverage(tmp_path):
 # ---------------------------------------------------------------------------
 # A mutant's likely tests first, each catch confirmed (CI-time design §4.3-4.4 and
 # §6; the PI's Q1 "Confirm each catch" and Q2 "In this build", 2026-11-21). A
-# selection may decide speed, never a verdict: a selected catch is confirmed on the
-# unbroken code, and every other outcome runs the full suite as `mutate` without a
-# map runs it. Driven end to end on toy suites, the real `_run_suite`, plugin and
+# selected catch fails with the mutant and passes without it, in the same selected
+# order, and every other outcome runs the full suite as `mutate` without a map runs
+# it. A leaky test whose catch the full order masks is the one way that can differ
+# from the full suite (the PI accepted it, and asked to look for leaks, 2026-11-22). Driven end to end on toy suites, the real `_run_suite`, plugin and
 # progress reader, with only the directory moved off the repository.
 # ---------------------------------------------------------------------------
 
@@ -1557,10 +1605,14 @@ def _wrap_suite(monkeypatch, tmp_path, suite: Path, target: Path) -> _Selected:
 
 
 def _hand_map(root: Path, functions: dict[str, dict[str, tuple[str, ...]]], *,
-              tests: tuple[str, ...], seconds: float = 1.0) -> Path:
+              tests: tuple[str, ...], seconds: float = 1.0,
+              took: tuple[float, ...] | None = None) -> Path:
     """A `SuiteMap` saved by hand for `root`'s tree, mapping each function to `tests`'
-    ids given; written outside `root` so it is no input to the hash."""
+    ids given; written outside `root` so it is no input to the hash. Each test's time
+    is `took`'s, or by default an equal part of `seconds`."""
     out = root.parent / "map.json"
+    if took is None:
+        took = tuple(seconds / len(tests) for _ in tests)
     mutate_tool.SuiteMap(
         tree=mutate_tool.tree_hash(root),
         summary=f"{len(tests)} passed in {seconds}s",
@@ -1572,6 +1624,7 @@ def _hand_map(root: Path, functions: dict[str, dict[str, tuple[str, ...]]], *,
             for module, names in functions.items()
         },
         unmatched=0,
+        took=took,
     ).save(out)
     return out
 
@@ -2027,6 +2080,248 @@ def test_with_a_map_main_runs_no_baseline_and_no_restored_suite_and_tallies_each
         assert any(line.startswith(f"  {kind}") and line.endswith("s") for line in lines), printed
     assert "  full: selected failed unmutated too: 0 in 0s" in lines, printed
     assert "SELECTION NOT INDEPENDENT" not in printed, printed
+
+
+#: Under the mutant, waits for `covered` to come back, bounded so a harness that failed
+#: to kill would make the test fail, never hang: XC-140's class, a mutant that hangs the
+#: very tests the map selects for it.
+_HANGS_WHEN_MUTATED = (
+    "import time\n"
+    "from toy_target import covered\n"
+    "def test_waits():\n"
+    f"    end = time.monotonic() + {_TOY_SLEEP}\n"
+    "    while covered() != [1] and time.monotonic() < end:\n"
+    "        time.sleep(0.05)\n"
+    "    assert covered() == [1]\n"
+)
+
+
+@pytest.mark.parametrize("catcher", [True, False], ids=["an-unselected-catcher", "no-catcher"])
+def test_a_selected_hang_falls_through_at_the_scaled_limit_and_the_full_run_judges(
+    monkeypatch, tmp_path, catcher
+):
+    """The whole-build review's I2. The selected test hangs under the mutant, so the
+    selected run stops at its own limit, the selection's share, not the full run's; it
+    names no failure, so it falls through, and the full run, at the whole limit, gives
+    today's verdict: caught by the unselected test before the same hang, or, with
+    none, `TIMED OUT` -- from the full run, never from the selection."""
+    files = {"test_z_waits.py": _HANGS_WHEN_MUTATED}
+    if catcher:
+        files["test_a_catches.py"] = _REACHES
+    toy = _toy_selected(monkeypatch, tmp_path, files)
+    quick, whole = _TOY_LIMIT, 2 * _TOY_LIMIT
+
+    caught, text = mutate_tool.mutate(
+        toy.target, "covered", "[]", limit=whole, of=len(files),
+        selection=("test_z_waits.py::test_waits",), selected_limit=quick,
+    )
+
+    assert [call["timeout"] for call in toy.calls] == [quick, whole], toy.calls
+    assert "select" in toy.calls[0] and "select" not in toy.calls[1], toy.calls
+    picked, final = toy.runs
+    assert picked.timed_out and picked.seconds < whole, picked
+    assert text.startswith(f"[full, after 1 selected timed out in {quick}s] "), text
+    assert final.timed_out, final
+    if catcher:
+        assert caught is True, text
+        assert f"timed out after {whole}s, 1 failed before it" in text, text
+        assert text.endswith("<- test_a_catches.py::test_uses"), text
+    else:
+        assert caught is mutate_tool.TIMED_OUT, text
+        assert f"timed out after {whole}s, no test failed before it" in text, text
+    assert toy.target.read_text() == _UNMUTATED
+
+
+def test_main_gives_each_selected_run_its_tests_share_and_each_full_run_the_whole_limit(
+    monkeypatch, tmp_path, capsys
+):
+    """Through `main`: the map's run took 1000 s, 800 of them in its two tests, so the
+    full run's limit is 2000 s and a selection of the 100-s test gets 2 x (200 + 100)."""
+    toy = _toy_selected(
+        monkeypatch, tmp_path, {"test_other.py": _BYSTANDER, "test_reaches.py": _REACHES}
+    )
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    tests = ("test_other.py::test_bystander", "test_reaches.py::test_uses")
+    out = _hand_map(
+        toy.target.parent, {"toy_target.py": {"covered": tests[:1]}},
+        tests=tests, seconds=1000.0, took=(100.0, 700.0),
+    )
+
+    assert _main(monkeypatch, "--map", str(out), "toy_target.py", "covered") == 0
+
+    assert [(call["timeout"], "select" in call) for call in toy.calls] == [
+        (600.0, True), (2000.0, False)
+    ], toy.calls
+    printed = capsys.readouterr().out
+    assert "mutants stopped after 2000s" in printed, printed
+    assert "its tests' share of the map's run, never under 300s" in printed, printed
+
+
+#: Two leaks, each the other's mirror, neither reaching `covered`: `test_needs` passes
+#: only after `test_sets` (it fails selected alone), and `test_clean` fails only after
+#: `test_spoils` (it passes selected alone). The third is the first with XC-331's 65 KB
+#: parameter on it.
+_BIG = "x" * 65537
+_LEAKS = {
+    "failed-alone-passed-in-order": {"state.py": _ORDER_STATE, "test_order.py": _ORDER_TESTS},
+    "passed-alone-failed-in-order": {
+        "state.py": "SPOILED = False\n",
+        "test_spoiled.py": (
+            "import state\n"
+            "def test_spoils():\n"
+            "    state.SPOILED = True\n"
+            "def test_clean():\n"
+            "    assert not state.SPOILED\n"
+        ),
+    },
+    "a-65-kb-id": {
+        "state.py": _ORDER_STATE,
+        "test_big.py": (
+            "import pytest\n"
+            "import state\n"
+            "def test_sets():\n"
+            "    state.READY = True\n"
+            f"@pytest.mark.parametrize('blob', ['x' * {len(_BIG)}])\n"
+            "def test_needs(blob):\n"
+            "    assert state.READY\n"
+        ),
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("case", "order", "results", "verb"),
+    [
+        ("failed-alone-passed-in-order",
+         ("test_order.py::test_sets", "test_order.py::test_needs"),
+         "selected: failed, full: passed", "SURVIVED"),
+        ("passed-alone-failed-in-order",
+         ("test_spoiled.py::test_spoils", "test_spoiled.py::test_clean"),
+         "selected: passed, full: failed", "caught"),
+        ("a-65-kb-id",
+         ("test_big.py::test_sets", f"test_big.py::test_needs[{_BIG}]"),
+         "selected: failed, full: passed", "SURVIVED"),
+    ],
+    ids=list(_LEAKS),
+)
+def test_a_selected_test_the_full_run_contradicts_is_listed_and_the_verdict_is_the_full_runs(
+    monkeypatch, tmp_path, capsys, case, order, results, verb
+):
+    """Looking for leaks (the PI, 2026-11-22, "Accept, and look for leaks"). A mutant
+    that falls through to the full run has each selected test's result compared across
+    the two runs, both mutated: one that disagrees depends on what ran before it, and
+    is listed under `QUICK AND FULL DISAGREE` and counted in the tally. It changes no
+    verdict: the full run's stands, a survivor where nothing fails in the full order,
+    caught where the leak makes a test fail there. The list keeps a 65 KB id short
+    (XC-331)."""
+    toy = _toy_selected(monkeypatch, tmp_path, _LEAKS[case])
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    selected = order[1]
+    out = _hand_map(toy.target.parent, {"toy_target.py": {"covered": (selected,)}}, tests=order)
+
+    status = _main(monkeypatch, "--map", str(out), "toy_target.py", "covered")
+
+    printed = capsys.readouterr().out
+    assert status == (0 if verb == "caught" else 1), printed[-3000:]
+    assert _verdict_line(printed, "covered").startswith(f"  {verb:9} covered "), printed[-3000:]
+    assert "select" not in toy.calls[-1], toy.calls
+    listed = next(
+        (row for row in printed.splitlines() if row.startswith("QUICK AND FULL DISAGREE: ")), None
+    )
+    assert listed is not None, printed[-3000:]
+    assert listed == (
+        f"QUICK AND FULL DISAGREE: {mutate_tool._short(selected)} ({results}; mutating covered)"
+    ), listed[:400]
+    assert len(listed) < 1024, len(listed)
+    assert "  quick and full disagree: 1" in printed.splitlines(), printed[-3000:]
+
+
+@pytest.mark.parametrize(
+    ("files", "selected"),
+    [
+        ({"test_a_other.py": _BYSTANDER, "test_b_reaches.py": _REACHES},
+         "test_a_other.py::test_bystander"),
+        ({"test_broken.py": "def test_broken():\n    assert False\n"},
+         "test_broken.py::test_broken"),
+    ],
+    ids=["passed-both-ways", "failed-both-ways"],
+)
+def test_a_selected_test_with_the_same_result_both_ways_is_not_listed(
+    monkeypatch, tmp_path, capsys, files, selected
+):
+    """The other half: a mutant that falls through with each selected test giving the
+    same result in both runs -- passed, or failed in each (a broken test, so the
+    confirmation fails too) -- lists nothing, and the tally counts none."""
+    toy = _toy_selected(monkeypatch, tmp_path, files)
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    order = tuple(
+        f"{name}::{line[4:].split('(')[0]}"
+        for name, source in sorted(files.items())
+        for line in source.splitlines()
+        if line.startswith("def test_")
+    )
+    out = _hand_map(toy.target.parent, {"toy_target.py": {"covered": (selected,)}}, tests=order)
+
+    assert _main(monkeypatch, "--map", str(out), "toy_target.py", "covered") == 0
+
+    printed = capsys.readouterr().out
+    assert len(toy.calls) >= 2 and "select" not in toy.calls[-1], toy.calls
+    assert "QUICK AND FULL DISAGREE" not in printed, printed
+    assert "  quick and full disagree: 0" in printed.splitlines(), printed
+
+
+#: An id that differs between collections, as a non-deterministic parameter would: each
+#: collection counts itself in `count.txt` beside the test, so the map's run named
+#: `[run0]`, the mutant's selected run collects `[run0]` too, and the confirmation finds
+#: `[run1]`, not the id it was given.
+_SHIFTING = (
+    "from pathlib import Path\n"
+    "import pytest\n"
+    "from toy_target import covered\n"
+    "_SEEN = Path(__file__).with_name('count.txt')\n"
+    "_N = int(_SEEN.read_text()) if _SEEN.exists() else 0\n"
+    "_SEEN.write_text(str(_N + 1))\n"
+    "@pytest.mark.parametrize('n', [_N], ids=[f'run{_N}'])\n"
+    "def test_shifts(n):\n"
+    "    assert covered() == [1]\n"
+)
+
+
+@pytest.mark.parametrize("neighbor", [True, False], ids=["green-without-it", "collects-nothing"])
+def test_a_confirmation_that_did_not_rerun_the_failed_test_is_not_a_catch(
+    monkeypatch, tmp_path, neighbor
+):
+    """The whole-build review's M3. The selected run's failing test is not collected by
+    the confirmation, so the confirmation asked it nothing: green on a neighbor alone,
+    or nothing collected (exit 5). Neither confirms; the full run decides, and the
+    test is listed as not run unmutated."""
+    files = {"test_shifts.py": _SHIFTING}
+    if neighbor:
+        files["test_a_passes.py"] = "def test_passes():\n    pass\n"
+    toy = _toy_selected(monkeypatch, tmp_path, files)
+    shifting = "test_shifts.py::test_shifts[run0]"
+    selection = (("test_a_passes.py::test_passes",) if neighbor else ()) + (shifting,)
+    tally = mutate_tool.Tally()
+
+    caught, text = mutate_tool.mutate(
+        toy.target, "covered", "[]", limit=60, of=len(selection),
+        selection=selection, tally=tally,
+    )
+
+    assert len(toy.runs) == 3, (caught, text, toy.calls)
+    picked, confirm, final = toy.runs
+    assert shifting in picked.ran and picked.failures, picked
+    assert shifting not in confirm.ran, confirm
+    assert confirm.passed is neighbor and confirm.returncode == (0 if neighbor else 5), confirm
+    assert "select" not in toy.calls[2], toy.calls
+    assert caught is True and "<- test_shifts.py::test_shifts[run2]" in text, text
+    if neighbor:
+        assert text.startswith("[full: selected failure not rerun unmutated] "), text
+        assert tally.not_independent == [f"covered ({shifting} not run unmutated)"], tally
+    else:
+        assert tally.not_independent == [f"covered ({shifting} not run unmutated, exit 5)"], tally
+    assert tally.count[mutate_tool.SELECTED] == 0, tally.count
+    assert tally.count[mutate_tool.FULL_NOT_INDEPENDENT] == 1, tally.count
 
 
 @pytest.mark.parametrize("green", [True, False], ids=["green", "red"])

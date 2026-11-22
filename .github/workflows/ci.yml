@@ -407,10 +407,18 @@ jobs:
     # tests that ran them (`tools/mutate.py --build-map`). A mutant then runs those
     # tests first. A catch there is confirmed by running the same tests on the unbroken
     # code (Q1, the PI: "Confirm each catch"), so a test that fails on its own is never
-    # read as a catch; every other outcome runs today's full suite, with today's
-    # verdicts. The map's run is the job's one unbroken baseline, and one restored
-    # suite runs at the end (Q2, "In this build"), where each module the shard touched
-    # used to run both. The verdict column is unchanged; a tag says where each verdict
+    # read as a catch: a quick catch fails with the mutant and passes without it, in the
+    # same selected order. Every other outcome runs today's full suite, with today's
+    # verdicts. That is the whole guarantee. A leaky test, whose catch the full order
+    # masks, can make a quick catch where the full suite would read SURVIVED; the full
+    # suite would not flag that test either. The PI accepted it (2026-11-22, "Accept,
+    # and look for leaks"): each mutant that does run the full suite has its selected
+    # tests' results compared across the two runs, and one that disagrees is listed
+    # under `QUICK AND FULL DISAGREE`, never changing a verdict (XC-556 reads it). A
+    # selected run is stopped at its tests' share of the map's run, never under 300 s,
+    # and the full run at the whole limit. The map's run is the job's one unbroken
+    # baseline, and one restored suite runs at the end (Q2, "In this build"), where each
+    # module the shard touched used to run both. The verdict column is unchanged; a tag says where each verdict
     # came from, and a closing tally gives each kind's count and seconds.
     #
     # **Eight at once since 2026-11-21** (the PI: the check "is holding up other repos
@@ -420,7 +428,14 @@ jobs:
     # and none of them measured: about 85 runner-hours a sweep with the map, against
     # about 153 before, and about 11 h of wall time under the cap. The first nightly
     # under this build measures all of them, and the map's log line prints its own time.
-    # GitHub's concurrent-job limit for the account's plan is UNVERIFIED (the design §5).
+    # The limit that matters is the organization's: the checkouts name
+    # `westerberg-lab-be`, so these jobs count against that organization's plan, and the
+    # "holding up other repos" share is the one its repositories have together. Its
+    # concurrent-job limit is UNVERIFIED (`gh api user`, the design §5's probe, reads a
+    # user, not the organization). A hand dispatch is in no concurrency group, so one
+    # during a nightly runs 8 + 8 of these jobs, and a push's `mutation` up to 4 more:
+    # 20, GitHub Free's whole limit (the design §5). Left so: putting a dispatch in the
+    # nightly's group trades a merge's wait for runner share, which is the PI's call.
     #
     # **Run unless the plan found a pass** (`nightly-plan`): on `schedule` a night whose
     # three SHAs already passed is skipped; on `workflow_dispatch` there is no lookup,

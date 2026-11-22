@@ -361,10 +361,13 @@ def function_count(plan: list[tuple[str, list[str] | None]]) -> int:
     )
 
 
-def _way(count: int) -> str:
-    """The line saying whether a job of `count` functions builds a map."""
+def _way(count: int, *, dry: bool = False) -> str:
+    """The line saying whether a job of `count` functions builds a map: printed before
+    the build, so it says `building`, and `mutate.py --build-map` then prints its own
+    `map:` line with what it built and its time; a dry run says `would build`."""
     if count >= MAP_FROM:
-        return f"map: built for {count} function(s) (MAP_FROM = {MAP_FROM})"
+        verb = "would build" if dry else "building"
+        return f"map: {verb} for {count} function(s) (MAP_FROM = {MAP_FROM})"
     return (
         f"no map: {count} function(s), under MAP_FROM = {MAP_FROM}; "
         f"each module runs its own baseline and restored suite"
@@ -407,6 +410,8 @@ def _sweep(plan: list[tuple[str, list[str] | None]], mapped: str | None) -> int:
                 f"\nMAP BUILD FAILED: mutate.py --build-map exited {code}; the job has "
                 f"no baseline, so no module was swept"
             )
+            # The gate's own banner too, so a reader grepping a shard for it finds this one.
+            print("\nMUTATION GATE FAILED: map build")
             return 1
     failures = []
     for module, only in plan:
@@ -427,6 +432,14 @@ def _sweep(plan: list[tuple[str, list[str] | None]], mapped: str | None) -> int:
         print(f"\n=== restored ({' '.join(command[3:])}) ===", flush=True)
         if subprocess.run(command, cwd=ROOT).returncode != 0:
             failures.append("restored suite")
+            # The review's M4. The map's run, under coverage, was this job's only
+            # baseline, so a test red only without coverage (a race the tracer's slowdown
+            # hides) went red unseen in every mutant that selected it, and read caught.
+            print(
+                "\nRESTORED SUITE RED: this job's verdicts are void. No plain suite ran "
+                "before its mutants (the map's run, under coverage, was the baseline), so "
+                "a catch above may be a test red without any mutant."
+            )
     if failures:
         print(f"\nMUTATION GATE FAILED: {', '.join(failures)}")
         return 1
@@ -528,7 +541,7 @@ def main() -> int:
         return 0
     if args.dry_run:
         # `run`'s own line, so a dry run says whether the job would build a map.
-        print(f"  {_way(function_count(plan))}")
+        print(f"  {_way(function_count(plan), dry=True)}")
         return 0
     return run(plan)
 
