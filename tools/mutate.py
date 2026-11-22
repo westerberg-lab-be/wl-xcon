@@ -24,12 +24,35 @@ baseline before and restored suite after. It exists so `tools/mutation_gate.py
 --shard` can cut one module's functions across CI machines (PI, 2026-09-30), and
 it refuses a name `--all` would not list rather than skipping it: a target that was
 never run must not read as one that was.
+
+**The map** (`--build-map PATH`; CI-time design §4.1, approved by the PI 2026-11-21). One
+run of the whole suite under coverage.py (`tools/suite_progress/coverage.ini`), with the
+progress plugin filing each test's lines under its pytest node id, writes a JSON file:
+every test id in run order, for each function of each `wl_xcon/*.py` the tests whose
+context reached a line of its body (`_body_lines`), and a hash of every file under
+`wl_xcon/` and `tests/` (`tree_hash`), so a map read against another tree is refused
+(`load_map`). Its run is a baseline -- it must be green, and the plugin must have recorded
+its tests -- so a test that is red only under coverage refuses the map, by name.
+
+    python3 tools/mutate.py --build-map .mutation-map.json
+
+**A label that is not a node id selects nothing.** Only a context exactly equal to an id
+the progress file saw start is a test. Import and collection run under `""`; a coverage
+run nested inside another joins labels as `outer|inner`; a child Python that replaced its
+environment loses the id. Each is counted in the map's line and selects no test, because
+a selection can only run tests: a function reached only that way falls through to the
+full suite, which costs time and never a verdict.
+
+**What it costs is an estimate, not a measurement**: one suite under coverage, guessed at
+1.5-3x a plain run (the coverage docs give no figure). The map's line prints its own
+time, and the first nightly under the CI-time build is the measurement.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import shutil
@@ -37,10 +60,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent.parent
+#: The package the map covers, every `*.py` directly in it (Call 8 of the CI-time plan).
+PACKAGE_DIR = "wl_xcon"
 
 #: Written before a file is mutated and removed after it is restored. A `finally`
 #: cannot survive SIGKILL, and a timeout kills -- which once left a neutered
@@ -132,6 +158,16 @@ PROGRESS_PLUGIN_DIR = Path(__file__).resolve().parent / "suite_progress"
 PROGRESS_PLUGIN = "wlx_suite_progress"
 #: The variable naming the plugin's file. Without it the plugin writes nothing.
 PROGRESS_ENV = "WLX_SUITE_PROGRESS"
+#: The plugin's two other variables (`wlx_suite_progress.CONTEXT_ENV` and `SELECT_ENV`,
+#: spelled again here because this file loads by path and cannot import the plugin;
+#: `tests/test_mutate.py` holds the two spellings equal). The running test's id, read by
+#: `COVERAGE_RC`'s `context`; and the file listing the ids a run keeps.
+CONTEXT_ENV = "WLX_COV_CONTEXT"
+SELECT_ENV = "WLX_SUITE_SELECT"
+#: The map's coverage configuration (CI-time design §4.1).
+COVERAGE_RC = PROGRESS_PLUGIN_DIR / "coverage.ini"
+#: What the map's hash covers (`tree_hash`): what a test can import or read.
+MAP_DIRS = ("wl_xcon", "tests")
 
 #: `-rfE` makes pytest end with one line per failed or errored test. **Keeping only
 #: the last line is how the 2026-09-25 nightly went red on a flaky test without once
@@ -230,6 +266,34 @@ class SuiteRun(NamedTuple):
     finished: int = 0
     running: str | None = None
     running_for: float = 0.0
+    #: Every test that started, by node id, in the order it started.
+    ran: tuple[str, ...] = ()
+    #: From the plugin's `selected` line: how many ids the selection named, and how many
+    #: of them were collected. `None` when no selection was asked.
+    wanted: int | None = None
+    selected: int | None = None
+    #: pytest's exit code; `None` when the run was killed.
+    returncode: int | None = None
+
+
+def _suite_env() -> dict[str, str]:
+    """This process's environment without anything that would make a suite measured, or
+    labelled, or selected, by a run around this one (Call 9 of the CI-time plan).
+
+    The nightly's map run executes this file's own tests, and those build toy maps: a
+    coverage run inside a coverage run. Inherited, `WLX_COV_CONTEXT` would become the
+    inner run's static context and every label `outer|inner`, matching no node id;
+    `COVERAGE_PROCESS_START` or `COVERAGE_PROCESS_CONFIG` would start the outer
+    measurement in the inner interpreter (coverage 7.17.4, `control.py:1490-1491` and its
+    `.pth` file, read 2026-11-21); and `COVERAGE_FILE`, `COVERAGE_RCFILE`, `COVERAGE_CORE`
+    and the rest bend a run's data or config (`config.py:659-732`). So every `COVERAGE_*`
+    goes, with the plugin's own two, and each run then sets what it needs.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("COVERAGE_") and key not in (CONTEXT_ENV, SELECT_ENV)
+    }
 
 
 def _run_suite(
@@ -237,10 +301,19 @@ def _run_suite(
     *,
     timeout: float = SUITE_TIMEOUT_SECONDS,
     maxfail: int | None = None,
+    coverage_file: Path | None = None,
+    paths: Sequence[str] = (),
+    select: Sequence[str] | None = None,
 ) -> SuiteRun:
     """Run the suite once, with the progress plugin loaded, and stop it at `timeout`
     -- and, given `maxfail`, at that many failures (`MUTANT_MAXFAIL`; only `mutate`
     gives it).
+
+    Given `coverage_file`, under `coverage run --rcfile=COVERAGE_RC`, its data written
+    beside that path (`COVERAGE_FILE`; one file per process, combined by `build_map`).
+    `paths` are pytest's positional arguments, so only those files are collected; `select`
+    is written to a JSON file named by `WLX_SUITE_SELECT`, never to argv, and removed after.
+    The environment is `_suite_env()`, so a run nested in a measured one starts clean.
 
     `cwd` is only ever the repository in use; it is a parameter so a test can run
     this, end to end, against a three-test suite rather than this one.
@@ -250,16 +323,35 @@ def _run_suite(
     handle, name = tempfile.mkstemp(prefix="wlx-suite-progress-", suffix=".jsonl")
     os.close(handle)
     progress = Path(name)
-    env = dict(os.environ)
+    chosen: Path | None = None
+    env = _suite_env()
     env[PROGRESS_ENV] = str(progress)
     env["PYTHONPATH"] = os.pathsep.join(
         [str(PROGRESS_PLUGIN_DIR), *filter(None, [os.environ.get("PYTHONPATH")])]
     )
+    measure: list[str] = []
+    if coverage_file is not None:
+        env["COVERAGE_FILE"] = str(Path(coverage_file).resolve())
+        measure = ["-m", "coverage", "run", f"--rcfile={COVERAGE_RC}"]
     start = time.monotonic()
     try:
+        if select is not None:
+            handle, name = tempfile.mkstemp(prefix="wlx-suite-select-", suffix=".json")
+            with os.fdopen(handle, "w", encoding="utf-8") as listed:
+                json.dump(list(select), listed)
+            chosen = Path(name)
+            env[SELECT_ENV] = str(chosen)
         try:
             result = subprocess.run(
-                [sys.executable, *SUITE_ARGV, *stop, "-p", PROGRESS_PLUGIN],
+                [
+                    sys.executable,
+                    *measure,
+                    *SUITE_ARGV,
+                    *stop,
+                    "-p",
+                    PROGRESS_PLUGIN,
+                    *paths,
+                ],
                 cwd=cwd,
                 capture_output=True,
                 text=True,
@@ -279,11 +371,16 @@ def _run_suite(
                 finished=seen.finished,
                 running=seen.running,
                 running_for=seen.running_for,
+                ran=seen.ran,
+                wanted=seen.wanted,
+                selected=seen.selected,
             )
         seconds = time.monotonic() - start
         seen = _read_progress(progress.read_text(encoding="utf-8"), time.time())
     finally:
         progress.unlink(missing_ok=True)
+        if chosen is not None:
+            chosen.unlink(missing_ok=True)
     output = result.stdout.strip().splitlines()
     return SuiteRun(
         result.returncode == 0,
@@ -292,6 +389,10 @@ def _run_suite(
         seconds=seconds,
         started=seen.started,
         finished=seen.finished,
+        ran=seen.ran,
+        wanted=seen.wanted,
+        selected=seen.selected,
+        returncode=result.returncode,
     )
 
 
@@ -303,6 +404,9 @@ class Progress(NamedTuple):
     finished: int
     running: str | None
     running_for: float
+    ran: tuple[str, ...] = ()
+    wanted: int | None = None
+    selected: int | None = None
 
 
 def _read_progress(text: str, now: float) -> Progress:
@@ -321,6 +425,7 @@ def _read_progress(text: str, now: float) -> Progress:
     started: dict[str, float] = {}
     finished: set[str] = set()
     failed: dict[str, str] = {}
+    chose: dict = {}
     lines = [line for line in text.splitlines() if line.strip()]
     for n, line in enumerate(lines):
         try:
@@ -329,6 +434,9 @@ def _read_progress(text: str, now: float) -> Progress:
             if n == len(lines) - 1:
                 break
             raise
+        if record["event"] == "selected":
+            chose = record
+            continue
         nodeid = record["nodeid"]
         if record["event"] == "start":
             started.setdefault(nodeid, record["at"])
@@ -344,6 +452,9 @@ def _read_progress(text: str, now: float) -> Progress:
         finished=len(finished),
         running=running,
         running_for=now - started[running] if running else 0.0,
+        ran=tuple(started),
+        wanted=chose.get("wanted"),
+        selected=chose.get("found"),
     )
 
 
@@ -666,10 +777,227 @@ def _only(targets: list[str], only: str, path: Path) -> list[str]:
     return [name for name in targets if name in wanted]
 
 
+def tree_hash(cwd: Path = ROOT) -> str:
+    """sha256 over every file under `MAP_DIRS`, path and bytes both, in sorted relative
+    POSIX path order; `__pycache__` skipped, since a run writes it and it is not source.
+
+    A map describes the tree it was built from. Under Q2 (the PI, 2026-11-21) no module's
+    sweep has its own baseline any more, so a tree changed since the map -- an edit, or a
+    mutation the heal declined to restore -- would otherwise be swept as if it were the
+    tree the map's green run saw. Each file's path and length go in before its bytes, so
+    no two trees can feed the hash the same stream.
+    """
+    digest = hashlib.sha256()
+    found = []
+    for top in MAP_DIRS:
+        base = cwd / top
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if "__pycache__" in path.relative_to(cwd).parts or not path.is_file():
+                continue
+            found.append((path.relative_to(cwd).as_posix(), path))
+    for relative, path in sorted(found):
+        data = path.read_bytes()
+        digest.update(f"{relative}\0{len(data)}\0".encode())
+        digest.update(data)
+    return digest.hexdigest()
+
+
+def _body_lines(source: str, function: str) -> set[int]:
+    """The lines of every definition of `function`, each from its first body statement
+    to its `end_lineno`, read with `ast` (CI-time design §4.1). The `def` and decorator
+    lines are left out because they run at import, under no test; a body is what only a
+    call runs. Every definition, because `mutate` neuters them all together."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function:
+            lines.update(range(node.body[0].lineno, node.end_lineno + 1))
+    return lines
+
+
+class SuiteMap(NamedTuple):
+    """Which tests reach each function, from one green run under coverage.
+
+    `tests` is every test the run started, in its order; `functions` maps a module's
+    path (`"wl_xcon/x.py"`) and a function's name to indices into `tests`; `unmatched`
+    counts the labels that were not a recorded node id, which select nothing. `seconds`
+    and `started` are the run's, so a later call can take its baseline from the map. A
+    `NamedTuple` for the reason `SuiteRun` gives.
+    """
+
+    tree: str
+    summary: str
+    seconds: float
+    started: int
+    tests: tuple[str, ...]
+    functions: dict[str, dict[str, tuple[int, ...]]]
+    unmatched: int
+
+    def tests_for(self, module: str, function: str) -> tuple[str, ...]:
+        """The node ids that reached `function` in `module`, in `tests` order; `()`
+        when none did or the map does not know it."""
+        return tuple(self.tests[i] for i in self.functions.get(module, {}).get(function, ()))
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = self._asdict()
+        record["tests"] = list(self.tests)
+        record["functions"] = {
+            module: {name: list(indices) for name, indices in names.items()}
+            for module, names in self.functions.items()
+        }
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+
+def _red_baseline(run: SuiteRun) -> SystemExit:
+    return SystemExit(
+        "\n".join([f"suite is not green to begin with: {run.summary}", *run.failures])
+    )
+
+
+def _blind_baseline(run: SuiteRun) -> SystemExit:
+    # The progress file is how a stopped suite is judged. A baseline that ran and
+    # recorded nothing means the plugin is not loading, and every timeout after it
+    # would be judged blind -- so the sweep refuses rather than starting.
+    return SystemExit(
+        f"the progress plugin recorded no test during the baseline "
+        f"({run.summary}); a suite stopped at its limit could not be judged. "
+        f"Check {PROGRESS_PLUGIN_DIR / (PROGRESS_PLUGIN + '.py')} loads."
+    )
+
+
+def _resolved(path: str) -> str:
+    return os.path.realpath(path)
+
+
+def build_map(out: Path, cwd: Path = ROOT) -> SuiteMap:
+    """Run the whole suite once under coverage and write which tests reach which
+    function to `out` (CI-time design §4.1-4.2).
+
+    The run is the job's baseline, held to a baseline's rules: red (named, as a red
+    baseline is), or blind (no test recorded), it is refused and no map is written. A
+    test red only under coverage -- one that checks `sys.gettrace()`, or a bounded wait
+    the tracer makes it miss -- therefore fails the job loudly, by name.
+    """
+    try:
+        # Imported here, and only here in this file, so `mutate.py` without
+        # `--build-map` runs where coverage is not installed.
+        from coverage import CoverageData
+    except ImportError:
+        raise SystemExit(
+            'the map needs coverage.py: pip install "coverage>=7.10" (the `dev` extra)'
+        ) from None
+    tree = tree_hash(cwd)
+    scratch = Path(tempfile.mkdtemp(prefix="wlx-map-"))
+    try:
+        run = _run_suite(
+            cwd, timeout=BASELINE_TIMEOUT_SECONDS, coverage_file=scratch / ".coverage"
+        )
+        if not run.passed:
+            raise _red_baseline(run)
+        if not run.started:
+            raise _blind_baseline(run)
+        # `patch = subprocess` makes every process write its own `.coverage.<suffix>`
+        # (`parallel`, `config.py:574` in coverage 7.17.4, read 2026-11-21). They are
+        # combined here, by reading each through the data API's
+        # `CoverageData.contexts_by_lineno` (added in 5.0; `sqldata.py`, read 2026-11-21).
+        root = Path(_resolved(str(cwd)))
+        reached: dict[str, dict[int, set[str]]] = {}
+        for part in sorted(scratch.glob(".coverage*")):
+            data = CoverageData(basename=str(part))
+            data.read()
+            for measured in data.measured_files():
+                try:
+                    relative = Path(_resolved(measured)).relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                lines = reached.setdefault(relative, {})
+                for line, labels in data.contexts_by_lineno(measured).items():
+                    lines.setdefault(line, set()).update(labels)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    index = {test: n for n, test in enumerate(run.ran)}
+    labels = {label for lines in reached.values() for seen in lines.values() for label in seen}
+    functions: dict[str, dict[str, tuple[int, ...]]] = {}
+    total = hit = 0
+    for module in sorted((cwd / PACKAGE_DIR).glob("*.py")):
+        relative = module.relative_to(cwd).as_posix()
+        source = module.read_text(encoding="utf-8")
+        lines = reached.get(relative, {})
+        names = {}
+        for name in _function_names(source):
+            found = {
+                index[label]
+                for line in _body_lines(source, name)
+                for label in lines.get(line, ())
+                if label in index
+            }
+            names[name] = tuple(sorted(found))
+            total += 1
+            hit += bool(found)
+        functions[relative] = names
+    made = SuiteMap(
+        tree=tree,
+        summary=run.summary,
+        seconds=run.seconds,
+        started=run.started,
+        tests=run.ran,
+        functions=functions,
+        unmatched=len(labels - set(index)),
+    )
+    made.save(out)
+    print(
+        f"map: {len(made.tests)} tests, {hit} of {total} functions reached by a test, "
+        f"{made.unmatched} labels selected nothing, built in {run.seconds:.0f}s "
+        f"({run.summary})"
+    )
+    return made
+
+
+def load_map(path: Path, cwd: Path = ROOT) -> SuiteMap:
+    """The map at `path`, refused when it is missing, does not parse, or was built from
+    a tree other than `cwd`'s (`tree_hash`)."""
+    try:
+        record = json.loads(Path(path).read_text(encoding="utf-8"))
+        made = SuiteMap(
+            tree=record["tree"],
+            summary=record["summary"],
+            seconds=float(record["seconds"]),
+            started=int(record["started"]),
+            tests=tuple(record["tests"]),
+            functions={
+                module: {name: tuple(indices) for name, indices in names.items()}
+                for module, names in record["functions"].items()
+            },
+            unmatched=int(record["unmatched"]),
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise SystemExit(f"cannot read the map {path}: {exc}") from None
+    now = tree_hash(cwd)
+    if made.tree != now:
+        raise SystemExit(
+            f"the map {path} was built from another tree (map {made.tree}, tree {now}); "
+            f"rebuild it with --build-map"
+        )
+    return made
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("path", type=Path)
+    parser.add_argument("path", type=Path, nargs="?")
     parser.add_argument("function", nargs="?")
+    parser.add_argument(
+        "--build-map",
+        metavar="PATH",
+        type=Path,
+        help="run the suite once under coverage and write which tests reach each function",
+    )
     parser.add_argument("--all", action="store_true")
     parser.add_argument(
         "--returns",
@@ -686,9 +1014,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.build_map is not None:
+        if args.path is not None or args.all or args.only is not None:
+            raise SystemExit("--build-map maps the whole suite; give it no module or --all")
+        _restore_any_interrupted_run()
+        build_map(ROOT / args.build_map)
+        return 0
+
     if args.only is not None and not args.all:
         raise SystemExit("--only narrows --all's target list; give --all as well")
 
+    if args.path is None:
+        raise SystemExit("give a module path, or --build-map PATH")
     path = ROOT / args.path
     if args.all:
         targets = _function_names(path.read_text())
@@ -704,20 +1041,9 @@ def main() -> int:
     _restore_any_interrupted_run()
     baseline = _run_suite(timeout=BASELINE_TIMEOUT_SECONDS)
     if not baseline.passed:
-        raise SystemExit(
-            "\n".join(
-                [f"suite is not green to begin with: {baseline.summary}", *baseline.failures]
-            )
-        )
+        raise _red_baseline(baseline)
     if not baseline.started:
-        # The progress file is how a stopped suite is judged. A baseline that ran and
-        # recorded nothing means the plugin is not loading, and every timeout after it
-        # would be judged blind -- so the sweep refuses rather than starting.
-        raise SystemExit(
-            f"the progress plugin recorded no test during the baseline "
-            f"({baseline.summary}); a suite stopped at its limit could not be judged. "
-            f"Check {PROGRESS_PLUGIN_DIR / (PROGRESS_PLUGIN + '.py')} loads."
-        )
+        raise _blind_baseline(baseline)
     limit = _mutant_limit(baseline.seconds)
     # The stop is printed with the limit, so a log that reads `3 failed` says why.
     print(

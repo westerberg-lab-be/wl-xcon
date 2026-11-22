@@ -798,7 +798,8 @@ def test_a_progress_line_cut_short_by_the_kill_is_dropped_and_only_that_one():
     seen = mutate_tool._read_progress(whole + '{"event": "fin', now=131.0)
 
     assert seen == mutate_tool.Progress(
-        failures=["FAILED t.py::a"], started=2, finished=1, running="t.py::b", running_for=30.0
+        failures=["FAILED t.py::a"], started=2, finished=1, running="t.py::b", running_for=30.0,
+        ran=("t.py::a", "t.py::b"),
     )
     with pytest.raises(json.JSONDecodeError):
         mutate_tool._read_progress('{"event": "fin\n' + whole, now=131.0)
@@ -1155,3 +1156,340 @@ def test_a_mutant_failing_only_at_collection_is_caught_naming_at_most_three_file
     assert summary.startswith("3 errors in "), summary
     assert summary.endswith("  <- test_uses_1.py, test_uses_2.py, test_uses_3.py"), summary
     assert target.read_text() == _UNMUTATED
+
+
+# ---------------------------------------------------------------------------
+# The map (CI-time design §4.1, approved by the PI 2026-11-21): one run of the
+# suite under coverage, each test's lines filed under its node id, so a mutant
+# can run the tests that reach it first. Driven end to end on a toy tree that
+# mirrors the repository's layout (`wl_xcon/`, `tests/`; Call 10), so the shipped
+# rcfile and `tree_hash` run unchanged. Never against this repository.
+# ---------------------------------------------------------------------------
+
+_TOY_MODULE = (
+    "def reached():\n"
+    "    return 1\n"
+    "\n"
+    "\n"
+    "def at_import():\n"
+    "    return 2\n"
+    "\n"
+    "\n"
+    "AT_IMPORT = at_import()\n"
+    "\n"
+    "\n"
+    "def never_called():\n"
+    "    return 3\n"
+    "\n"
+    "\n"
+    "def in_child():\n"
+    "    return 4\n"
+    "\n"
+    "\n"
+    "def in_child_stripped():\n"
+    "    return 5\n"
+)
+
+_TOY_TESTS = (
+    "import os\n"
+    "import subprocess\n"
+    "import sys\n"
+    "\n"
+    "import pytest\n"
+    "\n"
+    "import wl_xcon.toy as toy\n"
+    "\n"
+    "\n"
+    "@pytest.mark.parametrize('n', [1, 2])\n"
+    "def test_reached(n):\n"
+    "    assert toy.reached() == 1\n"
+)
+
+#: The in-process toy, and two tests that each start a child Python: one inheriting the
+#: environment, one replacing it. The child imports `wl_xcon.toy`, so under it
+#: `at_import` really does run inside a test: these are kept out of the in-process toy.
+_TOY_CHILD_TESTS = _TOY_TESTS + (
+    "\n"
+    "\n"
+    "def test_child():\n"
+    "    subprocess.run(\n"
+    "        [sys.executable, '-c', 'import wl_xcon.toy as t; t.in_child()'], check=True\n"
+    "    )\n"
+    "\n"
+    "\n"
+    "def test_child_stripped():\n"
+    "    subprocess.run(\n"
+    "        [sys.executable, '-c', 'import wl_xcon.toy as t; t.in_child_stripped()'],\n"
+    "        check=True,\n"
+    "        env={'PATH': os.environ['PATH']},\n"
+    "    )\n"
+)
+
+_TOY_IDS = ("tests/test_toy.py::test_reached[1]", "tests/test_toy.py::test_reached[2]")
+
+
+def _toy_tree(tmp_path, tests_source=_TOY_TESTS) -> Path:
+    """A tree shaped like this repository: `wl_xcon/toy.py` and `tests/test_toy.py`."""
+    tree = tmp_path / "tree"
+    (tree / "wl_xcon").mkdir(parents=True)
+    (tree / "tests").mkdir()
+    (tree / "wl_xcon" / "__init__.py").write_text("")
+    (tree / "wl_xcon" / "toy.py").write_text(_TOY_MODULE)
+    (tree / "tests" / "test_toy.py").write_text(tests_source)
+    return tree
+
+
+@pytest.fixture
+def map_env(monkeypatch):
+    """What every map test needs: coverage importable (skipped without it only off CI;
+    in CI it must run), plugin autoload off so the toy's pytest starts fast, and the
+    pycache sweep kept off the real tree while this suite runs it."""
+    if importlib.util.find_spec("coverage") is None and not os.environ.get("CI"):
+        pytest.skip('coverage is not installed: pip install "coverage>=7.10"')
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.setattr(mutate_tool, "_clear_pycache", lambda: None)
+
+
+def _plugin():
+    spec = importlib.util.spec_from_file_location(
+        "wlx_suite_progress_for_test",
+        mutate_tool.PROGRESS_PLUGIN_DIR / f"{mutate_tool.PROGRESS_PLUGIN}.py",
+    )
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    return plugin
+
+
+def test_the_plugins_variable_names_are_the_ones_mutate_sets():
+    """`mutate.py` loads by path and cannot import the plugin, so each spells them."""
+    plugin = _plugin()
+    assert (plugin.ENV, plugin.CONTEXT_ENV, plugin.SELECT_ENV) == (
+        mutate_tool.PROGRESS_ENV,
+        mutate_tool.CONTEXT_ENV,
+        mutate_tool.SELECT_ENV,
+    )
+
+
+def test_the_coverage_rcfile_pins_what_the_design_says():
+    import configparser
+
+    rc = configparser.RawConfigParser()
+    assert rc.read(mutate_tool.COVERAGE_RC) == [str(mutate_tool.COVERAGE_RC)]
+    run = rc["run"]
+    assert run["core"] == "ctrace"
+    assert run["source"] == "wl_xcon"
+    assert run["patch"] == "subprocess"
+    assert run["context"] == "${WLX_COV_CONTEXT-}"
+
+
+def test_a_map_records_an_in_process_test_by_its_parametrized_node_id(
+    map_env, tmp_path, capsys
+):
+    """The id with its parameters, never the bare function name: a selection hands
+    pytest ids, and `test_reached` alone would collect nothing. Code that runs at import
+    falls under `""`, which is not a test, and a function nothing calls has none."""
+    tree = _toy_tree(tmp_path)
+    out = tmp_path / "map.json"
+
+    m = mutate_tool.build_map(out, tree)
+
+    assert m.tests_for("wl_xcon/toy.py", "reached") == _TOY_IDS, m
+    assert m.tests_for("wl_xcon/toy.py", "at_import") == (), m
+    assert m.tests_for("wl_xcon/toy.py", "never_called") == (), m
+    assert m.tests == _TOY_IDS, m
+    assert m.started == len(m.tests) == len(_TOY_IDS), m
+    assert m.summary.startswith(f"{len(_TOY_IDS)} passed"), m
+    assert mutate_tool.load_map(out, tree) == m
+    line = capsys.readouterr().out
+    assert line.startswith(f"map: {len(_TOY_IDS)} tests, 1 of 5 functions reached by a test"), line
+
+
+def test_a_map_records_a_test_whose_child_process_reaches_the_function(map_env, tmp_path):
+    """A child Python files its lines under the test that started it, and one that
+    replaced its environment is unmapped (it costs only speed). **This is the guard on
+    the one coverage internal the plugin relies on** (`_measure_children_by_their_own_
+    context`): coverage 7.17.4 hands a child the parent's context already filled in, and
+    the plugin points the child at the rcfile instead (the coordinator's ruling,
+    2026-11-21). An upgrade that changes that fails here, not quietly in the map."""
+    tree = _toy_tree(tmp_path, _TOY_CHILD_TESTS)
+
+    m = mutate_tool.build_map(tmp_path / "map.json", tree)
+
+    assert m.tests_for("wl_xcon/toy.py", "in_child") == ("tests/test_toy.py::test_child",), m
+    assert m.tests_for("wl_xcon/toy.py", "in_child_stripped") == (), m
+
+
+def test_a_map_from_another_tree_is_refused(map_env, tmp_path):
+    """Under Q2 no module has its own baseline, so a map is only as good as the tree
+    it was built from. What a test can import or read changes the hash; a file outside
+    `wl_xcon/` and `tests/`, or bytecode, does not."""
+    tree = _toy_tree(tmp_path)
+    out = tmp_path / "map.json"
+    mutate_tool.build_map(out, tree)
+
+    for edited in ("tests/test_toy.py", "wl_xcon/toy.py"):
+        path = tree / edited
+        original = path.read_text()
+        path.write_text(original + "# edited\n")
+        with pytest.raises(SystemExit, match="rebuild it with --build-map"):
+            mutate_tool.load_map(out, tree)
+        path.write_text(original)
+        mutate_tool.load_map(out, tree)
+
+    (tree / "README.md").write_text("not a test input\n")
+    (tree / "tests" / "__pycache__").mkdir(exist_ok=True)
+    (tree / "tests" / "__pycache__" / "x.pyc").write_bytes(b"\0")
+    mutate_tool.load_map(out, tree)
+
+
+def test_a_missing_or_corrupt_map_is_refused(tmp_path):
+    with pytest.raises(SystemExit, match="cannot read the map"):
+        mutate_tool.load_map(tmp_path / "absent.json", tmp_path)
+    (tmp_path / "corrupt.json").write_text("{not json")
+    with pytest.raises(SystemExit, match="cannot read the map"):
+        mutate_tool.load_map(tmp_path / "corrupt.json", tmp_path)
+
+
+def test_a_suite_red_under_coverage_refuses_the_map(map_env, tmp_path):
+    """Review Focus 5. The map's run is the job's baseline, so a test that passes
+    plainly and fails under the tracer refuses the map by name, and none is written."""
+    tree = _toy_tree(
+        tmp_path, "import sys\n\n\ndef test_untraced():\n    assert sys.gettrace() is None\n"
+    )
+    out = tmp_path / "map.json"
+    plain = mutate_tool._run_suite(tree, timeout=60)
+    assert plain.passed, plain
+
+    with pytest.raises(SystemExit) as raised:
+        mutate_tool.build_map(out, tree)
+
+    message = str(raised.value)
+    assert message.startswith("suite is not green to begin with:"), message
+    assert "tests/test_toy.py::test_untraced" in message, message
+    assert not out.exists()
+
+
+def test_a_map_built_inside_a_measured_suite_starts_clean(map_env, monkeypatch, tmp_path):
+    """Review Focus 1. The nightly's map run executes this file, whose tests build toy
+    maps: a coverage run inside a coverage run. Every variable a measured test sees is
+    set here as the outer run sets it, and the inner map must be the one a clean build
+    makes. The ones coverage starts a child through are `COVERAGE_PROCESS_START` and
+    `COVERAGE_PROCESS_CONFIG` (coverage 7.17.4, `control.py:process_startup`, lines
+    1490-1491, and its `a1_coverage.pth`, read 2026-11-21); `COVERAGE_FILE` is where the
+    outer run's data goes (`config.py:713`); `WLX_COV_CONTEXT` is the outer test's id.
+    The toy includes the child tests, so a child of the nested run is checked as well."""
+    from coverage import Coverage
+
+    tree = _toy_tree(tmp_path, _TOY_CHILD_TESTS)
+    clean = mutate_tool.build_map(tmp_path / "clean.json", tree)
+    outer = tmp_path / "outer.coverage"
+    monkeypatch.setenv(mutate_tool.CONTEXT_ENV, "outer.py::test_outer")
+    monkeypatch.setenv("COVERAGE_FILE", str(outer))
+    monkeypatch.setenv("COVERAGE_PROCESS_START", str(mutate_tool.COVERAGE_RC))
+    # What `patch = subprocess` would leave for a child: the outer run's config,
+    # serialized with its context filled in (`patch.py:118`). Constructed, never started.
+    monkeypatch.setenv(
+        "COVERAGE_PROCESS_CONFIG", Coverage(config_file=str(mutate_tool.COVERAGE_RC)).config.serialize()
+    )
+
+    m = mutate_tool.build_map(tmp_path / "nested.json", tree)
+
+    def timeless(made):
+        return made._replace(seconds=0.0, summary=made.summary.split(" in ")[0])
+
+    assert timeless(m) == timeless(clean), (m, clean)
+    assert m.tests_for("wl_xcon/toy.py", "in_child") == ("tests/test_toy.py::test_child",), m
+    assert "outer.py::test_outer" not in m.tests
+    assert not outer.exists()
+
+
+def _plugin_env(tmp_path):
+    """An environment for a toy pytest with only the plugin: nothing a measured outer
+    run set, so these read the same under the nightly's map run as anywhere else."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("COVERAGE_")
+        and key not in (mutate_tool.PROGRESS_ENV, mutate_tool.CONTEXT_ENV, mutate_tool.SELECT_ENV)
+    }
+    env["PYTHONPATH"] = str(mutate_tool.PROGRESS_PLUGIN_DIR)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+_PLUGIN_ARGV = [
+    sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+    "-p", mutate_tool.PROGRESS_PLUGIN,
+]
+
+
+def test_the_progress_plugin_deselects_to_the_ids_its_file_names_and_records_how_many(
+    tmp_path,
+):
+    """The selected run's ids arrive by file (§4.3): only those start, the rest are
+    deselected, and one line says how many were wanted and how many were found -- an id
+    not collected is counted, never fatal (Review Focus 3)."""
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_toy.py").write_text(
+        "def test_a():\n    pass\n" "def test_b():\n    pass\n" "def test_c():\n    pass\n"
+    )
+    env = _plugin_env(tmp_path)
+    progress = tmp_path / "progress.jsonl"
+    env[mutate_tool.PROGRESS_ENV] = str(progress)
+    chosen = tmp_path / "select.json"
+    chosen.write_text(
+        json.dumps(["test_toy.py::test_c", "test_toy.py::test_a", "test_toy.py::test_gone"])
+    )
+    env[mutate_tool.SELECT_ENV] = str(chosen)
+
+    picked = subprocess.run(
+        _PLUGIN_ARGV, cwd=suite, env=env, capture_output=True, text=True, timeout=60
+    )
+
+    assert picked.returncode == 0, picked.stdout + picked.stderr
+    assert "2 passed, 1 deselected" in picked.stdout, picked.stdout
+    events = [json.loads(line) for line in progress.read_text().splitlines()]
+    assert [e["nodeid"] for e in events if e["event"] == "start"] == [
+        "test_toy.py::test_a",
+        "test_toy.py::test_c",
+    ]
+    assert [e for e in events if e["event"] == "selected"] == [
+        {"event": "selected", "wanted": 3, "found": 2}
+    ]
+    seen = mutate_tool._read_progress(progress.read_text(), now=0.0)
+    assert (seen.wanted, seen.selected) == (3, 2), seen
+
+    progress.unlink()
+    del env[mutate_tool.SELECT_ENV]
+    subprocess.run(_PLUGIN_ARGV, cwd=suite, env=env, capture_output=True, text=True, timeout=60)
+    events = [json.loads(line) for line in progress.read_text().splitlines()]
+    assert [e["nodeid"] for e in events if e["event"] == "start"] == [
+        "test_toy.py::test_a",
+        "test_toy.py::test_b",
+        "test_toy.py::test_c",
+    ]
+    assert not [e for e in events if e["event"] == "selected"]
+
+
+def test_the_plugin_sets_no_context_without_coverage(tmp_path):
+    """Inert unless coverage is running: a suite merely loading the plugin must not see
+    a context variable appear. The progress file shows the plugin did load."""
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_toy.py").write_text(
+        "import os\n"
+        "def test_no_context():\n"
+        "    assert 'WLX_COV_CONTEXT' not in os.environ\n"
+        "    assert 'COVERAGE_PROCESS_START' not in os.environ\n"
+    )
+    env = _plugin_env(tmp_path)
+    progress = tmp_path / "progress.jsonl"
+    env[mutate_tool.PROGRESS_ENV] = str(progress)
+
+    run = subprocess.run(_PLUGIN_ARGV, cwd=suite, env=env, capture_output=True, text=True, timeout=60)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "1 passed" in run.stdout, run.stdout
+    assert '"start"' in progress.read_text()

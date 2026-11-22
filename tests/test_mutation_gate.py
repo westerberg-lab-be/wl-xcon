@@ -100,6 +100,7 @@ def test_documentation_alone_selects_nothing():
         "tests/_builds.py",
         "tools/mutate.py",
         "tools/suite_progress/wlx_suite_progress.py",
+        "tools/suite_progress/coverage.ini",
         "pyproject.toml",
         ".github/workflows/ci.yml",
     ],

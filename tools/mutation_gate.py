@@ -124,6 +124,9 @@ GLOBAL = (
     "tools/mutate.py",
     # Loaded into every suite `mutate.py` runs; it decides what a stopped suite read.
     "tools/suite_progress/wlx_suite_progress.py",
+    # The map's coverage configuration (`mutate.py --build-map`): it decides which tests a
+    # mutant runs first, so a change to it changes every module's selected runs.
+    "tools/suite_progress/coverage.ini",
     "tools/mutation_gate.py",
     "pyproject.toml",
     ".github/workflows/ci.yml",
