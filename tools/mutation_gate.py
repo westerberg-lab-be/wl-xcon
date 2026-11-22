@@ -32,6 +32,20 @@ full sweep is what catches it. Anything structural (`conftest.py` and the shared
 test helpers beside it, `mutate.py` and its progress plugin, `pyproject.toml`, `tasks/`) escalates to a full
 sweep here rather than being reasoned about, because those change what every test
 sees.
+
+**One map and one restored suite a job** (CI-time design §4.2 and §4.5; the PI's Q2,
+"In this build", 2026-11-21). A job of at least `MAP_FROM` functions first runs
+`mutate.py --build-map`: one unbroken run of the whole suite under coverage, which is the
+job's baseline and also records which tests reach each function. Every module's
+`mutate.py --all` then takes `--map`, so each mutant runs its likely tests first and no
+module runs a baseline or a restored suite of its own, and the job ends with one
+`mutate.py --restored`. That is one unbroken run a job, the map, and one restored run,
+where there were two a module. What each module's baseline guarded -- that the tree it
+sweeps is the green one -- the map's hash now guards: `mutate.py --map` refuses a tree
+that no longer hashes as the map's run saw it, so a module left changed by the one
+before it stops the next before any mutant. A failed map build fails the job and sweeps
+nothing. A smaller job runs exactly as it did before the map, each module with its own
+baseline and restored suite (`run`).
 """
 
 from __future__ import annotations
@@ -39,8 +53,10 @@ from __future__ import annotations
 import argparse
 import functools
 import importlib.util
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -131,6 +147,13 @@ GLOBAL = (
     "pyproject.toml",
     ".github/workflows/ci.yml",
 )
+
+#: A job of at least this many functions builds a map (`run`); a smaller one runs as it
+#: did before the map. **An estimate, not a measurement** (CI-time design §4.5): the
+#: map is one suite under coverage, about 25 min, against about 100 s it saves a
+#: mutant, so it pays from roughly 15 functions. The first nightly under the CI-time
+#: build measures both sides, and this is tuned from what it reads.
+MAP_FROM = 15
 
 
 def declared_modules() -> set[str]:
@@ -275,9 +298,10 @@ def shard_plan(
 
     The flat target list is cut into `n` contiguous chunks whose sizes differ by at
     most one (`_chunk`). Contiguous rather than dealt round-robin so a shard spans
-    few modules, and each module it touches costs one baseline and one restored
-    suite. A name is one target however many times it is defined
-    (`module_functions`), so no boundary can fall inside it. Nothing here depends
+    few modules: each module it touches costs one `mutate.py` call, and in a job
+    under `MAP_FROM` (`run`) one baseline and one restored suite too. A name is
+    one target however many times it is defined (`module_functions`), so no
+    boundary can fall inside it. Nothing here depends
     on the order modules were given or on anything but the inputs, so every CI job
     computes the same shards while seeing only its own `k`.
     """
@@ -328,22 +352,81 @@ def changed_files(base: str | None) -> list[str] | None:
     return [line for line in result.stdout.splitlines() if line]
 
 
+def function_count(plan: list[tuple[str, list[str] | None]]) -> int:
+    """How many functions `plan` mutates: an entry's `--only` part, or the whole
+    module's listing (`module_functions`) when its entry is `None`."""
+    return sum(
+        len(only) if only is not None else len(module_functions(module))
+        for module, only in plan
+    )
+
+
+def _way(count: int) -> str:
+    """The line saying whether a job of `count` functions builds a map."""
+    if count >= MAP_FROM:
+        return f"map: built for {count} function(s) (MAP_FROM = {MAP_FROM})"
+    return (
+        f"no map: {count} function(s), under MAP_FROM = {MAP_FROM}; "
+        f"each module runs its own baseline and restored suite"
+    )
+
+
 def run(plan: list[tuple[str, list[str] | None]]) -> int:
     """One `mutate.py --all` per module, in order: the whole module when its entry
-    is `None`, and `--only` its part of the module when a shard cut it."""
+    is `None`, and `--only` its part of the module when a shard cut it.
+
+    From `MAP_FROM` functions, the job's one map comes first (`--build-map`) and
+    every module is passed it (`--map`), then one `--restored` suite closes the job
+    (the module docstring says why). The map sits in a fresh temporary directory,
+    outside the repository so it is no part of the tree it describes, and is removed
+    however the job ends. A map that cannot be built fails the job before any
+    module runs. Under `MAP_FROM` the commands are exactly those before the map.
+    """
+    count = function_count(plan)
+    print(f"\n{_way(count)}", flush=True)
+    if count < MAP_FROM:
+        return _sweep(plan, None)
+    scratch = tempfile.mkdtemp(prefix="wlx-mutation-map-")
+    try:
+        return _sweep(plan, str(Path(scratch) / "map.json"))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _sweep(plan: list[tuple[str, list[str] | None]], mapped: str | None) -> int:
+    """`run`'s commands, with the map at `mapped`, or none when it is `None`."""
+    # -u: each verdict line leaves when it is reached, so CI timestamps it truthfully
+    # and a cancelled job loses no verdict it already reached (XC-331).
+    mutate = [sys.executable, "-u", "tools/mutate.py"]
+    if mapped is not None:
+        command = [*mutate, "--build-map", mapped]
+        print(f"\n=== map ({' '.join(command[3:])}) ===", flush=True)
+        code = subprocess.run(command, cwd=ROOT).returncode
+        if code != 0:
+            print(
+                f"\nMAP BUILD FAILED: mutate.py --build-map exited {code}; the job has "
+                f"no baseline, so no module was swept"
+            )
+            return 1
     failures = []
     for module, only in plan:
-        # -u: each verdict line leaves when it is reached, so CI timestamps it truthfully
-        # and a cancelled job loses no verdict it already reached (XC-331).
-        command = [sys.executable, "-u", "tools/mutate.py", "--all"]
+        command = [*mutate, "--all"]
         if only is not None:
             command += ["--only", ",".join(only)]
         if RETURNS[module] != "[]":
             command += ["--returns", RETURNS[module]]
+        if mapped is not None:
+            command += ["--map", mapped]
         command.append(f"{PACKAGE}/{module}.py")
         print(f"\n=== {module} ({' '.join(command[3:])}) ===", flush=True)
         if subprocess.run(command, cwd=ROOT).returncode != 0:
             failures.append(module)
+    if mapped is not None:
+        # The job's one restored suite: under the map no module ran its own.
+        command = [*mutate, "--restored"]
+        print(f"\n=== restored ({' '.join(command[3:])}) ===", flush=True)
+        if subprocess.run(command, cwd=ROOT).returncode != 0:
+            failures.append("restored suite")
     if failures:
         print(f"\nMUTATION GATE FAILED: {', '.join(failures)}")
         return 1
@@ -444,6 +527,8 @@ def main() -> int:
         print("  nothing this change could have affected; the nightly sweep covers the rest")
         return 0
     if args.dry_run:
+        # `run`'s own line, so a dry run says whether the job would build a map.
+        print(f"  {_way(function_count(plan))}")
         return 0
     return run(plan)
 

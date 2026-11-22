@@ -483,37 +483,169 @@ def test_dry_run_prints_each_module_of_the_shard_and_the_functions_it_would_run(
     assert f"shard {k}/12" in out
     for module, names in plan:
         assert f"    {module} ({len(names)}): {', '.join(names)}" in out
+    count = sum(len(names) for _, names in plan)
+    assert count >= _MAP_FROM, "a push's shard of the real package is under MAP_FROM"
+    assert f"map: built for {count} function(s) (MAP_FROM = {_MAP_FROM})" in out
 
 
-def test_a_shard_runs_each_of_its_modules_with_only_its_functions(monkeypatch, capsys):
-    """The commands themselves: one `mutate.py --all --only` per module in the
-    chunk, in order, with that module's `--returns` exactly as `RETURNS` has it."""
-    k, plan = _spanning_shard(12)
-    commands = []
+# ---------------------------------------------------------------------------
+# One map and one restored suite a job (CI-time design §4.2 and §4.5; the PI's Q2,
+# "In this build", 2026-11-21): a job of at least MAP_FROM functions builds one map,
+# passes it to every module, and runs one restored suite; a smaller one runs exactly
+# as it did before the map.
+# ---------------------------------------------------------------------------
 
+#: Written out rather than read from the gate, so a test that compares against it
+#: does not agree with the gate by construction; the 14 / 15 test pins the two equal.
+_MAP_FROM = 15
+
+_MUTATE = [sys.executable, "-u", "tools/mutate.py"]
+
+
+def _module_command(module: str, names: list[str] | None, mapped: str | None = None):
+    """Today's `mutate.py --all` for `module`, with `--map M` just before the path."""
+    return [
+        *_MUTATE,
+        "--all",
+        *([] if names is None else ["--only", ",".join(names)]),
+        *([] if gate.RETURNS[module] == "[]" else ["--returns", gate.RETURNS[module]]),
+        *([] if mapped is None else ["--map", mapped]),
+        f"{gate.PACKAGE}/{module}.py",
+    ]
+
+
+def _recorder(commands: list[list[str]], fails=lambda command: False):
     def record(command, cwd):
+        assert cwd == gate.ROOT
         commands.append(command)
-        return subprocess.CompletedProcess(command, 0)
+        return subprocess.CompletedProcess(command, 1 if fails(command) else 0)
 
-    monkeypatch.setattr(gate.subprocess, "run", record)
+    return record
+
+
+def test_a_shard_of_at_least_map_from_functions_builds_one_map_and_passes_it_to_every_module(
+    monkeypatch, capsys
+):
+    """The commands themselves: one map built, then one `mutate.py --all --only` per
+    module in the chunk, in order, with that module's `--returns` exactly as
+    `RETURNS` has it and `--map` naming the one map, then one restored suite. The
+    map lives in a fresh temporary directory outside the repository, which is gone
+    once the gate returns."""
+    k, plan = _spanning_shard(12)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(gate.subprocess, "run", _recorder(commands))
     monkeypatch.setattr(sys, "argv", ["mutation_gate.py", "--all", "--shard", f"{k}/12"])
 
     assert gate.main() == 0
 
+    assert commands[0][:4] == [*_MUTATE, "--build-map"] and len(commands[0]) == 5
+    mapped = commands[0][4]
     assert commands == [
-        [
-            sys.executable,
-            "-u",
-            "tools/mutate.py",
-            "--all",
-            "--only",
-            ",".join(names),
-            *([] if gate.RETURNS[module] == "[]" else ["--returns", gate.RETURNS[module]]),
-            f"{gate.PACKAGE}/{module}.py",
-        ]
-        for module, names in plan
+        [*_MUTATE, "--build-map", mapped],
+        *(_module_command(module, names, mapped) for module, names in plan),
+        [*_MUTATE, "--restored"],
     ]
-    assert "mutation gate passed" in capsys.readouterr().out
+    where = Path(mapped)
+    assert where.is_absolute()
+    assert not where.resolve().is_relative_to(gate.ROOT.resolve()), where
+    assert not where.exists() and not where.parent.exists(), "the map's directory was left"
+    out = capsys.readouterr().out
+    count = sum(len(names) for _, names in plan)
+    assert f"map: built for {count} function(s) (MAP_FROM = {_MAP_FROM})" in out
+    assert "mutation gate passed" in out
+
+
+def _toy_package(tmp_path, monkeypatch, sizes: dict[str, int]) -> None:
+    """`wl_xcon/<module>.py` with `sizes[module]` functions each, under a `ROOT` of
+    `tmp_path`, as in `test_a_selected_module_with_no_functions_fails_every_shard`."""
+    (tmp_path / gate.PACKAGE).mkdir()
+    for module, size in sizes.items():
+        (tmp_path / gate.PACKAGE / f"{module}.py").write_text(
+            "".join(f"def {module}_{i}():\n    return {i}\n" for i in range(size))
+        )
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    monkeypatch.setattr(gate, "RETURNS", {module: "None" for module in sizes})
+    monkeypatch.setattr(gate, "EXEMPT", {})
+
+
+@pytest.mark.parametrize("total", [14, 15])
+def test_a_shard_under_map_from_runs_exactly_as_before(
+    tmp_path, monkeypatch, capsys, total
+):
+    """Fourteen functions over two whole modules (`--all`, unsharded, so each entry
+    is `None` and its functions are counted from the module): the commands are
+    exactly the gate's before the map, with no map and no `--restored`, since each
+    module still runs its own baseline and restored suite. Fifteen builds the map:
+    the count is the job's, across its modules, and the bound is inclusive."""
+    assert getattr(gate, "MAP_FROM", None) == _MAP_FROM
+    _toy_package(tmp_path, monkeypatch, {"first": 7, "second": total - 7})
+    commands: list[list[str]] = []
+    monkeypatch.setattr(gate.subprocess, "run", _recorder(commands))
+    monkeypatch.setattr(sys, "argv", ["mutation_gate.py", "--all"])
+
+    assert gate.main() == 0
+
+    out = capsys.readouterr().out
+    if total < _MAP_FROM:
+        assert commands == [
+            _module_command("first", None),
+            _module_command("second", None),
+        ]
+        assert (
+            f"no map: {total} function(s), under MAP_FROM = {_MAP_FROM}; "
+            f"each module runs its own baseline and restored suite"
+        ) in out
+    else:
+        assert commands[0][:4] == [*_MUTATE, "--build-map"]
+        mapped = commands[0][4]
+        assert commands == [
+            [*_MUTATE, "--build-map", mapped],
+            _module_command("first", None, mapped),
+            _module_command("second", None, mapped),
+            [*_MUTATE, "--restored"],
+        ]
+        assert f"map: built for {total} function(s) (MAP_FROM = {_MAP_FROM})" in out
+
+
+def test_a_failed_map_build_fails_the_job_and_runs_no_mutant(monkeypatch, capsys):
+    """Loudly (§4.5): a job whose map could not be built has no baseline, so no
+    module is swept, and the gate fails rather than falling back to a sweep the
+    map's absence would make slower and the log would not explain."""
+    k, _ = _spanning_shard(12)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        gate.subprocess,
+        "run",
+        _recorder(commands, fails=lambda command: "--build-map" in command),
+    )
+    monkeypatch.setattr(sys, "argv", ["mutation_gate.py", "--all", "--shard", f"{k}/12"])
+
+    assert gate.main() == 1
+
+    assert len(commands) == 1 and "--build-map" in commands[0], commands
+    out = capsys.readouterr().out
+    assert "MAP BUILD FAILED" in out
+    assert "mutation gate passed" not in out
+
+
+def test_a_red_restored_suite_fails_the_job(monkeypatch, capsys):
+    """Under the map no module runs its own restored suite, so the job's one is the
+    only check that the mutants left the tree as they found it."""
+    k, _ = _spanning_shard(12)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        gate.subprocess,
+        "run",
+        _recorder(commands, fails=lambda command: command == [*_MUTATE, "--restored"]),
+    )
+    monkeypatch.setattr(sys, "argv", ["mutation_gate.py", "--all", "--shard", f"{k}/12"])
+
+    assert gate.main() == 1
+
+    assert commands[-1] == [*_MUTATE, "--restored"]
+    out = capsys.readouterr().out
+    assert "MUTATION GATE FAILED: restored suite" in out
+    assert "mutation gate passed" not in out
 
 
 def test_a_failing_part_fails_the_shard_and_names_its_module(monkeypatch, capsys):
@@ -538,19 +670,26 @@ def test_the_shard_counts_ci_runs_through_mutate_run_every_function_exactly_once
     monkeypatch, n
 ):
     """Test the path, not the piece. Each shard's real commands are handed to
-    `tools/mutate.py`'s own `main()` -- its `--only` parsing and refusal included --
-    with only the suite runs and the neutering stubbed. Across the `n`, every
-    function the package has is mutated once, in order, and every call brackets
-    its part with one baseline and one restored suite. Twelve is a push's count and
-    thirty-six the nightly's since 2026-11-09 (twenty-four from 2026-10-22); `test_each_mutation_job_runs_...`
-    holds the workflow to both."""
+    `tools/mutate.py`'s own `main()` -- its `--only` parsing and refusal, `--map`'s
+    `load_map` and its tree hash, and `--restored`, included -- with only the suite
+    runs, the map's coverage run and the neutering stubbed. Across the `n`, every
+    function the package has is mutated once, in order. A shard of at least
+    `MAP_FROM` functions builds one map, every mutant under it is handed that map's
+    selection, and the shard runs one restored suite; a call without a map brackets
+    its part with one baseline and one restored suite, as before. Twelve is a push's
+    count and thirty-six the nightly's since 2026-11-09 (twenty-four from
+    2026-10-22); `test_each_mutation_job_runs_...` holds the workflow to both."""
     spec = importlib.util.spec_from_file_location(
         "wlx_mutate_for_gate_test", gate.ROOT / "tools" / "mutate.py"
     )
     mutate_tool = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mutate_tool)
     mutated: list[tuple[str, str]] = []
+    handed: list[tuple[bool, object]] = []
     suites = []
+    maps: list[Path] = []
+    calls: list[list[str]] = []
+    unset = object()
     monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
     monkeypatch.setattr(
         mutate_tool,
@@ -558,16 +697,34 @@ def test_the_shard_counts_ci_runs_through_mutate_run_every_function_exactly_once
         lambda **_: suites.append(1)
         or mutate_tool.SuiteRun(True, "1 passed in 0.01s", [], started=1),
     )
-    monkeypatch.setattr(
-        mutate_tool,
-        "mutate",
-        lambda path, name, returns, **_: mutated.append((path.stem, name))
-        or (True, "1 failed in 0.01s"),
-    )
-    calls = []
+
+    def build_map(out, cwd=gate.ROOT):
+        # The map's coverage run is the one thing stubbed: a map of this tree that
+        # reaches no function, saved where the gate asked, for the real `load_map`.
+        maps.append(out)
+        made = mutate_tool.SuiteMap(
+            tree=mutate_tool.tree_hash(gate.ROOT),
+            summary="1 passed in 0.01s",
+            seconds=0.01,
+            started=1,
+            tests=(),
+            functions={},
+            unmatched=0,
+        )
+        made.save(out)
+        return made
+
+    monkeypatch.setattr(mutate_tool, "build_map", build_map)
+
+    def fake_mutate(path, name, returns, **kwargs):
+        mutated.append((path.stem, name))
+        handed.append(("--map" in calls[-1], kwargs.get("selection", unset)))
+        return True, "1 failed in 0.01s"
+
+    monkeypatch.setattr(mutate_tool, "mutate", fake_mutate)
 
     def through_mutate(command, cwd):
-        assert command[:3] == [sys.executable, "-u", "tools/mutate.py"]
+        assert command[:3] == _MUTATE
         calls.append(command)
         monkeypatch.setattr(sys, "argv", ["mutate.py", *command[3:]])
         return subprocess.CompletedProcess(command, mutate_tool.main())
@@ -578,7 +735,22 @@ def test_the_shard_counts_ci_runs_through_mutate_run_every_function_exactly_once
         assert gate.main() == 0, k
 
     assert mutated == _targets()
-    assert len(suites) == 2 * len(calls)
+    under_map = [selection for mapped, selection in handed if mapped]
+    assert under_map, "no mutant ran under a map"
+    assert all(selection == () for selection in under_map), set(map(repr, under_map))
+    assert all(selection is unset for mapped, selection in handed if not mapped)
+    sizes = [
+        sum(len(names) for _, names in gate.shard_plan(_MODULES, k, n, _functions()))
+        for k in range(1, n + 1)
+    ]
+    assert len(maps) == sum(size >= _MAP_FROM for size in sizes)
+    restored_calls = sum(command == [*_MUTATE, "--restored"] for command in calls)
+    assert restored_calls == len(maps)
+    unmapped_module_calls = sum(
+        "--build-map" not in command and "--restored" not in command and "--map" not in command
+        for command in calls
+    )
+    assert len(suites) == restored_calls + 2 * unmapped_module_calls
 
 
 # ---------------------------------------------------------------------------
