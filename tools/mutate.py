@@ -46,6 +46,20 @@ full suite, which costs time and never a verdict.
 **What it costs is an estimate, not a measurement**: one suite under coverage, guessed at
 1.5-3x a plain run (the coverage docs give no figure). The map's line prints its own
 time, and the first nightly under the CI-time build is the measurement.
+
+**A mutant's likely tests first** (`--map PATH`; §4.3). With a map, each mutant first runs
+only the tests the map says reach it, and a failure there is a catch only once those tests
+pass on the unbroken code (the PI's Q1, "Confirm each catch"). Every other outcome runs the
+full suite exactly as without a map, so the map decides how fast a verdict comes, never
+what it is (`mutate` gives the argument). The map's run is the call's baseline (Q2, "In this
+build"): no baseline and no restored suite run here, and the map is refused unless the tree
+still hashes as it did when the map was built. The caller runs the one restored suite:
+
+    python3 tools/mutate.py --all --map .mutation-map.json wl_xcon/check.py
+    python3 tools/mutate.py --restored
+
+How much this saves is an estimate; the closing tally prints each kind's count and
+seconds, and the first nightly under the CI-time build is the measurement.
 """
 
 from __future__ import annotations
@@ -675,6 +689,101 @@ def _already_inert(source: str, function: str, returns: str) -> bool:
     return found
 
 
+#: Where a verdict under `--map` came from (CI-time design §4.4): the kind each mutant is
+#: tallied under, and, but for `FULL_AFTER`, whose tag names what the selection did, the
+#: tag on its line.
+SELECTED = "selected"
+FULL_AFTER = "full, after selected"
+FULL_NO_TEST = "full: no test in the map"
+FULL_NOT_INDEPENDENT = "full: selected failed unmutated too"
+_KINDS = (SELECTED, FULL_AFTER, FULL_NO_TEST, FULL_NOT_INDEPENDENT)
+
+
+class Tally:
+    """Each kind's count and the seconds its mutants' suites took, for the closing lines
+    under `--map`: the first nightly reads the fall-through rate from them (§4.4).
+
+    `not_independent` lists each mutant whose selected failure came back on the unbroken
+    code, `"name (id, id)"`; `missing` counts selected ids a run did not collect (Review
+    Focus 3: counted, never fatal).
+    """
+
+    def __init__(self) -> None:
+        self.count = dict.fromkeys(_KINDS, 0)
+        self.seconds = dict.fromkeys(_KINDS, 0.0)
+        self.not_independent: list[str] = []
+        self.missing = 0
+
+    def add(self, kind: str, seconds: float) -> None:
+        if kind not in self.count:
+            raise ValueError(f"no tally kind {kind!r}")
+        self.count[kind] += 1
+        self.seconds[kind] += seconds
+
+    def lines(self) -> list[str]:
+        return [
+            *(f"{kind}: {self.count[kind]} in {self.seconds[kind]:.0f}s" for kind in _KINDS),
+            f"selected ids not collected: {self.missing}",
+        ]
+
+
+def _selected_files(ids: Sequence[str]) -> list[str]:
+    """Each id's file, the part before its first `::`, once each, in the order the ids
+    first name it. The ids arrive in the map's run order, so the files keep the
+    baseline's relative order (Call 4)."""
+    return list(dict.fromkeys(test_id.split("::", 1)[0] for test_id in ids))
+
+
+def _hold(path: Path, original: str, mutated: str) -> None:
+    """Put the mutation on disk, and then the sentinel that can undo it."""
+    path.write_text(mutated)
+    # Written *after* the mutation, holding both texts: the restore checks the
+    # file still looks like what it wrote before putting the original back.
+    SENTINEL.write_text(json.dumps({"path": str(path), "original": original, "mutated": mutated}))
+
+
+def _release(path: Path, original: str) -> None:
+    path.write_text(original)
+    SENTINEL.unlink(missing_ok=True)
+    _clear_pycache()
+
+
+def _judge(run: SuiteRun, of: int | None) -> tuple[bool | str, str]:
+    """A full mutant run's verdict and text, exactly as `mutate` has read one since
+    XC-275: a stop before any failure is `TIMED_OUT`, a stop after one is a catch."""
+    if run.timed_out:
+        if not run.failures:
+            return TIMED_OUT, f"{run.summary}, no test failed before it; {_how_far(run, of)}"
+        return True, (
+            f"{run.summary}, {len(run.failures)} failed before it; {_how_far(run, of)}"
+            + _caught_by(run.failures)
+        )
+    return not run.passed, run.summary + _caught_by(run.failures)
+
+
+def _failed_ids(run: SuiteRun) -> list[str]:
+    """The tests of `run.ran` behind its failure lines, in run order. Matched against
+    the ids the progress file saw, never split out of the line, so an id holding
+    `" - "` is still found; a collection error names a file, which ran no test."""
+    found = []
+    for test_id in run.ran:
+        for line in run.failures:
+            named = line.split(" ", 1)[1] if " " in line else ""
+            if named == test_id or named.startswith(f"{test_id} - "):
+                found.append(test_id)
+                break
+    return found
+
+
+def _up_to_last_failure(run: SuiteRun, selection: Sequence[str]) -> list[str]:
+    """What the confirmation runs (Q1): the selected run's tests up to and including
+    the last one that failed, in the order they ran. When no failure names a test that
+    ran (collection errors only), the whole selection."""
+    failed = set(_failed_ids(run))
+    last = max((n for n, test_id in enumerate(run.ran) if test_id in failed), default=None)
+    return list(run.ran[: last + 1]) if last is not None else list(selection)
+
+
 def mutate(
     path: Path,
     function: str,
@@ -682,6 +791,8 @@ def mutate(
     *,
     limit: float = SUITE_TIMEOUT_SECONDS,
     of: int | None = None,
+    selection: Sequence[str] | None = None,
+    tally: Tally | None = None,
 ) -> tuple[bool | str | None, str]:
     """`(verdict, the line's text)` for neutering `function`.
 
@@ -706,6 +817,43 @@ def mutate(
     the function is load-bearing, but no longer proof that any single test isolates
     it. Prefer the value the caller actually composes; the default suits list
     returns because that is what this codebase's checkers do.
+
+    **With a `selection`** (`--map`; CI-time design §4.3), the map's tests for this
+    function run first, and the text starts with a tag saying where the verdict came
+    from (§4.4). The argument that this changes no verdict (§6): a `caught` from the
+    selection needs a named test that fails with the mutant and passes without it, in
+    the same selected order. Every other outcome -- the selected tests passed, were
+    stopped at the limit before any failure, named no failure at all, or failed again
+    unmutated -- runs the full suite, through exactly the code a run without a map takes,
+    to exactly its verdicts. So the map's accuracy can only change how long a verdict
+    takes. The steps:
+
+    - **No test in the map** (`selection` empty): the full suite at once, `[full: no
+      test in the map]`. Code that runs only at import, or only in a child that lost
+      its environment, lands here.
+    - **The selected run**: the mutant on disk with its sentinel, the same `limit` and
+      `--maxfail`, the selected files as pytest's positional arguments and the ids in
+      the file `WLX_SUITE_SELECT` names, never on argv (one id reached 65 KB, XC-331).
+      **It is a catch only if a failure or error is named.** An exit code alone is not:
+      a usage error (4) or "no tests ran" (5) is the harness, not a test. Ids not
+      collected are counted in the tally, never fatal (Review Focus 3).
+    - **The confirmation** (the PI's Q1, "Confirm each catch"): the file restored and
+      the sentinel gone, the same files and the selected tests up to and including the
+      last that failed, with **no `--maxfail` and the same `limit`** (Call 6). Green, the
+      verdict is `[selected N of M]` (`N` the run's `selected`, `M` is `of`). Red, the
+      failure did not need the mutant -- a test that passes in file order and fails on
+      its own -- so the mutant goes to the full suite, `[full: selected failed unmutated
+      too]`, and the test is listed under `SELECTION NOT INDEPENDENT`. A confirmation
+      that times out is not a confirmation, and is listed "(timed out)".
+    - **The full suite**, after a selection that did not catch: `[full, after N selected
+      passed in Ss]`, or, so a tag never says "passed" for a run that did not
+      (Call 5), `timed out in Ss` or `ended with no test named (exit C) in Ss`. **A
+      selected run never ends `TIMED OUT` on its own**: the full suite may still catch
+      the mutant on its way to the hang.
+
+    The sentinel is on disk exactly while the file is mutated: through the selected run
+    and the full run, and not through the confirmation. `tally` takes each mutant's kind
+    and the seconds all its suites took; without one the counts are dropped.
     """
     original = path.read_text()
     if _already_inert(original, function, args_returns):
@@ -719,26 +867,83 @@ def mutate(
         # the fourth blind spot of exactly that shape.
         return None, why
 
-    try:
-        path.write_text(mutated)
-        # Written *after* the mutation, holding both texts: the restore checks the
-        # file still looks like what it wrote before putting the original back.
-        SENTINEL.write_text(
-            json.dumps({"path": str(path), "original": original, "mutated": mutated})
+    if selection is not None:
+        return _mutate_selected(
+            path, function, original, mutated, tuple(selection),
+            limit=limit, of=of, tally=Tally() if tally is None else tally,
         )
-        run = _run_suite(timeout=limit, maxfail=MUTANT_MAXFAIL)
-        if run.timed_out:
-            if not run.failures:
-                return TIMED_OUT, f"{run.summary}, no test failed before it; {_how_far(run, of)}"
-            return True, (
-                f"{run.summary}, {len(run.failures)} failed before it; {_how_far(run, of)}"
-                + _caught_by(run.failures)
-            )
-        return not run.passed, run.summary + _caught_by(run.failures)
+    try:
+        _hold(path, original, mutated)
+        return _judge(_run_suite(timeout=limit, maxfail=MUTANT_MAXFAIL), of)
     finally:
-        path.write_text(original)
-        SENTINEL.unlink(missing_ok=True)
-        _clear_pycache()
+        _release(path, original)
+
+
+def _mutate_selected(
+    path: Path,
+    function: str,
+    original: str,
+    mutated: str,
+    selection: tuple[str, ...],
+    *,
+    limit: float,
+    of: int | None,
+    tally: Tally,
+) -> tuple[bool | str, str]:
+    """`mutate` with a selection: §4.3's steps 2-5, as `mutate`'s docstring gives them."""
+    spent = 0.0
+
+    def full(tag: str, kind: str) -> tuple[bool | str, str]:
+        # The mutant is on disk with its sentinel here, as `mutate` without a map has it.
+        nonlocal spent
+        run = _run_suite(timeout=limit, maxfail=MUTANT_MAXFAIL)
+        spent += run.seconds
+        verdict, text = _judge(run, of)
+        tally.add(kind, spent)
+        return verdict, f"[{tag}] {text}"
+
+    try:
+        _hold(path, original, mutated)
+        if not selection:
+            return full(FULL_NO_TEST, FULL_NO_TEST)
+        files = _selected_files(selection)
+        picked = _run_suite(
+            timeout=limit, maxfail=MUTANT_MAXFAIL, paths=files, select=list(selection)
+        )
+        spent += picked.seconds
+        if picked.wanted is not None:
+            tally.missing += picked.wanted - (picked.selected or 0)
+        chosen = picked.selected or 0
+        if not picked.failures:
+            if picked.passed:
+                how = "passed"
+            elif picked.timed_out:
+                how = "timed out"
+            else:
+                how = f"ended with no test named (exit {picked.returncode})"
+            return full(f"full, after {chosen} selected {how} in {picked.seconds:.0f}s", FULL_AFTER)
+
+        _release(path, original)
+        confirm = _run_suite(
+            timeout=limit, paths=files, select=_up_to_last_failure(picked, selection)
+        )
+        spent += confirm.seconds
+        if confirm.passed:
+            tally.add(SELECTED, spent)
+            return True, f"[selected {chosen} of {of}] {_judge(picked, chosen)[1]}"
+
+        # Named as a verdict line names them (`_caught_by`), so a collection error
+        # in the confirmation is listed by its file.
+        again = [_short(line.split(" ", 1)[1].split(" - ", 1)[0]) for line in confirm.failures]
+        if confirm.timed_out:
+            again.append("timed out")
+        if not again:
+            again.append(f"exit {confirm.returncode}")
+        tally.not_independent.append(f"{function} ({', '.join(again)})")
+        _hold(path, original, mutated)
+        return full(FULL_NOT_INDEPENDENT, FULL_NOT_INDEPENDENT)
+    finally:
+        _release(path, original)
 
 
 def _how_far(run: SuiteRun, of: int | None) -> str:
@@ -988,6 +1193,27 @@ def load_map(path: Path, cwd: Path = ROOT) -> SuiteMap:
     return made
 
 
+def restored(cwd: Path = ROOT) -> int:
+    """One unmutated suite after the mutants, green or the sweep fails: 0 or 1.
+
+    It prints `restored: <summary>` and every failure, by name: five of the seven red
+    suites on 2026-09-25 were restores, not baselines. `main` runs it after its mutants
+    without `--map`; with `--map` the caller runs it once, as `--restored`, after its
+    last module (Q2: one restored run a job, not one a module).
+    """
+    run = _run_suite(cwd=cwd, timeout=BASELINE_TIMEOUT_SECONDS)
+    print("\n".join([f"\nrestored: {run.summary}", *run.failures]))
+    return 0 if run.passed else 1
+
+
+def _relative(path: Path) -> str:
+    """`path` as the map names a module: relative to `ROOT`, in POSIX form."""
+    try:
+        return Path(os.path.realpath(path)).relative_to(os.path.realpath(ROOT)).as_posix()
+    except ValueError:
+        raise SystemExit(f"--map maps modules under {ROOT}; {path} is not one") from None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", type=Path, nargs="?")
@@ -997,6 +1223,20 @@ def main() -> int:
         metavar="PATH",
         type=Path,
         help="run the suite once under coverage and write which tests reach each function",
+    )
+    parser.add_argument(
+        "--map",
+        metavar="PATH",
+        type=Path,
+        help=(
+            "with --all or a function: run each mutant's mapped tests first, confirming "
+            "each catch unmutated; the baseline is the map's run, and no restored suite runs"
+        ),
+    )
+    parser.add_argument(
+        "--restored",
+        action="store_true",
+        help="run one unmutated suite, as a sweep's restored suite, and nothing else",
     )
     parser.add_argument("--all", action="store_true")
     parser.add_argument(
@@ -1014,8 +1254,20 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.restored:
+        if (
+            args.path is not None
+            or args.all
+            or args.only is not None
+            or args.map is not None
+            or args.build_map is not None
+        ):
+            raise SystemExit("--restored runs the unmutated suite alone; give it nothing else")
+        _restore_any_interrupted_run()
+        return restored(ROOT)
+
     if args.build_map is not None:
-        if args.path is not None or args.all or args.only is not None:
+        if args.path is not None or args.all or args.only is not None or args.map is not None:
             raise SystemExit("--build-map maps the whole suite; give it no module or --all")
         _restore_any_interrupted_run()
         build_map(ROOT / args.build_map)
@@ -1039,16 +1291,29 @@ def main() -> int:
         targets = [args.function]
 
     _restore_any_interrupted_run()
-    baseline = _run_suite(timeout=BASELINE_TIMEOUT_SECONDS)
-    if not baseline.passed:
-        raise _red_baseline(baseline)
-    if not baseline.started:
-        raise _blind_baseline(baseline)
-    limit = _mutant_limit(baseline.seconds)
+    suite_map: SuiteMap | None = None
+    tally = Tally()
+    if args.map is not None:
+        # Q2's guard (Call 3): no baseline runs here, so the map's run stands in for one,
+        # and only for the tree it saw -- checked after the heal, before any mutant.
+        module = _relative(path)
+        suite_map = load_map(ROOT / args.map, ROOT)
+        summary, seconds, started = suite_map.summary, suite_map.seconds, suite_map.started
+        source = f"{summary} (the map's run, under coverage, {seconds:.0f}s)"
+    else:
+        baseline = _run_suite(timeout=BASELINE_TIMEOUT_SECONDS)
+        if not baseline.passed:
+            raise _red_baseline(baseline)
+        if not baseline.started:
+            raise _blind_baseline(baseline)
+        source, seconds, started = baseline.summary, baseline.seconds, baseline.started
+    # Under `--map`, the map run's own time (Call 2): never shorter than a plain
+    # baseline's limit, so it can only turn a would-be TIMED OUT into a verdict.
+    limit = _mutant_limit(seconds)
     # The stop is printed with the limit, so a log that reads `3 failed` says why.
     print(
-        f"baseline: {baseline.summary}; mutants stopped after {limit:.0f}s "
-        f"({LIMIT_FACTOR} x this run's {baseline.seconds:.0f}s, never under "
+        f"baseline: {source}; mutants stopped after {limit:.0f}s "
+        f"({LIMIT_FACTOR} x this run's {seconds:.0f}s, never under "
         f"{SUITE_TIMEOUT_SECONDS}s) or at {MUTANT_MAXFAIL} failures "
         f"(--maxfail={MUTANT_MAXFAIL})\n"
     )
@@ -1058,7 +1323,13 @@ def main() -> int:
     inert = []
     unsettled = []
     for name in targets:
-        caught, summary = mutate(path, name, args.returns, limit=limit, of=baseline.started)
+        if suite_map is None:
+            caught, summary = mutate(path, name, args.returns, limit=limit, of=started)
+        else:
+            caught, summary = mutate(
+                path, name, args.returns, limit=limit, of=started,
+                selection=suite_map.tests_for(module, name), tally=tally,
+            )
         if caught is None:
             skipped.append(name)
             print(f"  SKIPPED   {name:32} {summary}")
@@ -1086,9 +1357,17 @@ def main() -> int:
                 f"False, None, INERT or TIMED_OUT; refusing to read it as anything"
             )
 
-    restored = _run_suite(timeout=BASELINE_TIMEOUT_SECONDS)
-    ok = restored.passed
-    print("\n".join([f"\nrestored: {restored.summary}", *restored.failures]))
+    if suite_map is None:
+        ok = restored(ROOT) == 0
+    else:
+        ok = True
+        print("\nrestored: left to the caller (--map)")
+        print("\n".join(["\ntally (each kind's mutants, and the seconds their suites took):",
+                         *(f"  {line}" for line in tally.lines())]))
+        if tally.not_independent:
+            # A test named here fails on its own, unmutated, in its selected order: a
+            # selection cannot judge the mutants it reaches, so they ran the full suite.
+            print(f"\nSELECTION NOT INDEPENDENT: {', '.join(tally.not_independent)}")
     if inert:
         # Printed, never fatal, and never silent: these are functions no mutation
         # can reach, and a reader has to be able to tell that from coverage.
