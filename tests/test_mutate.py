@@ -31,6 +31,8 @@ _SPEC = importlib.util.spec_from_file_location(
 mutate_tool = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(mutate_tool)
 _already_inert = mutate_tool._already_inert
+#: Taken before any test replaces it, for `_wrap_suite`, whose `ROOT` is a toy.
+_CLEAR_PYCACHE = mutate_tool._clear_pycache
 
 
 # ---------------------------------------------------------------------------
@@ -1584,11 +1586,51 @@ def _toy_selected(monkeypatch, tmp_path, files: dict[str, str]) -> _Selected:
     return _wrap_suite(monkeypatch, tmp_path, suite, target)
 
 
+#: The one modification time every write of a `_wrap_suite` target carries.
+_PINNED_MTIME = 1_700_000_000
+
+
 def _wrap_suite(monkeypatch, tmp_path, suite: Path, target: Path) -> _Selected:
+    """`ROOT` moved to the toy `suite`, `_run_suite` recorded, and the toy's bytecode
+    cleared by the real `_clear_pycache`, which now sweeps only the toy.
+
+    **The real sweep, because a no-op one let mutants run each other's bytecode.** A
+    `.pyc` is reused while its source's size and modification time, in whole seconds,
+    match (`importlib._bootstrap_external._validate_timestamp_pyc`). Every mutant of a
+    module inserts the same `return ...` line, so all are one size; under `--all`, with
+    no sweep, a mutant written in the same second as the one before it, whose `.pyc` was
+    still on disk, ran that one's code. `test_a_function_reached_only_in_a_child_...`
+    failed so in 5 of about 31 CI shards (run 45355914942, 2026-11-24): `in_child`'s
+    selected run executed `at_import`'s mutant, passed, and the full run caught
+    `at_import` instead. A runner fast enough fit four suite runs in that second. The
+    Mac's full suite, under `-n auto`, never failed it, though the test alone failed
+    there in 9 of 20 runs. `PYTHONDONTWRITEBYTECODE` did not prevent it (13 of 20 with it set): the
+    child that replaces its environment drops the variable and writes the `.pyc` that
+    the next mutant's run then reads. That stale bytecode is the whole reason
+    `mutate.py` exists (its docstring), and the test had turned its cure off.
+
+    **So every toy process writes bytecode, as on CI, and every write of `target`
+    carries `_PINNED_MTIME`**: each run is the fastest runner's worst case, every time.
+    With the sweep the verdicts cannot depend on the clock, and without it they are
+    wrong on every machine, not one run in six."""
     monkeypatch.setattr(mutate_tool, "SENTINEL", tmp_path / "sentinel.json")
-    monkeypatch.setattr(mutate_tool, "_clear_pycache", lambda: None)
+    monkeypatch.setattr(mutate_tool, "_clear_pycache", _CLEAR_PYCACHE)
     monkeypatch.setattr(mutate_tool, "ROOT", suite)
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    hold, release = mutate_tool._hold, mutate_tool._release
+
+    def held(path, original, mutated):
+        hold(path, original, mutated)
+        os.utime(path, (_PINNED_MTIME, _PINNED_MTIME))
+
+    def released(path, original):
+        release(path, original)
+        os.utime(path, (_PINNED_MTIME, _PINNED_MTIME))
+
+    monkeypatch.setattr(mutate_tool, "_hold", held)
+    monkeypatch.setattr(mutate_tool, "_release", released)
+    os.utime(target, (_PINNED_MTIME, _PINNED_MTIME))
     real = mutate_tool._run_suite
     calls: list = []
     runs: list = []
