@@ -50,6 +50,7 @@ from wl_xcon.photometry import (
 )
 from wl_xcon.run import LONGEST_TRIAL_S
 from wl_xcon.task import (
+    kind_words,
     ANSWERS,
     BY_CONDITIONS,
     CHOSEN_BY,
@@ -64,6 +65,7 @@ from wl_xcon.task import (
     After,
     Array,
     Balanced,
+    Blank,
     Block,
     ByCriterion,
     Condition,
@@ -75,6 +77,7 @@ from wl_xcon.task import (
     Entered,
     Exited,
     Factorial,
+    FullTask,
     Hide,
     Hold,
     Listed,
@@ -92,8 +95,12 @@ from wl_xcon.task import (
     Random,
     Remembered,
     SaccadeTo,
+    Scaled,
     SequenceBalanced,
+    SIZED_LOOKS,
+    SPECIAL_UNIT,
     Show,
+    Special,
     Shuffled,
     Staircase,
     Steps,
@@ -111,7 +118,12 @@ from wl_xcon.task import (
     actions_of,
     array_actions,
     is_point,
+    limit_reason,
     rule_at,
+    section_of,
+    shared_color_choices,
+    size_at,
+    sized_places,
 )
 from wl_xcon.variation import (
     bounds_of, directions, expanded, generated, in_force, level_name, own_ranges, values_of,
@@ -125,7 +137,12 @@ def check(
     components: Registry | None = None,
     geometry: Geometry | None = None,
     calibration: Calibration | None = None,
+    unstarted: frozenset[str] = frozenset(),
 ) -> list[Finding]:
+    """One structure's load-time checks. `unstarted` names the settings with an open side and no
+    start (`_at_start`), whose place is left to the run's start: check 8 says nothing of a place
+    one of them leaves unbounded (the console settings design's §4), and the run's pre-flight
+    judges it at the run's values (`preflight.laid_out`)."""
     # Every check but the placement refusal reads a placing setting's choices less `None`, which
     # that refusal says in its own sentence (`_valued`; XC-415).
     valued = _valued(trial)
@@ -139,7 +156,7 @@ def check(
         + _framework_codes(valued, allocation)
         + _undeclared_parameters(valued)
         + _custom_components(valued, components or Registry())
-        + _offscreen_stimuli(valued, geometry)
+        + _offscreen_stimuli(valued, geometry, unstarted)
         + _unallocated_outcomes(valued, allocation)
         + _undeclared_windows(valued)
         + _uncoupled_windows(valued)
@@ -156,6 +173,10 @@ def check(
         + _overlapping_windows(valued)
         + _unreachable_timeouts(valued)
         + _crowded_arrays(valued)
+        + _unsized_windows(valued)
+        + _sizeless_windows(valued)
+        + _windows_inside_objects(valued)
+        + _objects_touch(valued)
         + _answer_windows_reach(valued)
         + _view_faults(valued, geometry)
         + _placement_faults(valued)
@@ -200,19 +221,41 @@ def check_task(
     # draws (the C3 plan's call 39).
     drawn = {(f"setting {name!r}",) for name in _drawn_directions(task)}
     findings: list[Finding] = []
-    for name, structure in task.structures.items():
-        for finding in check(structure, allocation, components, geometry, calibration):
+    # **An open side is judged at the setting's start** (the console settings design's §4: every
+    # limit that stays is hard, so a task leaves a side open where nothing cannot be), one with no
+    # start left to the run's (`_at_start`); the task's own checks read its declarations as written.
+    pinned, unstarted = _at_start(task)
+    # **A light's saturation setting is judged at its start too** (the whole-build review of the
+    # pop-out revision; the controller's ruling): the default gray point raises nothing at load,
+    # and a saturation set live is judged where it is set (`laid_out`). **And a luminance setting
+    # whose start the panel cannot show** is judged at its reachable top, warned of, and refused
+    # only as a value (`_reachable_starts`; XC-494's rule).
+    pinned = at_values(pinned, _saturation_starts(task))
+    pinned, unreached = _reachable_starts(task, pinned, calibration)
+    each: list[tuple[str, Finding]] = []
+    for name, structure in pinned.structures.items():
+        found = check(structure, allocation, components, geometry, calibration, unstarted)
+        # **But a set size reads its declared highest**, which it must declare (the PI,
+        # 2026-10-14, "Refuse at load"; the console settings design's §4: "a set size past the
+        # array's places" is a limit that stands): held at its start, one with none would pass
+        # and a console could send a set size the run stalls building (the builder's call).
+        found += [finding for finding in _unbounded_set_sizes(_valued(task.structures[name]))
+                  if not _among(finding, found)]
+        for finding in found:
             if finding.code == "direction-outside-0-360" and finding.subjects in drawn:
                 continue
-            findings.append(
-                dataclasses.replace(
-                    finding, detail=f"in structure {name!r}: {finding.detail}",
-                    subjects=tuple(f"{name}: {subject}" for subject in finding.subjects))
-                if several else finding
-            )
+            each.append((name, finding))
+    findings = in_structures(each) if several else [finding for _, finding in each]
     return (
         findings
+        + unreached
         + _structure_faults(task)
+        + _unexplained_limits(task)
+        + _whole_faults(task)
+        + _group_faults(task)
+        + _label_faults(task)
+        + _ambiguous_color_choices(task)
+        + _hidden_at_go(task)
         + _meaning_faults(task)
         + _reaction_time_faults(task)
         + _choice_faults(task)
@@ -225,6 +268,8 @@ def check_task(
         + _staircase_faults(task)
         + _unmade_steps(task)
         + _pool_faults(task)
+        + _full_task_faults(task)
+        + _special_faults(task)
         + _impossible_faults(task)
         + _found_by_faults(task)
         + _condition_spellings(task)
@@ -266,6 +311,106 @@ def _among(finding: Finding, findings: list[Finding]) -> bool:
     return any(f == finding and f.subjects == finding.subjects for f in findings)
 
 
+def in_structures(each: list[tuple[str, Finding]]) -> list[Finding]:
+    """**One finding for each kind the structures of a task of several make alike** (XC-545):
+    `each` is `(structure, finding)` in the order found; findings equal but for their structure
+    -- the same code, detail, kinds and subjects -- are said once, in the place the first was,
+    naming every structure it occurs in, `in structures 'search', 'target_absent': ...` (`in
+    structure 'search': ...` where one alone makes it), and about each structure's subjects, each
+    prefixed by its structure as before (`Finding.subjects`), so a later finding about one of them
+    is still known (`taskd.Session._laid_out`). The default calibration's warnings, said five
+    times by the pop-out's five structures until 2026-11-19, are said once each."""
+    merged: list[tuple[Finding, list[str]]] = []
+    for name, finding in each:
+        for found, names in merged:
+            if found == finding and found.subjects == finding.subjects:
+                if name not in names:
+                    names.append(name)
+                break
+        else:
+            merged.append((finding, [name]))
+    said = []
+    for finding, names in merged:
+        where = (f"in structure {names[0]!r}" if len(names) == 1 else
+                 f"in structures {', '.join(repr(name) for name in names)}")
+        said.append(dataclasses.replace(
+            finding, detail=f"{where}: {finding.detail}",
+            subjects=tuple(f"{name}: {subject}" for name in names
+                           for subject in finding.subjects)))
+    return said
+
+
+def _saturation_starts(task: Task) -> dict:
+    """**Each setting a color-set light's saturation is, at its start** (`check_task`): a number
+    setting with a finite start, by name; none with choices, no start, or no such light."""
+    from wl_xcon.declarations import color_set_lights
+
+    params = {param.name: param for param in task.params}
+    starts: dict = {}
+    for light in color_set_lights(task):
+        if not isinstance(light.saturation, P):
+            continue
+        param = params.get(light.saturation.name)
+        if param is not None and not param.choices and _finite(param.start):
+            starts[param.name] = param.start
+    return starts
+
+
+def _reachable_starts(task: Task, pinned: Task,
+                      calibration: Calibration | None) -> tuple[Task, list[Finding]]:
+    """**A luminance setting whose start `calibration` cannot show its color set at, not even the
+    apex, but some lower value it allows can** (XC-494's rule, the PI's "warnings over refusals";
+    the whole-build review of the pop-out revision, the controller's ruling on Task 7's concern 3:
+    a panel too dim for the fixation point's 40 cd/m²): the load judges it at the panel's
+    reachable top for the set (`reachable_top`, from the least it allows, its declared lowest or
+    `DESATURATED_STEP`) and warns, `color-set-unreachable`, naming the top; a run starting at the
+    start starts at the top instead, with a warning a person accepts (`in_reach`; the PI,
+    2026-11-20, "Start at the brightest it can, warn"), and a value set live above the top is
+    refused (`taskd.Session._impossible`). One no value the setting allows shows is left as
+    it is, refused as a light (`_one_color`, `unrealizable-color`). Only a setting the load holds
+    at its start (`_at_start`: an open side); one read over its declared range keeps the range's
+    rule (`_within_reach`, `_desaturated_range`). At load, never in a frame."""
+    from wl_xcon.declarations import color_set_lights
+
+    if calibration is None:
+        return pinned, []
+    declared = {param.name: param for param in task.params}
+    tops: dict = {}
+    sets: dict = {}
+    for light in color_set_lights(task):
+        if not isinstance(light.luminance, P):
+            continue
+        param = declared.get(light.luminance.name)
+        if (param is None or param.choices or not _finite(param.start) or param.start <= 0.0
+                or (param.low is not None and param.high is not None)):
+            continue
+        start = float(param.start)
+        least = float(param.low) if _finite(param.low) and param.low > 0.0 else DESATURATED_STEP
+        if least >= start or reachable_top(light.colorset, calibration, start, start) is not None:
+            continue
+        top = reachable_top(light.colorset, calibration, least, start)
+        if top is None:
+            continue
+        if param.name not in tops or top < tops[param.name]:
+            tops[param.name] = top
+        names = sets.setdefault(param.name, [])
+        if light.colorset.name not in names:
+            names.append(light.colorset.name)
+    if not tops:
+        return pinned, []
+    name = calibration.id or calibration.measured_on
+    findings = [Finding("color-set-unreachable", (
+        f"calibration {name} cannot show color set{'s' if len(sets[setting]) > 1 else ''} "
+        f"{', '.join(repr(one) for one in sets[setting])} at the start of setting {setting!r}, "
+        f"{declared[setting].start:g} cd/m² of macaque luminance, not even the apex: this panel's "
+        f"reachable top for it is about {top:.3g} cd/m², a run starting above that starts at it, "
+        f"with a warning to accept, and a value set live above it is refused; the task is checked "
+        f"at that top and runs at any value up to it"), blocking=False, accepted_in=SESSION_KINDS,
+        subjects=tuple(f"color set {one!r}" for one in sets[setting]))
+        for setting, top in tops.items()]
+    return at_values(pinned, tops), findings
+
+
 def _outside(param: Param, value: object) -> bool:
     """Whether `value` is a finite number outside the range `param` declares (a setting with
     choices has none)."""
@@ -305,6 +450,13 @@ def _waits(task: Task) -> tuple[set[str], float]:
                     if param.choices:
                         offered = [_seconds(c) for c in param.choices if _is_number(c)]
                         longest = max([longest, *offered])
+                    elif _is_number(param.start) and param.high is None:
+                        # **A wait with no highest counts by its start** (the console settings
+                        # plan's Task 4; the planner's call): every limit that stays is hard
+                        # since the PI's 2026-11-16 ruling, so a wait sets its highest only where
+                        # a longer one cannot be, and the PI's 2026-10-12 warning compares a wait
+                        # with the longest the task's own starting values give.
+                        longest = max(longest, _seconds(param.start))
                     elif _is_number(param.high):
                         longest = max(longest, _seconds(param.high))
                     else:
@@ -326,14 +478,18 @@ def widened(task: Task, values) -> Task:
     outside its range (the PI, 2026-10-11, XC-352's D2). A setting with choices, a value that is
     no finite number, a name the task does not declare and a value inside its range leave its
     declaration as it is. A starting value stays: widening only extends a range, so the start
-    `Param` held inside it is inside it still."""
+    `Param` held inside it is inside it still. **A side left open is closed at the start** (or at
+    the value, with none), so the load's reading of an open range at its start (`_at_start`; the
+    console settings plan's Task 4) does not hold it there: the value is what is judged."""
     def wide(param: Param) -> Param:
         value = values.get(param.name)
         if not _outside(param, value):
             return param
         low = value if param.low is not None and value < param.low else param.low
         high = value if param.high is not None and value > param.high else param.high
-        return dataclasses.replace(param, low=low, high=high)
+        other = param.start if _finite(param.start) else value
+        return dataclasses.replace(param, low=min(value, other) if low is None else low,
+                                   high=max(value, other) if high is None else high)
 
     return dataclasses.replace(task, structures={
         name: dataclasses.replace(structure, params=[wide(p) for p in structure.params])
@@ -366,7 +522,10 @@ def beyond_range(
     made over (the checks "Reasoning over the whole parameter space" below), which proves a value
     inside them cannot break the task from the console and says nothing of one outside them, so
     the checks run again, widened to it, twice: at a run's start (`preflight.beyond`) and on a
-    live edit (`Session.set`)."""
+    live edit (`Session.set`). **Since the console settings plan's Task 4 every declared bound is
+    a hard limit** (the PI, 2026-11-16, "Hard limits only where impossible"): each value past one
+    is refused first, `past-limit`, blocking, saying the limit's reason; the widened checks follow
+    it, unchanged, and say nothing a person can act on (XC-516)."""
     declared = {param.name: param for param in task.params}
     outside = {name: value for name, value in values.items()
                if name in declared and _outside(declared[name], value)}
@@ -378,7 +537,12 @@ def beyond_range(
     # a trial (WEL-11; engine spec §6.8; XC-373), when this sentence changes; the trial cap it
     # names is the longest trial, five minutes since engine build C2a (`TRIAL_CAP`).
     waits, longest = _waits(task)
-    findings: list[Finding] = []
+    # **Every declared bound is a hard limit** (the console settings design's §4; the PI,
+    # 2026-11-16, "Hard limits only where impossible"): a value past one is refused first, saying
+    # the limit's reason (`task.limit_reason`), at a run's start (`preflight.beyond`) and live
+    # (`Session.set`, through `_beyond_range`), each by its existing path.
+    findings: list[Finding] = [_past_limit(declared[name], value)
+                               for name, value in outside.items()]
     said = ", ".join(f"{name!r} at {value:g}" for name, value in outside.items())
     for name, value in outside.items():
         param = declared[name]
@@ -393,12 +557,7 @@ def beyond_range(
             f"its load-time checks were proved only over its declared range, and were run again "
             f"with the range widened to {value:g}"), blocking=False, accepted_in=SESSION_KINDS))
         if name in waits and value > longest:
-            findings.append(Finding("longer-than-declared", (
-                f"{name!r} at {value:g} s is a wait longer than any the task declares (its "
-                f"longest, {longest:g} s), and a stop, a pause and the out-of-cage limit are heard "
-                f"only between trials: while a trial waits on {name!r} they go unheard until that "
-                f"trial ends, and {TRIAL_CAP} ends any trial still running then, with no outcome "
-                f"(a hang)"), blocking=False, accepted_in=SESSION_KINDS))
+            findings.append(_longer(name, value, longest))
     before = check_task(task, allocation, components, geometry, calibration, deployment)
     # What the declared task's findings are about (the warnings-over-refusals review's I5): a
     # finding of `BREAKS_A_RUN` about the same thing, only larger, was accepted with the task.
@@ -408,7 +567,13 @@ def beyond_range(
         # One the declared task gives, about the same things: equality leaves `subjects` out, and
         # a light a value newly asks for can be one the task's clip warning already says, word
         # for word (Task 10's review, I1).
-        if _among(finding, before) or not (finding.blocking or finding.is_warning):
+        if (_among(finding, before) or not (finding.blocking or finding.is_warning)
+                or finding.code in (UNEXPLAINED_LIMIT, BAD_WHOLE)):
+            # A limit with no reason is the declaration's, said at load, never the value's: the
+            # widened range only moves the bound it names. So is a whole setting's bound that is
+            # not whole: widened to a value, it would name a bound the task never declared, and
+            # whether a value is whole is the live path's to judge (the console interface plan's
+            # Task 3), never `Session.set`'s.
             continue
         detail = f"with {said}, outside its declared range: {finding.detail}"
         new = [subject for subject in finding.subjects if (finding.code, subject) not in known]
@@ -430,6 +595,452 @@ def beyond_range(
                     f"with {said}, outside its declared range: {where}{finding.detail}")
             for finding in _overlapping_objects(structure, raised)
         ]
+    return findings
+
+
+#: **A value past a declared bound** (the console settings design's §4; the PI, 2026-11-16, "Hard
+#: limits only where impossible"): refused wherever it is offered, saying the limit's reason.
+PAST_LIMIT = "past-limit"
+
+#: **A bound declared with no reason** (§4: "each card says why for any limit that stays, in one
+#: line"): a warning at load, accepted in every kind, naming the setting and the bound, until the
+#: task gives the line (`Param.why`) or takes the limit away.
+UNEXPLAINED_LIMIT = "unexplained-limit"
+
+
+def _past_limit(param: Param, value: float) -> Finding:
+    """`PAST_LIMIT` for `value` past `param`'s bound, blocking: "'fix_hold' at -0.1 s is below its
+    0: below 0 cannot be", the reason `task.limit_reason`'s, or that the task gives none."""
+    low = param.low is not None and value < param.low
+    side, bound = ("low", param.low) if low else ("high", param.high)
+    why = limit_reason(param, side) or (
+        f"the task gives no reason for this limit ({UNEXPLAINED_LIMIT})")
+    unit = f" {param.unit}" if param.unit else ""
+    return Finding(PAST_LIMIT, (
+        f"{param.name!r} at {value:g}{unit} is {'below' if low else 'above'} its {bound:g}: {why}"))
+
+
+def _longer(name: str, value: float, longest: float) -> Finding:
+    """`longer-than-declared` for a wait setting at `value`, longer than the task's `longest`
+    (`_waits`; the PI, 2026-10-12: "Allow, with a warning"): stop, pause and the out-of-cage limit
+    are heard between trials, never inside one, until they are checked about once a second
+    inside a trial (WEL-11; engine spec §6.8; XC-373), when this sentence changes; the trial cap
+    it names is the longest trial, five minutes since engine build C2a (`TRIAL_CAP`)."""
+    return Finding("longer-than-declared", (
+        f"{name!r} at {value:g} s is a wait longer than any the task declares (its "
+        f"longest, {longest:g} s), and a stop, a pause and the out-of-cage limit are heard "
+        f"only between trials: while a trial waits on {name!r} they go unheard until that "
+        f"trial ends, and {TRIAL_CAP} ends any trial still running then, with no outcome "
+        f"(a hang)"), blocking=False, accepted_in=SESSION_KINDS)
+
+
+def _unexplained_limits(task: Task) -> list[Finding]:
+    """`UNEXPLAINED_LIMIT` for each setting declaring a bound that neither a standard reason nor
+    its own line explains (`task.limit_reason`): since every bound is hard (the console settings
+    design's §4), each says why or goes."""
+    findings: list[Finding] = []
+    for param in task.params:
+        if param.choices:
+            continue
+        sides = [(side, bound) for side, bound in (("low", param.low), ("high", param.high))
+                 if _finite(bound) and limit_reason(param, side) is None]
+        if not sides:
+            continue
+        said = " and ".join(f"its {'lowest' if side == 'low' else 'highest'}, {bound:g}"
+                            for side, bound in sides)
+        unit = f" {param.unit}" if param.unit else ""
+        findings.append(Finding(UNEXPLAINED_LIMIT, (
+            f"{param.name!r} declares {said}{unit}, with no reason: every limit is hard, a value "
+            f"past it refused (the PI, 2026-11-16, \"Hard limits only where impossible\"); give "
+            f"its reason in one line (`why`), or take it away"),
+            blocking=False, accepted_in=SESSION_KINDS, subjects=(f"setting {param.name!r}",)))
+    return findings
+
+
+#: **A whole setting declaring a number that is not whole** (the console interface design's goal
+#: 6; the PI, 2026-11-19): its start, lowest, highest or step, refused at load, naming each.
+BAD_WHOLE = "bad-whole"
+
+
+def _whole_faults(task: Task) -> list[Finding]:
+    """`BAD_WHOLE` for each setting declared whole (`Param.whole`) whose start, lowest, highest or
+    step, where given, is not a whole number (`4.0` is): its box steps by whole numbers from its
+    start, within its bounds, and could not show a start of 4.5 without a decimal. A bound that is
+    no finite number is left to the checks that read it (`_unexplained_limits`, the pre-flight)."""
+    findings: list[Finding] = []
+    for param in task.params:
+        if not param.whole:
+            continue
+        given = (("start", param.start), ("lowest", param.low), ("highest", param.high),
+                 ("step", param.step))
+        said = [f"its {which}, {value!r}" for which, value in given
+                if _finite(value) and not float(value).is_integer()]
+        if not said:
+            continue
+        listed = said[0] if len(said) == 1 else f"{', '.join(said[:-1])} and {said[-1]}"
+        findings.append(Finding(BAD_WHOLE, (
+            f"{param.name!r} is declared whole, and {listed}, "
+            f"{'is not a whole number' if len(said) == 1 else 'are not whole numbers'}")))
+    return findings
+
+
+#: **Why a group may not hold a reward size** (`bad-group`; the console interface design's "Decided
+#: by us": a reward size keeps its own Apply, never in an Apply all or a withdraw; the controller's
+#: ruling on its plan's Task 7), in the words the page's drafts bar says it in.
+REWARD_ALONE = "a reward size is sent alone, by its own Apply"
+
+
+def _group_faults(task: Task) -> list[Finding]:
+    """`bad-group` for what a task's groups (`Task.groups`; the console interface design's goal 8)
+    name that the task cannot box: a setting it does not declare; one in two groups, since a
+    setting sits in one box; two groups of one title; and **a ceiling** -- a welfare-bounded
+    setting (`declarations.BOUNDED`, `reward_correct` today) or any bounded-config entry the task
+    rewards through, whatever its declarations -- since a reward size is never applied with
+    others (the design's call; the plan's Global Constraints; XC-527): it keeps its own Apply.
+    Each blocking. A group's own shape is refused as it is built (`task.Group`)."""
+    from wl_xcon.declarations import BOUNDED, rewarded_through
+
+    declared = {param.name for param in task.params}
+    by_name = {param.name: param for param in task.params}
+    ceilings = set(BOUNDED) | rewarded_through(task)
+    findings: list[Finding] = []
+    titles: set[str] = set()
+    boxed: dict[str, str] = {}
+    for group in task.groups:
+        if group.name in titles:
+            findings.append(Finding("bad-group", (
+                f"two groups are named {group.name!r}; a box's title names one")))
+        titles.add(group.name)
+        for name in group.settings:
+            if name in ceilings:
+                findings.append(Finding("bad-group", (
+                    f"group {group.name!r} holds {name!r}, a welfare-bounded setting: "
+                    f"{REWARD_ALONE}")))
+            elif name not in declared:
+                findings.append(Finding("bad-group", (
+                    f"group {group.name!r} names {name!r}, which the task does not declare")))
+            elif name in boxed:
+                findings.append(Finding("bad-group", (
+                    f"setting {name!r} is in group {boxed[name]!r} and in group "
+                    f"{group.name!r}; a setting sits in one box")))
+            else:
+                boxed[name] = group.name
+        # **One section** (the controller's ruling on the console interface plan's Task 3): a
+        # group's box sits in the section its settings share, so they share one.
+        sections = list(dict.fromkeys(section_of(by_name[name]) for name in group.settings
+                                      if name in by_name and name not in ceilings))
+        if len(sections) > 1:
+            findings.append(Finding("bad-group", (
+                f"group {group.name!r} holds settings of the sections "
+                f"{', '.join(repr(section) for section in sections)}; its box sits in one "
+                f"section, so its settings share one")))
+    return findings
+
+
+#: **Two settings sharing one plain name** (`Param.label`; the console interface design's goal 5;
+#: the controller's ruling on its plan's Task 3): their boxes would read alike, so the load refuses
+#: it, an authoring rule.
+BAD_LABEL = "bad-label"
+
+
+def _label_faults(task: Task) -> list[Finding]:
+    """`BAD_LABEL`, blocking, for each plain name two or more settings declare, compared as a
+    person reads it -- case and runs of spaces aside -- naming the settings."""
+    named: dict[str, list[Param]] = {}
+    for param in task.params:
+        if param.label.strip():
+            named.setdefault(" ".join(param.label.split()).casefold(), []).append(param)
+    return [Finding(BAD_LABEL, (
+                f"settings {', '.join(repr(param.name) for param in params)} share the plain name "
+                f"{params[0].label!r}; their boxes would read alike, so each takes a name of its "
+                f"own"))
+            for params in named.values() if len(params) > 1]
+
+
+#: **Two of a setting's choices showing one set's one hue** (the console settings design's §6): a
+#: console's pick names a set and a hue (`link.SetColor`), so it could not say which of the two it
+#: is. A warning at load, accepted in every kind: the setting's other choices are still picked
+#: by set and hue, these two only by code (`task.color_choices` leaves their key out).
+AMBIGUOUS_COLOR_CHOICE = "ambiguous-color-choice"
+
+
+def _ambiguous_color_choices(task: Task) -> list[Finding]:
+    """`AMBIGUOUS_COLOR_CHOICE` for each setting whose choices share a set and hue
+    (`task.shared_color_choices`), naming each key."""
+    findings: list[Finding] = []
+    for param in task.params:
+        shared = shared_color_choices(param)
+        if not shared:
+            continue
+        said = "; ".join(f"{colorset}'s {hue}" for colorset, hue in shared)
+        findings.append(Finding(AMBIGUOUS_COLOR_CHOICE, (
+            f"{param.name!r} offers two or more choices in {said}, and a console picks a color by "
+            f"its set and hue, so it cannot say which of them it means: those are left off its "
+            f"card, the rest picked as ever; give each choice its own hue, or keep one"),
+            blocking=False, accepted_in=SESSION_KINDS, subjects=(f"setting {param.name!r}",)))
+    return findings
+
+
+#: **A task that hides its fixation point at its go** (the pop-out revision's design §2, which
+#: leaves the warning to the builder; TSK-79, the PI's rule of 2026-11-16 for every task: "I dont
+#: think that fixation should disappear when array appears"): the fixation point stays on, and its
+#: look changes at the go. A warning at load, accepted in every kind, never a refusal (the PI,
+#: 2026-10-11: warnings over refusals): a task may have its reasons, and the person starting it
+#: is told the rule.
+FIXATION_HIDDEN_AT_GO = "fixation-hidden-at-go"
+
+
+def _hidden_at_go(task: Task) -> list[Finding]:
+    """`FIXATION_HIDDEN_AT_GO` for each `Hide`, on an edge into the task's reaction-time state
+    (`Task.reaction_time`, its go) or in that state's own entry, of a stimulus a window held the
+    eye on in the edge's source state names (`Window.on`): held by a `Hold` or an `Exited` of that
+    state, each of which keeps the eye there. One finding per structure, source state and
+    stimulus, naming the state and the stimulus. A task with no reaction time, or a structure
+    with no state of its name, says nothing. Read from the declarations, between trials."""
+    timed = task.reaction_time
+    if timed is None or not isinstance(getattr(timed, "state", None), str):
+        return []
+    several = len(task.structures) > 1
+    findings: list[Finding] = []
+    for name, structure in task.structures.items():
+        states = {state.name: state for state in structure.states}
+        go = states.get(timed.state)
+        if go is None:
+            continue
+        windows = {window.name: window for window in structure.windows
+                   if isinstance(window, Window) and isinstance(window.on, str)}
+        entered = [action.stimulus for action in go.enter if isinstance(action, Hide)]
+        for state in structure.states:
+            held = {}
+            for edge in state.go:
+                if (isinstance(edge.guard, (Hold, Exited)) and edge.guard.window in windows):
+                    window = windows[edge.guard.window]
+                    held.setdefault(window.on, window.name)
+            if not held:
+                continue
+            said: list[str] = []
+            for edge in state.go:
+                if edge.to != timed.state:
+                    continue
+                for stimulus in [action.stimulus for action in edge.do
+                                 if isinstance(action, Hide)] + entered:
+                    if stimulus in held and stimulus not in said:
+                        said.append(stimulus)
+            for stimulus in said:
+                where = f"in structure {name!r}, " if several else ""
+                findings.append(Finding(FIXATION_HIDDEN_AT_GO, (
+                    f"{where}the edge from state {state.name!r} into {timed.state!r}, the task's "
+                    f"reaction-time state, hides stimulus {stimulus!r}, which window "
+                    f"{held[stimulus]!r} held the eye on in {state.name!r}: the lab's rule since "
+                    f"2026-11-16 (TSK-79) is that the fixation point stays on, and its look "
+                    f"changes at the go (an Update of its looks, to its act look), so the go is "
+                    f"the point's change, never its going off"),
+                    blocking=False, accepted_in=SESSION_KINDS,
+                    subjects=(f"state {state.name!r}", f"stimulus {stimulus!r}")))
+    return findings
+
+
+def _at_start(task: Task) -> tuple[Task, frozenset[str]]:
+    """**`task` with each numeric setting whose range is open judged at its start** (the console
+    settings design's §4; the planner's call): a setting that leaves a side open declares no span
+    of values it was designed for -- the bound it keeps marks only where a value cannot be -- so
+    the load-time checks, which reason over the declared ranges, hold it at the value the run
+    begins with (`low = high = start`), and a change from there is judged again where it is made
+    (`laid_out`, `taskd.Session._laid_out`). Read over `[0, start]`, a ring's least would be 0 and
+    every array crowded at load, at a value no one set (the builder's call). A setting declaring
+    both bounds is read over them still. **A setting with an open side and no start is left to the
+    run's start**, named in the set returned: its place is judged at the run's values
+    (`preflight.laid_out`), and check 8 says nothing of it at load. Every structure alike."""
+    unstarted: set[str] = set()
+
+    def pinned(param: Param) -> Param:
+        if param.choices or (param.low is not None and param.high is not None):
+            return param
+        if not _finite(param.start):
+            unstarted.add(param.name)
+            return param
+        return dataclasses.replace(param, low=param.start, high=param.start)
+
+    held = dataclasses.replace(task, structures={
+        name: dataclasses.replace(structure, params=[pinned(p) for p in structure.params])
+        for name, structure in task.structures.items()
+    })
+    return held, frozenset(unstarted)
+
+
+def at_values(task: Task, values) -> Task:
+    """**`task` with each numeric setting `values` names pinned there** (the console settings
+    design's §4: "warnings come from the layout actually set"): a number pins the setting's range
+    and start to it, `low = high = start = value`; a `(least, most)` pair, a draw's or a
+    staircase's two ends, to that span, its start the least. A setting with choices, a name the
+    task does not declare and a value that is no finite number are left as declared. Every
+    structure alike; what the layout checks read at the values set (`laid_out`)."""
+    def pinned(param: Param) -> Param:
+        if param.choices or param.name not in values:
+            return param
+        value = values[param.name]
+        if isinstance(value, tuple) and len(value) == 2 and all(_finite(v) for v in value):
+            least, most = sorted(float(v) for v in value)
+            return dataclasses.replace(param, low=least, high=most, start=least)
+        if not _finite(value):
+            return param
+        return dataclasses.replace(param, low=value, high=value, start=value)
+
+    return dataclasses.replace(task, structures={
+        name: dataclasses.replace(structure, params=[pinned(p) for p in structure.params])
+        for name, structure in task.structures.items()
+    })
+
+
+#: **The layout checks** (the console settings design's §4: "warnings come from the layout actually
+#: set, recomputed whenever a value changes"): judged at the values set (`laid_out`) at a run's
+#: start (`preflight.laid_out`) and on every change (`taskd.Session._laid_out`), each finding
+#: compared with those at the values in force. Off the field refuses; the rest are warnings.
+#: **A color set shown less saturated than asked at the luminance set** (`color-set-desaturated`)
+#: and **a drawn luminance whose upper part the panel cannot show** (`color-set-unreachable`, always
+#: a warning; a single value set live past the reachable top is refused as impossible,
+#: `unshowable`, and a run starting past it starts at it, `in_reach`) are
+#: among them (the whole-build review's I2; XC-518): the load judges an open luminance at its start,
+#: so without them a trainer brightening the colors live was told nothing (the design's third
+#: anti-goal, "a color picked on the page that differs from what the rig draws, with nothing saying
+#: so"). Each names its set (`Finding.subjects`), so a set already warned of at the values in force
+#: is not warned of again for another luminance (`taskd.Session._laid_out`). **The special trials'
+#: percentages adding past 100** (`specials-over-100`) are a sum and no layout, judged here because
+#: these are the checks run at the values set (the pop-out revision's plan, Task 4), so shares set
+#: past 100 live are warned when a change makes them so (`_over_100`).
+LAYOUT = ("stimulus-off-screen", "overlapping-windows", "crowded-array",
+          "answer-window-reaches-objects", "window-inside-object", "objects-touch",
+          "scaled-small", "color-set-desaturated", "color-set-unreachable", "specials-over-100")
+
+#: **A size scaled by eccentricity that the center leaves small** (the console settings design's
+#: §5: "eccentricity 0 gives size 0, so the load check warns for a scaled stimulus at or near the
+#: center"; the plan's Review Focus 4), a warning in every kind: a stimulus drawn straight ahead is
+#: not drawn at all, and one drawn nearer than its fixed size there says both sizes (the planner's
+#: call: "near the center" made checkable against the task's own size). One of `LAYOUT`.
+SCALED_SMALL = "scaled-small"
+
+#: **An object window by `scale` on an array whose looks have no single size** (`ObjectWindows.
+#: scale`; the console settings design's §5), refused at load: a multiple of an object's radius
+#: needs the object's radius.
+UNSIZED_WINDOW = "unsized-window"
+
+
+def _scaled_sizes(task: Task, values: dict, fixed: dict) -> tuple[dict, list[Finding]]:
+    """**`values` with each size scaled by eccentricity read as the sizes it gives**, and what those
+    sizes say (`laid_out`; the console settings design's §5): each `Scaled` value of a size setting
+    is drawn at each place the task draws a look of that size (`task.sized_places`, at the values
+    set, a span read at each of its ends and an open side at its start), each object at its own
+    eccentricity (`task.size_at`, true visual angle, never an average), and the layout checks read
+    the setting over the least and the most of those sizes above 0 (`at_values`' span). For each
+    stimulus: drawn straight ahead it is not drawn (`scaled-small`); drawn smaller somewhere than
+    its fixed value (`fixed`, the value it held before it was scaled) says both (`scaled-small`);
+    drawn past a bound its setting declares is refused there (`past-limit`), every bound being hard
+    (the console settings design's §4). Between trials, never in a frame."""
+    scaled = {name: value for name, value in values.items() if isinstance(value, Scaled)}
+    if not scaled:
+        return values, []
+    declared = {param.name: param for param in task.params}
+    starts = {param.name: param.start for param in task.params if param.start is not None}
+
+    def end(value, which: int):
+        if isinstance(value, tuple) and len(value) == 2 and all(_finite(v) for v in value):
+            return sorted(value)[which]
+        return value
+
+    ends = [{**starts, **{name: end(value, which) for name, value in values.items()
+                          if name not in scaled}} for which in (0, 1)]
+    read = dict(values)
+    findings: list[Finding] = []
+    for name, form in scaled.items():
+        sizes: dict[str, list[tuple[float, float]]] = {}
+        for these in ends:
+            for structure in task.structures.values():
+                for label, place in sized_places(structure, these, name):
+                    eccentricity = size_at(Scaled(1.0), place)
+                    sizes.setdefault(label, []).append((eccentricity, size_at(form, place)))
+        drawn = [size for each in sizes.values() for _, size in each if size > 0.0]
+        held = fixed.get(name)
+        if drawn:
+            read[name] = (min(drawn), max(drawn))
+        elif _finite(held):
+            read[name] = held
+        else:
+            read.pop(name)
+        param = declared.get(name)
+        for label, each in sizes.items():
+            nearest, least = min(each)
+            subjects = (f"{label} sized by {name!r}",)
+            if nearest <= 1e-9:
+                findings.append(Finding(SCALED_SMALL, (
+                    f"{name!r} scaled by {form.factor:g} gives {label} no size straight ahead, at "
+                    f"0° out, so it is not drawn: a size scaled by eccentricity is 0 at the center; "
+                    f"keep {name!r} fixed while it draws something at the center"),
+                    blocking=False, accepted_in=SESSION_KINDS, subjects=subjects))
+            elif _finite(held) and least < held:
+                findings.append(Finding(SCALED_SMALL, (
+                    f"{name!r} scaled by {form.factor:g} gives {label} {least:.3g}° at "
+                    f"{nearest:.3g}° out, below its fixed {held:g}°: scaled, it is drawn smaller "
+                    f"there than it was"),
+                    blocking=False, accepted_in=SESSION_KINDS, subjects=subjects))
+            if param is not None:
+                past = [size for _, size in each if _outside(param, size)]
+                if past:
+                    findings.append(dataclasses.replace(
+                        _past_limit(param, max(past, key=lambda size: abs(size))),
+                        subjects=subjects))
+    return read, findings
+
+
+def laid_out(task: Task, values, *, allocation: Allocation = PROVISIONAL,
+             geometry: Geometry | None = None, calibration: Calibration | None = None,
+             deployment: Deployment | None = None, fixed: dict | None = None) -> list[Finding]:
+    """**The layout checks at the values set** (`LAYOUT`; the console settings design's §4): each
+    structure's, on `task` with each setting `values` names pinned there (`at_values`: a number,
+    or a draw's or a staircase's `(least, most)`) and every other open side at its start
+    (`_at_start`), each named by its structure in a task of several, as `check_task` names them;
+    and `longer-than-declared` for a wait set longer than any the task's own starting values give
+    (`_waits`, `_longer`; the planner's call: the PI's 2026-10-12 warning keeps its sense).
+
+    **And every refusal a structure's checks newly give at the values** (`check`, against what
+    they give at the task's own starts): an open range is judged at its start at load, so a value
+    a console sends past what a structure can hold -- a target index past its array, a
+    correlation past 1, a size of 0 -- is what cannot be (§4), refused where it is set, as the load
+    refused a range reaching it before the open ranges (the builder's call; the PI, 2026-10-14,
+    I4, refused such a range at load because a console could send it unchecked).
+
+    **A size scaled by eccentricity** (a `task.Scaled` value; the console settings design's §5) is
+    read as the sizes it gives at each place it is drawn, its center and nearness warned and a size
+    past its bound refused (`_scaled_sizes`), `fixed` giving each such setting's fixed value. **And
+    the special trials' percentages past 100** at the values (`_over_100`; `specials-over-100`), a
+    warning. Run between trials, never in a frame."""
+    values, scaled = _scaled_sizes(task, dict(values), fixed or {})
+    pinned, unstarted = _at_start(at_values(task, values))
+    own, _ = _at_start(task)
+    several = len(pinned.structures) > 1
+    each: list[tuple[str, Finding]] = []
+    for name, structure in pinned.structures.items():
+        found = check(structure, allocation, None, geometry, calibration, unstarted)
+        found = [finding for finding in found if finding.code in LAYOUT or finding.blocking]
+        if any(finding.blocking and finding.code not in LAYOUT for finding in found):
+            given = check(own.structures[name], allocation, None, geometry, calibration,
+                          unstarted)
+            found = [finding for finding in found if finding.code in LAYOUT
+                     or not _among(finding, given)]
+        each += [(name, finding) for finding in found]
+    # One finding for each kind the structures make alike, naming them (XC-545).
+    findings: list[Finding] = in_structures(each) if several else [f for _, f in each]
+    waits, longest = _waits(task)
+    for name in sorted(waits):
+        value = values.get(name)
+        most = (max(value) if isinstance(value, tuple) and value and all(_finite(v) for v in value)
+                else value)
+        if _finite(most) and most > longest:
+            findings.append(_longer(name, most, longest))
+    findings += [finding for finding in scaled if not _among(finding, findings)]
+    over = _over_100(task, values)
+    if over is not None:
+        findings.append(over)
+    del deployment  # read by no structure's check: a head's is the task's (`_head_faults`)
     return findings
 
 
@@ -2004,6 +2615,153 @@ def _pool_faults(task: Task) -> list[Finding]:
     return [Finding("bad-pool", sentence) for sentence in said]
 
 
+def _full_task_faults(task: Task) -> list[Finding]:
+    """**A plan's full task naming what the plan or the task lacks** (`task.FullTask`,
+    `Plan.full`; the console settings design's §8), **refused**, `bad-full-task`, each sentence
+    saying which plan and what to write: a block the plan has not, by name; a value for a setting
+    the task does not declare, or for a welfare-bounded one (a reward size is the subject's
+    bounded config's, never a task's version); a value outside the setting's declared limits, or
+    not among its choices; and a pool's value naming no pool (`unpooled`). Between trials and at
+    load, never in a frame."""
+    declared = {param.name: param for param in task.params}
+    pool = task.pool if isinstance(task.pool, Pool) else None
+    said: list[str] = []
+    for plan_name, plan in task.plans.items():
+        full = getattr(plan, "full", None)
+        if not isinstance(full, FullTask):
+            continue
+        where = f"plan {plan_name!r}'s full task"
+        names = [block.name for block in plan.blocks if isinstance(block, Block)]
+        if full.block not in names:
+            said.append(f"{where} plays block {full.block!r}, which the plan does not have; name "
+                        f"one of its blocks: {', '.join(map(repr, names)) or 'none'}")
+        for name, value in full.values.items():
+            param = declared.get(name)
+            if name in BOUNDED:
+                said.append(f"{where} gives {name!r}, a bounded setting, which the subject's "
+                            f"bounded config sets and no task's version does (welfare); take it "
+                            f"out")
+            elif param is None:
+                said.append(f"{where} gives {name!r}, which is no setting the task declares; "
+                            f"declare it or take it out")
+            elif param.choices and value not in param.choices:
+                said.append(f"{where} gives {name!r} {value!r}, which is none of its choices")
+            elif _outside(param, value):
+                low = "no lowest" if param.low is None else f"{param.low:g}"
+                high = "no highest" if param.high is None else f"{param.high:g}"
+                said.append(f"{where} gives {name!r} {value:g}, outside its limits ({low} to "
+                            f"{high}); give a value inside them")
+            elif pool is not None and name == pool.setting:
+                said += [f"{where}: {sentence}" for _, sentence in unpooled(task, {name: value})]
+    return [Finding("bad-full-task", sentence) for sentence in said]
+
+
+#: **A special kind the task cannot play** (`task.Special`; the pop-out revision design's §4),
+#: refused at load: its structure is not one of the task's, or is its default; its share names no
+#: setting the task declares, or one that is not a percentage of trials (`SPECIAL_UNIT`, 0 to 100).
+BAD_SPECIAL = "bad-special"
+
+#: **The special kinds' percentages adding past 100 at the task's starts** (the design's §4: "More
+#: is a load warning naming the sum"), accepted in every kind: each kind is then drawn in
+#: proportion to its percentage and no trial is normal (`taskd.Session._special`; the controller's
+#: call). Judged at the values set by the run's pre-flight (`LAYOUT`, the plan's Task 4).
+SPECIALS_OVER_100 = "specials-over-100"
+
+
+def _range_said(param: Param) -> str:
+    """A setting's unit and limits, as a `bad-special` sentence says them: "in s from 0 to 10"."""
+    low, high = _real_bound(param.low), _real_bound(param.high)
+    if low is not None and high is not None:
+        limits = f"from {low:g} to {high:g}"
+    elif low is not None:
+        limits = f"from {low:g}, with no highest"
+    elif high is not None:
+        limits = f"up to {high:g}, with no lowest"
+    else:
+        limits = "with no limits"
+    return f"in {param.unit} {limits}"
+
+
+def _real_bound(bound: object) -> float | None:
+    """A declared bound as a number, or `None` for none or one that is no real number."""
+    if isinstance(bound, bool) or not isinstance(bound, (int, float)) or not math.isfinite(bound):
+        return None
+    return bound
+
+
+def special_share(value: object) -> float:
+    """**A special kind's percentage as its draw reads it** (`taskd.Session._special`; the
+    `specials-over-100` warning): a finite number above 0 as it is, anything else -- no number, a
+    `bool`, below 0 -- 0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 0.0
+    return max(float(value), 0.0)
+
+
+def _special_faults(task: Task) -> list[Finding]:
+    """`BAD_SPECIAL` for each special kind the task cannot play (blocking), and
+    `SPECIALS_OVER_100` where their shares at the task's starts add past 100 (a warning in every
+    kind), naming the sum and each share. A special's own shape is refused as it is built
+    (`task.Special`, `Task.specials`)."""
+    declared = {param.name: param for param in task.params}
+    findings: list[Finding] = []
+    for special in task.specials:
+        named = f"special kind {special.kind!r}"
+        if special.structure not in task.structures:
+            findings.append(Finding(BAD_SPECIAL, (
+                f"{named} plays structure {special.structure!r}, which the task does not have")))
+        elif special.structure == task.default:
+            findings.append(Finding(BAD_SPECIAL, (
+                f"{named} plays structure {special.structure!r}, the task's default: a special "
+                f"trial plays a structure of its own, in place of the default")))
+        name = special.share.name
+        param = declared.get(name)
+        if param is None:
+            findings.append(Finding(BAD_SPECIAL, (
+                f"{named} takes its percentage from {name!r}, which the task does not declare")))
+        elif not (param.unit == SPECIAL_UNIT and _real_bound(param.low) == 0
+                  and _real_bound(param.high) == 100):
+            findings.append(Finding(BAD_SPECIAL, (
+                f"{named} takes its percentage from {name!r}, which is {_range_said(param)}: a "
+                f"percentage of trials is a setting in {SPECIAL_UNIT} from 0 to 100")))
+    over = _over_100(task, {})
+    return findings + ([over] if over is not None else [])
+
+
+#: **What shares past 100 do**, as `SPECIALS_OVER_100` says it and a special trials group's box
+#: says it after its remainder (`web._rest_said`; the pop-out revision's Amendments, item 4).
+IN_PROPORTION = "each kind is then drawn in proportion to its percentage, and no trial is normal"
+
+
+def _over_100(task: Task, values: dict) -> "Finding | None":
+    """**`SPECIALS_OVER_100` where the special kinds' percentages add past 100**, each read from
+    `values` over the task's starts as the draw reads it (`special_share`), or `None`: at load
+    (`_special_faults`, `values` empty) and at the values set (`laid_out`; the plan's Task 4). Said
+    "at the task's starts" where every percentage is its start, so the run's pre-flight at the
+    task's own starts says the load's sentence, once, and "at the values set" otherwise. Its
+    subjects are each share's setting, so a change that keeps them past 100 is no new warning
+    (`taskd.Session._laid_out`)."""
+    declared = {param.name: param for param in task.params}
+    shares, started = [], True
+    for special in task.specials:
+        name = special.share.name
+        start = getattr(declared.get(name), "start", None)
+        value = values.get(name, start)
+        started = started and value == start
+        shares.append((special, special_share(value)))
+    total = sum(share for _, share in shares)
+    if not total > 100:
+        return None
+    each = ", ".join(f"{special.kind} {share:g} from {special.share.name!r}"
+                     for special, share in shares)
+    where = "at the task's starts" if started else "at the values set"
+    return Finding(SPECIALS_OVER_100, (
+        f"the special trials' percentages add to {total:g} {where} ({each}), past 100: "
+        f"{IN_PROPORTION}"),
+        blocking=False, accepted_in=SESSION_KINDS,
+        subjects=tuple(f"setting {special.share.name!r}" for special, _ in shares))
+
+
 def unpooled(task: Task, values: dict) -> "list[tuple[str, str]]":
     """**A pool that names no pairing at `values`** (`task.Pool`; the pop-out search build,
     2026-11-07; the plan's Review Focus 5: "an empty pool is refused with a sentence before the
@@ -2180,21 +2938,49 @@ def _found_by_faults(task: Task) -> list[Finding]:
     otherwise, `bad-array`: its word decides whether a target that can look like its distractors,
     or looks that swap, are refused or only warned (`impossible`), so a misspelling would quietly
     soften a pop-out search's refusal. Every array a `Show` or an `Update` gives, as written or
-    among a setting's choices (`task.array_actions`), each stimulus and word said once."""
+    among a setting's choices (`task.array_actions`), each stimulus and word said once.
+
+    **And an array with no target scored by its target** (`"none"`, a catch; the pop-out revision
+    design's §8; its plan's Task 4): a structure that shows one and scores a `SaccadeTo` or a
+    `Hold` on its family's target (`<name>.target`), as a guard or what a timer runs from, is
+    refused, once for each state, structure and guard: a catch's right answer is no look at an
+    object, and its target's place is where an odd one would be, which nothing is."""
     found: list[Finding] = []
     said: set[tuple] = set()
-    for structure in task.structures.values():
+    for label, structure in task.structures.items():
         if not isinstance(structure, Trial):
             continue
+        targetless: list[str] = []
         for _, name, _, array in array_actions(structure):
             word = array.found_by
+            if word == "none" and name not in targetless:
+                targetless.append(name)
             if word in FOUND_BY or (name, repr(word)) in said:
                 continue
             said.add((name, repr(word)))
             found.append(Finding("bad-array", (
                 f"array {name!r} is found by {word!r}, and an array's found_by is one of "
                 f"{', '.join(map(repr, FOUND_BY))}: 'look', its target the odd one out by its "
-                f"look, or 'cue', something else the trial shows naming it")))
+                f"look, 'cue', something else the trial shows naming it, or 'none', no target, "
+                f"a catch")))
+        for name in targetless:
+            for state in structure.states:
+                for edge in state.go:
+                    for guard in (edge.guard, getattr(edge.guard, "since", None)):
+                        if not (isinstance(guard, (SaccadeTo, Hold))
+                                and guard.window == f"{name}.target"):
+                            continue
+                        key = (label, state.name, repr(guard))
+                        if key in said:
+                            continue
+                        said.add(key)
+                        found.append(Finding("bad-array", (
+                            f"array {name!r} has no target (found_by 'none'), and state "
+                            f"{state.name!r} of structure {label!r} scores "
+                            f"{type(guard).__name__}({guard.window!r}): a catch's right answer "
+                            f"is no look at an object, and its target's place holds no odd one; "
+                            f"score the catch by its fixation hold, or say the array's target is "
+                            f"found by its look or a cue")))
     return found
 
 
@@ -2263,6 +3049,8 @@ def impossible(
     held: frozenset = frozenset(),
     ranges: dict | None = None,
     cued: bool = False,
+    forms: dict | None = None,
+    specials: str = "set",
 ) -> list[Finding]:
     """**The trials no animal can get right among `blocks`**, refused, `IMPOSSIBLE` (engine build
     C3's spec §9; the PI, 2026-10-30, Q10: "the check judges each concrete combination (per
@@ -2275,6 +3063,9 @@ def impossible(
     - **`ranges`** changes the draws in force, keyed as the C3 plan's call 7 keys a draw
       (`("task", name)`, `("block", block, name)`, `("condition", condition, name)`): a
       `Distribution` there replaces the declared draw, `None` restores it.
+    - **`forms`** are the draws a person gives settings (`taskd.Session._forms`; the console
+      settings design's §3), by name: each beats a condition's value, any draw and a staircase,
+      as a held value does, and is judged by what it can give, at its extremes (`_drawable`).
     - **Each condition of each block**, its factorial expanded (`variation.expanded`), is judged
       on what its trials can hold (`_sources`): **a draw that can give an impossible trial is
       refused**, since some trials would take that value (the spec's §9).
@@ -2295,23 +3086,65 @@ def impossible(
       sentence said of several conditions is one finding naming each (`subjects`, each
       `"block: condition"`).
 
+    - **Each special kind's structure too** (`task.Special`; TSK-69 revised by the pop-out
+      revision's Task 4), on every condition playing the default structure -- the trials a kind
+      can take the place of (`taskd.Session._special`) -- with that condition's sources, each
+      sentence naming the kind and its structure. **`specials`** says which: `"set"`, at a run's
+      start and live, the kinds whose percentage in `values` is above 0 (`special_share`), so a
+      kind at 0, drawn on no trial, blocks nothing and raising it is judged when it is set;
+      `"every"`, at load, each kind whatever its percentage. A kind the task cannot play
+      (`bad-special`) is not judged here. An array with no target (`Array.found_by` `"none"`, a
+      catch) is judged by neither look check: its objects may all look alike, which is the catch.
+
     A setting nothing gives is not judged (a run's pre-flight refuses it), nor a draw that cannot
     be drawn (`_draw_faults` refuses it), nor a block or condition that is not the shape its
     class declares (`_plan_faults` refuses it); nothing in a task's declarations raises here."""
+    if specials not in ("set", "every"):
+        raise ValueError(f"specials is 'set' or 'every', not {specials!r}")
     declared = {param.name: param for param in task.params}
     changed = ranges if isinstance(ranges, dict) else {}
+    formed = forms if isinstance(forms, dict) else {}
+    played = _specials_judged(task, values, specials)
     findings: list[Finding] = []
     for block in blocks:
         if isinstance(block, Block):
             findings += _impossible_in(task, expanded(block), values, held, changed, declared,
-                                       cued)
+                                       cued, formed, played)
     return findings
 
 
+def _specials_judged(task: Task, values: dict, specials: str) -> "list[Special]":
+    """**The special kinds `impossible` judges** (its `specials`): each the task can play -- a
+    structure the task has, a `Trial`, never its default (`bad-special` refuses the rest) -- and,
+    for `"set"`, whose percentage in `values` is above 0 (`special_share`, as the draw reads it)."""
+    return [special for special in getattr(task, "specials", ()) or ()
+            if isinstance(special, Special) and special.structure != task.default
+            and isinstance(task.structures.get(special.structure), Trial)
+            and (specials == "every"
+                 or special_share(values.get(special.share.name)) > 0)]
+
+
+def _played_by(task: Task, condition: Condition,
+               specials: "list[Special]") -> "list[tuple[str, Trial]]":
+    """**The structures a trial of `condition` can play**, each with how a sentence names it: the
+    one it names, or the task's default; and where that is the default, each special kind's
+    (`specials`), named by its kind and structure (`_specials_judged`)."""
+    name = condition.structure or task.default
+    structure = task.structures.get(name)
+    played = [("", structure)] if isinstance(structure, Trial) else []
+    if name == task.default:
+        played += [(f"special kind {special.kind!r} (structure {special.structure!r}): ",
+                    task.structures[special.structure]) for special in specials]
+    return played
+
+
 def _impossible_in(task: Task, block: Block, values: dict, held: frozenset, ranges: dict,
-                   declared: dict[str, Param], cued: bool = False) -> list[Finding]:
+                   declared: dict[str, Param], cued: bool = False,
+                   forms: dict | None = None,
+                   specials: "list[Special] | None" = None) -> list[Finding]:
     """`impossible` for one block, its factorial expanded: a look check's finding in an array a
-    cue names the target of (`_cued`) a `CUED` warning, said only with `cued`."""
+    cue names the target of (`_cued`) a `CUED` warning, said only with `cued`; each special kind
+    in `specials` judged on each condition playing the default structure (`_played_by`)."""
     conditions = [
         condition for condition in block.conditions
         if isinstance(condition, Condition) and isinstance(condition.values, dict)
@@ -2322,29 +3155,21 @@ def _impossible_in(task: Task, block: Block, values: dict, held: frozenset, rang
     looked: dict[str, tuple] = {}  # `_same_looks` once per distinct set of arrays
     pairs: dict[str, tuple] = {}  # each distinct pair of looks at two objects, and its conditions
     for condition in conditions:
-        structure = task.structures.get(condition.structure or task.default)
-        if not isinstance(structure, Trial):
+        played = _played_by(task, condition, specials or [])
+        if not played:
             continue
-        sources = _sources(task, block, condition, values, held, ranges, declared)
-        arrays = _arrays(structure, sources)
-        key = repr([(name, [part for part in form.parts if part[0] in _LOOKED])
-                    for name, _, form in arrays])
-        if key not in looked:
-            looked[key] = _same_looks(arrays, sources)
-        for sentence in _cut_off(structure, sources) + looked[key][0]:
-            said.setdefault(sentence, []).append(condition.name)
-        for sentence in looked[key][1]:
-            warned.setdefault(sentence, []).append(condition.name)
-        for name, array, form in arrays:
-            parts = dict(form.parts)
-            if _counts(parts["n"], 2, 2) is not True:
-                continue
-            key = repr((parts["looks"], parts["among"], _cued(array)))
-            if key not in pairs:
-                pairs[key] = (parts["looks"], parts["among"], [],
-                              _settings_said((array.looks, array.among), sources), _cued(array))
-            if condition.name not in pairs[key][2]:
-                pairs[key][2].append(condition.name)
+        sources = _sources(task, block, condition, values, held, ranges, declared, forms)
+        for named, structure in played:
+            arrays = _arrays(structure, sources)
+            key = repr([(name, [part for part in form.parts if part[0] in _LOOKED])
+                        for name, _, form in arrays])
+            if key not in looked:
+                looked[key] = _same_looks(arrays, sources)
+            for sentence in _cut_off(structure, sources) + looked[key][0]:
+                said.setdefault(named + sentence, []).append(condition.name)
+            for sentence in looked[key][1]:
+                warned.setdefault(named + sentence, []).append(condition.name)
+            _pairs_of(arrays, sources, condition, pairs)
     findings = [
         Finding(IMPOSSIBLE, f"block {block.name!r}, {_conditions_said(names)}: {sentence}",
                 subjects=tuple(f"{block.name}: {name}" for name in names))
@@ -2387,6 +3212,30 @@ def _impossible_in(task: Task, block: Block, values: dict, held: frozenset, rang
     return findings
 
 
+def _pairs_of(arrays: list[tuple[str, Array, _Made]], sources: dict[str, tuple],
+              condition: Condition, pairs: dict[str, tuple]) -> None:
+    """**Each distinct pair of looks a two-object array of `arrays` can show**, added to `pairs`
+    with `condition` among its conditions, for `_swapped`; an array with no target (`_targetless`)
+    has none to swap, and is left out."""
+    for name, array, form in arrays:
+        parts = dict(form.parts)
+        if _targetless(array) or _counts(parts["n"], 2, 2) is not True:
+            continue
+        key = repr((parts["looks"], parts["among"], _cued(array)))
+        if key not in pairs:
+            pairs[key] = (parts["looks"], parts["among"], [],
+                          _settings_said((array.looks, array.among), sources), _cued(array))
+        if condition.name not in pairs[key][2]:
+            pairs[key][2].append(condition.name)
+
+
+def _targetless(array: object) -> bool:
+    """Whether `array` has no target (`Array.found_by` `"none"`, a catch; the pop-out revision
+    design's §8): its objects may all look alike, which is the catch, so neither look check judges
+    it."""
+    return getattr(array, "found_by", "look") == "none"
+
+
 def _cued(array: object) -> bool:
     """Whether a cue names `array`'s target (`Array.found_by` `"cue"`; the PI, 2026-10-31), so the
     two look checks warn for it; anything else, its look the default, is held to them."""
@@ -2394,12 +3243,14 @@ def _cued(array: object) -> bool:
 
 
 def _sources(task: Task, block: Block, condition: Condition, values: dict, held: frozenset,
-             ranges: dict, declared: dict[str, Param]) -> dict[str, tuple]:
+             ranges: dict, declared: dict[str, Param],
+             forms: dict | None = None) -> dict[str, tuple]:
     """**What each setting can hold on a trial of `condition` in `block`**, in the order the C3
     plan's call 10 builds a trial's values: the run's value (`values`), under the condition's value
     or a draw -- its own range, else the block's or the task's draw in force (`variation.in_force`,
     `own_ranges`), each as `ranges` changes it -- or the block's staircase, each of its levels
-    (`Block.staircase`), and a value a person holds (`held`) over all of them.
+    (`Block.staircase`), then a person's draw (`forms`; the console settings build), what it can
+    give, and a value a person holds (`held`) over all of them.
     Each is a tuple: one value, or what its draw can give (`_drawable`). A setting nothing gives,
     or a draw that cannot be drawn, is absent, and so not judged."""
     found: dict[str, tuple | None] = {name: (value,) for name, value in values.items()}
@@ -2415,6 +3266,10 @@ def _sources(task: Task, block: Block, condition: Condition, values: dict, held:
         # **Each level of the block's staircase** (the pop-out search build, 2026-11-07), which
         # gives its setting each trial over the rest, a person's value aside.
         found[staircase.setting] = _staircase_levels(staircase, declared)
+    for name, form in (forms or {}).items():
+        # A size scaled by eccentricity (`task.Scaled`) is one value, the scaling, as a held
+        # value is: two looks scaled alike are alike wherever they are drawn.
+        found[name] = (form,) if isinstance(form, Scaled) else _drawable(form, declared.get(name))
     for name in held:
         if name in values:
             found[name] = (values[name],)
@@ -2503,6 +3358,8 @@ def _alike(left: object, right: object, one: bool) -> bool | None:
         if not (isinstance(left, _Made) and isinstance(right, _Made)) or (
                 left.kind is not right.kind):
             return False
+        if left.kind is ColorSetLight:
+            return _lights_alike(dict(left.parts), dict(right.parts), one)
         return _every(_alike(mine, yours, one)
                       for (_, mine), (_, yours) in zip(left.parts, right.parts))
     if isinstance(left, _Seq) or isinstance(right, _Seq):
@@ -2514,6 +3371,21 @@ def _alike(left: object, right: object, one: bool) -> bool | None:
         return bool(left == right)
     except Exception:  # noqa: BLE001 -- a value's own equality is the task's code
         return None
+
+
+def _lights_alike(left: dict, right: dict, one: bool) -> bool | None:
+    """**Whether two color-set lights can be one light** (`_alike`), each read at its own
+    saturation (the console settings design's §6; the plan's Review Focus 5): **a light at
+    saturation 0 is its set's apex, whatever its hue**, so two lights of one set, fraction and
+    luminance whose saturations can both be 0 are alike though their hues differ -- the odd one
+    is odd no longer -- and otherwise alike only where their hues and saturations can be. Every
+    other field as `_alike` reads a declaration's."""
+    rest = _every(_alike(left[field], right[field], one)
+                  for field in left if field not in ("color", "saturation"))
+    gray = _every((_alike(left["saturation"], 0.0, one), _alike(right["saturation"], 0.0, one)))
+    hued = _every((_alike(left["color"], right["color"], one),
+                   _alike(left["saturation"], right["saturation"], one)))
+    return _every((rest, _some((hued, gray))))
 
 
 def _spans(form: object) -> list[tuple[float, float]] | None:
@@ -2723,7 +3595,7 @@ def _same_looks(arrays: list[tuple[str, Array, _Made]],
     warned: list[str] = []
     for name, array, form in arrays:
         parts = dict(form.parts)
-        if _counts(parts["n"], 2, math.inf) is not True:
+        if _targetless(array) or _counts(parts["n"], 2, math.inf) is not True:
             continue
         if _alike(parts["looks"], parts["among"], one=True) is not True:
             continue
@@ -2826,10 +3698,11 @@ def _impossible_faults(task: Task) -> list[Finding]:
     starts = {param.name: param.start for param in task.params if param.start is not None}
     plain = Block("session", [Condition("session", {}, target=1)])
     found = [dataclasses.replace(finding, detail=f"the plain run: {finding.detail}")
-             for finding in impossible(task, [plain], starts, cued=True)]
+             for finding in impossible(task, [plain], starts, cued=True, specials="every")]
     for name, plan in task.plans.items():
         found += [dataclasses.replace(finding, detail=f"plan {name!r}: {finding.detail}")
-                  for finding in impossible(task, plan.blocks, starts, cued=True)]
+                  for finding in impossible(task, plan.blocks, starts, cued=True,
+                                            specials="every")]
     return found + _little_time_faults(task, starts)
 
 
@@ -2840,8 +3713,11 @@ def _little_time_faults(task: Task, starts: dict) -> list[Finding]:
     expanded, at the task's starting values, each condition's values and draws as `impossible`
     reads them (`_sources`); one finding per sentence, naming each `"block: condition"` it is
     true of. Only at load: a live change is judged for what no animal can get right
-    (`impossible`), never warned for this."""
+    (`impossible`), never warned for this. **Each special kind's structure too**, whatever its
+    percentage, on each condition playing the default structure (`_played_by`; TSK-69 revised),
+    each sentence naming the kind."""
     declared = {param.name: param for param in task.params}
+    specials = _specials_judged(task, starts, "every")
     blocks = [("the plain run", Block("session", [Condition("session", {}, target=1)]))]
     blocks += [(f"plan {name!r}", block) for name, plan in task.plans.items()
                for block in plan.blocks]
@@ -2854,13 +3730,14 @@ def _little_time_faults(task: Task, starts: dict) -> list[Finding]:
             if not (isinstance(condition, Condition) and isinstance(condition.values, dict)
                     and isinstance(condition.structure, (str, type(None)))):
                 continue
-            structure = task.structures.get(condition.structure or task.default)
-            if not isinstance(structure, Trial):
+            played = _played_by(task, condition, specials)
+            if not played:
                 continue
             sources = _sources(task, block, condition, starts, frozenset(), {}, declared)
-            for sentence in _little_time(structure, sources):
-                said.setdefault(f"{where}: {sentence}", []).append(
-                    f"{block.name}: {condition.name}")
+            for named, structure in played:
+                for sentence in _little_time(structure, sources):
+                    said.setdefault(f"{where}: {named}{sentence}", []).append(
+                        f"{block.name}: {condition.name}")
     return [Finding("little-time-to-answer", detail, blocking=False, accepted_in=SESSION_KINDS,
                     subjects=tuple(dict.fromkeys(names)))
             for detail, names in said.items()]
@@ -3579,7 +4456,8 @@ def _as_updated(trial: Trial) -> dict[int, list[Stimulus]]:
     return result
 
 
-def _offscreen_stimuli(trial: Trial, geometry: Geometry | None) -> list[Finding]:
+def _offscreen_stimuli(trial: Trial, geometry: Geometry | None,
+                       unstarted: frozenset[str] = frozenset()) -> list[Finding]:
     """S1 §9 check 8: every stimulus can actually be shown.
 
     Checked **per eye, after disparity**, not at the cyclopean position. Disparity is
@@ -3660,6 +4538,10 @@ def _offscreen_stimuli(trial: Trial, geometry: Geometry | None) -> list[Finding]
             )
             continue
         except _Unbounded as unbounded:
+            if unbounded.args[0] in unstarted:
+                # An open side with no start: left to the run's start (the console settings
+                # design's §4), which judges it at the run's values (`preflight.laid_out`).
+                continue
             findings.append(
                 Finding(
                     "stimulus-off-screen",
@@ -4207,7 +5089,7 @@ def _colors(trial: Trial, params: dict[str, Param]):
                        else f"{what} (a choice of parameter {color.name!r})"), choice
 
     for looks in _appearances(trial):
-        what = type(looks).__name__
+        what = kind_words(looks)
         chosen = f" ({', '.join(offered[id(looks)])})" if id(looks) in offered else ""
         if isinstance(looks, look.Look):
             for written in (looks.fill, looks.outline):
@@ -4317,29 +5199,67 @@ def _color_set_faults(trial: Trial, params: dict[str, Param], panel: Calibration
     by how much"). A set whose apex the panel cannot show at all is refused where its lights are
     checked (`unrealizable-color`). **On a calibration measured without spectra**, macaque
     luminance is wl-style's model of the sRGB primaries, as on the default: a warning in every
-    kind, as cone colors have there (`cone-colors-without-spectra`)."""
+    kind, as cone colors have there (`cone-colors-without-spectra`).
+
+    **Each light is read at its own saturation** (`ColorSetLight.saturation`; the console settings
+    design's §6): a light whose every saturation is 0 is the set's gray, its apex, whatever its hue,
+    so no chroma of the set is drawn for it and the set's loss of chroma at its luminance is no
+    loss of what it shows -- it adds no `color-set-desaturated` (the pop-out revision's seam, defect
+    1: a fixation point at saturation 0). Its luminance is still held through the set's macaque
+    model, so it is named among the lights `color-set-without-spectra` names.
+
+    **And a light its saturation puts outside the panel's gamut** (COL-39: saturation scales its
+    CAM16-UCS chroma at a fixed hue, a path that is no straight line in xy, so a light between the
+    apex and its color, both shown, need not be one the panel shows): it is moved toward the apex
+    in xy by the least share that brings it inside (`photometry.colorset_xy`), as the set's own
+    colors are, its luminance held, and warned once per set (`color-set-desaturated`, naming the
+    light, its saturation and the share), read at each saturation it can take -- a choice each, a
+    range at `SATURATION_STEPS` steps from end to end, since its ends never need it -- at each
+    luminance it can take, read by its ends."""
+    from wl_xcon.photometry import colorset_xy
+
     sets: list[tuple] = []
+    pulled: dict = {}
     for what, color in _colors(trial, params):
         if not isinstance(color, ColorSetLight):
             continue
         try:
-            at = ([color.colorset.luminance_cd_m2] if color.luminance is None
+            gray = all(v == 0.0 for v in _reach(color.saturation, params))
+        except (_Unbounded, _Unreal):
+            gray = False  # refused where its fields are checked (`_block_faults`)
+        try:
+            at = ([] if gray else [color.colorset.luminance_cd_m2] if color.luminance is None
                   else _reach(color.luminance, params))
         except (_Unbounded, _Unreal):
             at = []  # refused where its fields are checked (`_block_faults`)
-        named = ([color.luminance.name] if isinstance(color.luminance, P) else [])
-        for colorset, whats, values, names in sets:
+        for saturation in ([] if gray else _saturations(color.saturation, params)):
+            for luminance in at:
+                try:
+                    _, share = colorset_xy(ColorSetLight(color.colorset, color.color,
+                                                         luminance=luminance,
+                                                         saturation=saturation), panel)
+                except (ValueError, TypeError, ArithmeticError):
+                    continue  # refused where its lights are checked (`_one_color`)
+                named = f"{what} in {color.color}"
+                most = pulled.setdefault(color.colorset, {}).get(named)
+                if share > 0.0 and (most is None or share > most[0]):
+                    pulled[color.colorset][named] = (share, saturation, luminance)
+        named = ([color.luminance.name] if isinstance(color.luminance, P) and not gray else [])
+        for colorset, whats, values, names, chroma in sets:
             if colorset == color.colorset:
                 if what not in whats:
                     whats.append(what)
                 values += [v for v in at if v not in values]
                 names += [n for n in named if n not in names]
+                chroma.append(not gray)
                 break
         else:
-            sets.append((color.colorset, [what], list(at), named))
+            sets.append((color.colorset, [what], list(at), named, [not gray]))
     findings: list[Finding] = []
     name = panel.id or panel.measured_on
-    for colorset, whats, values, names in sets:
+    for colorset, whats, values, names, chroma in sets:
+        if not any(chroma):
+            continue  # every light of it the set's gray: no chroma of it drawn
         ranged = [float(v) for v in values if _is_number(v) and v > 0.0]
         if names and ranged and len(set(ranged)) > 1:
             findings += _desaturated_range(colorset, panel, sorted(set(ranged)), names, whats)
@@ -4358,20 +5278,61 @@ def _color_set_faults(trial: Trial, params: dict[str, Param], panel: Calibration
                 f"(the pop-out search spec §3.2); shown as "
                 f"{', '.join(f'{c} x={x:.4f}, y={y:.4f}' for c, (x, y) in shown.xy.items())}; "
                 f"asked for by {'; '.join(whats)}"),
-                blocking=False, accepted_in=SESSION_KINDS))
+                blocking=False, accepted_in=SESSION_KINDS,
+                subjects=(f"color set {colorset.name!r}",)))
+    for colorset, lights in pulled.items():
+        if not lights:
+            continue
+        said = "; ".join(
+            f"{what} at saturation {saturation:g} and {luminance:g} cd/m², by {100 * share:.1f}%"
+            for what, (share, saturation, luminance) in lights.items())
+        findings.append(Finding("color-set-desaturated", (
+            f"calibration {name} cannot show some saturations of color set {colorset.name!r}'s "
+            f"lights as asked: a saturation scales a color's CAM16-UCS chroma at its hue, a path "
+            f"that is no straight line in CIE 1931 xy, and at these it leaves the panel's gamut, so "
+            f"each is moved toward the apex ({colorset.apex[0]:.4f}, {colorset.apex[1]:.4f}) in xy "
+            f"by the least share that shows it, its luminance held and none clipped, as the set's "
+            f"own colors are (COL-39), less saturated than asked; the most each gives up of its "
+            f"distance from the apex: {said}"),
+            blocking=False, accepted_in=SESSION_KINDS,
+            subjects=(f"color set {colorset.name!r}",)))
     if sets and not panel.standard and panel.spectra is None:
         findings.append(Finding("color-set-without-spectra", (
             f"calibration {name} was measured without spectra, so this task's color-set lights "
             f"hold their macaque luminance (L + M at L:M 1, CIE 2006 2°) through "
             f"{MACAQUE_WITHOUT_SPECTRA}, whose fit to this panel is unknown: they are equal in "
             f"macaque luminance only nominally; the lights it names: "
-            f"{'; '.join(what for _, whats, _, _ in sets for what in whats)}"),
+            f"{'; '.join(what for _, whats, _, _, _ in sets for what in whats)}"),
             blocking=False, accepted_in=SESSION_KINDS))
     return findings
 
 
 #: How finely `_desaturated_range` finds where a color set starts to lose chroma, in cd/m².
 DESATURATED_STEP = 0.05
+
+#: **The steps a saturation's range is read at for a light its saturation puts outside the gamut**
+#: (`_color_set_faults`): 20, every 0.05 of a range from 0 to 1, its ends included. Its ends never
+#: need it (a saturation of 1 is its color as the set is shown, 0 its apex), so the reading is of
+#: the path between; a light a finer step would catch is still moved inside as it is drawn
+#: (`photometry.colorset_xy`) and written as drawn (`light_xy`), only not warned at load. Live, a
+#: value set is read as itself.
+SATURATION_STEPS = 20
+
+
+def _saturations(value: object, params: dict[str, Param]) -> list[float]:
+    """Each saturation a light's `saturation` is read at for its gamut (`_color_set_faults`): a
+    number as itself, a setting's choices each, a range at `SATURATION_STEPS` steps from its lowest
+    to its highest; none where it cannot be bounded (refused where its fields are checked)."""
+    try:
+        ends = _reach(value, params)
+    except (_Unbounded, _Unreal):
+        return []
+    param = params.get(value.name) if isinstance(value, P) else None
+    if param is None or param.choices or len(ends) != 2:
+        return [float(v) for v in ends if 0.0 <= v <= 1.0]
+    low, high = (float(v) for v in ends)
+    return [v for v in (low + (high - low) * k / SATURATION_STEPS
+                        for k in range(SATURATION_STEPS + 1)) if 0.0 <= v <= 1.0]
 
 
 def _desaturated_range(colorset, panel: Calibration, values: list[float], names: list[str],
@@ -4388,7 +5349,8 @@ def _desaturated_range(colorset, panel: Calibration, values: list[float], names:
     **A range whose upper part the panel cannot show at all, not even the apex** (XC-494; the PI's
     "warnings over refusals"), is a warning too, `color-set-unreachable`, naming the reachable top
     (`reachable_top`): a value above it is refused only where a person sets it live
-    (`taskd.Session._impossible`) or a run starts with it (`unshowable`), never the task. One the
+    (`taskd.Session._impossible`, `unshowable`), never the task, and a run starting above it starts
+    at it, with a warning (`in_reach`; the PI, 2026-11-20). One the
     panel cannot show at any luminance of the range is refused where the lights are checked
     (`_one_color`, `unrealizable-color`). At load, never in a frame; each luminance probed is
     realized uncached (`photometry.realize`)."""
@@ -4411,10 +5373,12 @@ def _desaturated_range(colorset, panel: Calibration, values: list[float], names:
             f"calibration {name} cannot show color set {colorset.name!r} at all above about "
             f"{top:.3g} cd/m² of macaque luminance, of the {low:g} to {high:g} cd/m² setting {by} "
             f"allows, not even its apex ({colorset.apex[0]:.4f}, {colorset.apex[1]:.4f}): this "
-            f"panel's reachable top for it is about {top:.3g} cd/m², and a value above that is "
-            f"refused when a trainer sets it live or a run starts with it; the task runs at any "
-            f"value up to it; asked for by {'; '.join(whats)}"),
-            blocking=False, accepted_in=SESSION_KINDS))
+            f"panel's reachable top for it is about {top:.3g} cd/m², a value above that is "
+            f"refused when a trainer sets it live, and a run starting above it starts at it, with "
+            f"a warning to accept; the task runs at any value up to it; asked for by "
+            f"{'; '.join(whats)}"),
+            blocking=False, accepted_in=SESSION_KINDS,
+            subjects=(f"color set {colorset.name!r}",)))
     shown_high = share(top)
     if not shown_high:
         return findings
@@ -4440,7 +5404,7 @@ def _desaturated_range(colorset, panel: Calibration, values: list[float], names:
         f"at {at} as "
         f"{', '.join(f'{c} x={x:.4f}, y={y:.4f}' for c, (x, y) in shown.xy.items())}; asked for "
         f"by {'; '.join(whats)}"),
-        blocking=False, accepted_in=SESSION_KINDS)]
+        blocking=False, accepted_in=SESSION_KINDS, subjects=(f"color set {colorset.name!r}",))]
 
 
 def reachable_top(colorset, panel: Calibration, low: float, high: float) -> float | None:
@@ -4483,10 +5447,10 @@ def unshowable(task: Task, values: dict, calibration: Calibration | None) -> lis
     unreachable part, `color-set-unreachable`, and only such a value is refused), as `(setting,
     sentence)`, the sentence naming the panel's reachable top for the set (`reachable_top`); empty
     where every one shows, for a task with no color-set light whose luminance is a setting, and
-    with no calibration. One function for a person's live value (`taskd.Session._impossible`,
-    ahead of welfare-listed `Session.set`) and a run's starting values (`preflight.values`,
-    `Session.run`, `wlx run`), as `unpooled` is. Between trials or before a run, never in a
-    frame."""
+    with no calibration. **For a person's live value** (`taskd.Session._impossible`, ahead of
+    welfare-listed `Session.set`); a run's starting value past the top starts at the top instead,
+    with a warning (`in_reach`; the PI, 2026-11-20, "Start at the brightest it can, warn").
+    Between trials or before a run, never in a frame."""
     from wl_xcon.declarations import color_set_lights
 
     if calibration is None:
@@ -4515,6 +5479,84 @@ def unshowable(task: Task, values: dict, calibration: Calibration | None) -> lis
             f"reachable top")))
     return found
 
+
+#: **A run started at the panel's reachable top** (`in_reach`; the PI, 2026-11-20): the code of
+#: the warning that says a starting luminance was brought down to it.
+START_AT_REACHABLE_TOP = "start-at-reachable-top"
+
+
+def in_reach(task: Task, values: dict, calibration: Calibration | None
+                 ) -> tuple[dict, list[Finding], list[tuple[str, str]]]:
+    """**A run's starting luminances brought within the panel's reach** (the PI, 2026-11-20, from
+    his try-out of the page, asked in the UI: "Start at the brightest it can, warn"; his standing
+    "warnings over refusals"; XC-494): for each luminance setting whose value in `values` -- a
+    run's starting values, the task's under the run's -- `calibration` cannot show its color set
+    at, not even the apex, **the value the run starts at instead**, the panel's reachable top for
+    the set (`reachable_top`, searched from the least the setting allows, its declared lowest or
+    `DESATURATED_STEP`; the least over every set the setting lights), and **a warning saying so**,
+    `START_AT_REACHABLE_TOP`, naming the setting, the value asked, the value used and why, which
+    the run's warnings item asks a person to accept (`preflight.warnings`, as the page's start
+    shows it) and `wlx run --accept-warnings` accepts. **Where no value the setting allows shows
+    the set, the run is refused**, as `(setting, sentence)`: no trial could be drawn (XC-494's
+    other side; the load refuses such a task first, `_one_color`, `unrealizable-color`).
+
+    `(used, warnings, refused)`, each empty with no calibration. **One function for the three
+    starts** -- the pre-flight (`service.Service._preflight`, `preflight.values`), `Session.run` and
+    `wlx run` -- so each starts at the same value; the value used is the run's own, recorded as its
+    start. A value set live above the top is still refused (`unshowable`,
+    `taskd.Session._impossible`). Between trials or before a run, never in a frame; each luminance
+    probed is realized uncached."""
+    from wl_xcon.declarations import color_set_lights
+
+    if calibration is None:
+        return {}, [], []
+    declared = {param.name: param for param in task.params}
+    panel = calibration.id or calibration.measured_on
+    tops: dict = {}
+    sets: dict = {}
+    refused: list[tuple[str, str]] = []
+    seen: set = set()
+    for light in color_set_lights(task):
+        if not isinstance(light.luminance, P) or light.luminance.name not in values:
+            continue
+        setting, value = light.luminance.name, values[light.luminance.name]
+        if not (_is_number(value) and math.isfinite(value) and value > 0.0):
+            continue  # no luminance: refused as a value of the wrong kind elsewhere
+        key = (setting, light.colorset.name)
+        if key in seen:
+            continue
+        seen.add(key)
+        asked = float(value)
+        if reachable_top(light.colorset, calibration, asked, asked) is not None:
+            continue  # shown as asked
+        param = declared.get(setting)
+        low = None if param is None else param.low
+        least = float(low) if _finite(low) and low > 0.0 else DESATURATED_STEP
+        top = None if least >= asked else reachable_top(light.colorset, calibration, least, asked)
+        if top is None:
+            refused.append((setting, (
+                f"calibration {panel} cannot show color set {light.colorset.name!r} at {asked:g} "
+                f"cd/m² of macaque luminance, not even its apex, nor at any value from {least:g} "
+                f"cd/m² the setting allows, so no trial could be drawn")))
+            continue
+        if setting not in tops or top < tops[setting]:
+            tops[setting] = top
+        sets.setdefault(setting, []).append(light.colorset.name)
+    for setting, _ in refused:
+        tops.pop(setting, None)
+    warnings = []
+    for setting, top in tops.items():
+        named = sets[setting]
+        asked = float(values[setting])
+        warnings.append(Finding(START_AT_REACHABLE_TOP, (
+            f"setting {setting!r} starts at {top:g} cd/m², not the {asked:g} cd/m² asked: "
+            f"calibration {panel} cannot show color set{'s' if len(named) > 1 else ''} "
+            f"{', '.join(repr(one) for one in named)} at {asked:g} cd/m² of macaque luminance, "
+            f"not even the apex, and {top:g} cd/m² is the brightest it can show "
+            f"{'them' if len(named) > 1 else 'it'} at, its reachable top; the run is recorded at "
+            f"{top:g}, and a value set live above it is refused"), blocking=False,
+            accepted_in=SESSION_KINDS, subjects=tuple(f"color set {one!r}" for one in named)))
+    return tops, warnings, refused
 
 def _spectra_faults(trial: Trial, params: dict[str, Param], panel: Calibration) -> list[Finding]:
     """Cone colors on a measured calibration without spectra, which convert as the default's do
@@ -4569,7 +5611,7 @@ def _modulation_faults(trial: Trial, params: dict[str, Param], panel: Calibratio
         if light is None:
             continue
         kind, _, contrast, mean = light
-        what = type(looks).__name__
+        what = kind_words(looks)
         try:
             contrasts = [c for c in _options(contrast, params) if isinstance(c, (Weber, Michelson))]
             means = [None] if mean is None else _options(mean, params)
@@ -4789,8 +5831,13 @@ def _lights(color, params: dict[str, Param]) -> list:
         # Its luminance as each value it can take, as its fraction (the pop-out search build's
         # fix round): the panel's gamut is convex, so both ends of each range are enough.
         luminances = [None] if color.luminance is None else _reach(color.luminance, params)
-        return [ColorSetLight(color.colorset, color.color, fraction, luminance)
-                for fraction in _reach(color.fraction, params) for luminance in luminances]
+        # And its saturation (the console settings design's §6), each end: a saturation between
+        # that its CAM16-UCS path takes outside the gamut is moved inside as it is drawn
+        # (`photometry.colorset_xy`; COL-39), so none is clipped, and that move is warned where the
+        # set's own are (`_color_set_faults`).
+        return [ColorSetLight(color.colorset, color.color, fraction, luminance, saturation)
+                for fraction in _reach(color.fraction, params) for luminance in luminances
+                for saturation in _reach(color.saturation, params)]
     return [color]
 
 
@@ -5254,7 +6301,7 @@ def _light_faults(trial: Trial) -> list[Finding]:
         except _Unbounded as unbounded:
             unread(f"the trial's {attr.replace('_', ' ')}", unbounded.args[0])
     for looks in _appearances(trial):
-        what = type(looks).__name__
+        what = kind_words(looks)
         # Only an `Outline` has a color to read: one of another kind is `_block_faults`' to
         # refuse, and one written as a parameter is read by no rule yet (XC-273).
         if isinstance(looks, look.Look) and isinstance(looks.outline, look.Outline):
@@ -5572,6 +6619,12 @@ def _block_faults(trial: Trial) -> list[Finding]:
                 kind(f"{name}.luminance", part.luminance, _is_number, "a number")
                 first([(v, f"{said}: a color set's luminance is a number of cd/m² above 0")
                        for v, said in values(part, "luminance")], lambda v: v <= 0.0)
+            # Its saturation, a fraction of the way from the set's apex to its color, 0 to 1 (the
+            # console settings design's §6): hard at both ends, as a fraction is.
+            kind(f"{name}.saturation", part.saturation, _is_number, "a number")
+            first([(v, f"{said}: a saturation is a fraction of the way from the set's apex, "
+                    f"0 to 1") for v, said in values(part, "saturation")],
+                  lambda v: not 0.0 <= v <= 1.0)
         if isinstance(part, xyY):
             for attr in ("x", "y", "Y"):
                 # Bounded here; whether the panel makes each value is `_color_faults`' test.
@@ -6414,7 +7467,10 @@ def answer_reaches(trial: Trial, params: dict[str, Param]) -> list[tuple[str, st
                 apart = separation_deg(*window.at, *at)
                 widest = _span(window.radius, params, 0.0)[1]
                 ring_low, ring_high = _span(array.radius, params, 0.0)
-                reach = _span(objects[name].radius, params, 0.0)[1]
+                reached = _window_reach(objects[name], array, params)
+                if reached is None:
+                    continue  # refused at load (XC-426, `unsized-window`)
+                reach = reached[1]
                 nearest = (0.0 if ring_low <= apart <= ring_high
                            else min(abs(ring_low - apart), abs(ring_high - apart)))
                 if not nearest < widest + reach:
@@ -6468,7 +7524,8 @@ def _crowded_arrays(trial: Trial) -> list[Finding]:
     settings crowd it. A set size sent past its range that draws the objects on one another,
     windows or none, is refused (`_overlapping_objects`). **Every array a `Show` or an `Update`
     gives the family's stimulus** (`_shown_arrays`): since XC-402 the windows follow an `Update`
-    that changes the array (the XC-402 review, I1).
+    that changes the array (the XC-402 review, I1). **A place left empty** (a `Blank` among its
+    looks) is no object, as a `Blank` stimulus is none (`_neighbors`).
     """
     params = {p.name: p for p in trial.params}
     findings: list[Finding] = []
@@ -6489,12 +7546,13 @@ def _crowded(declared: ObjectWindows, array: Array, params: dict[str, Param]) ->
     """`crowded-array` for one array of a family, or nothing (`_crowded_arrays`). The windows'
     radius is read as a window's (`_radius`): a choice that is no finite number left out, and
     nothing said where there is none to read, each refused at load (XC-426)."""
-    widest = _radius(declared.radius, params)
+    reach = _window_reach(declared, array, params)
+    widest = None if reach is None else reach[1]
     if widest is None or not (_counted(array.n) and _counted(array.radius)):
         return []  # refused at load (XC-426; `_block_faults`, XC-273)
     most = _whole(_span(array.n, params, 0.0)[1])
     tightest = _span(array.radius, params, 0.0)[0]
-    if most < 2:
+    if most < 2 or not _neighbors(array, most):
         return []
     spacing = ring_spacing_deg(tightest, most)
     if spacing >= 2.0 * widest:
@@ -6504,15 +7562,281 @@ def _crowded(declared: ObjectWindows, array: Array, params: dict[str, Param]) ->
     return [
         Finding(
             "crowded-array",
-            f"array {declared.of!r} can put {objects} objects on a "
-            f"{tightest:g}° ring, {spacing:.2f}° apart, with windows "
-            f"{windows} radius; adjacent objects would overlap and a "
+            f"array {declared.of!r} can put {objects} objects{_by(array.n)} on a "
+            f"{tightest:g}° ring{_by(array.radius)}, {spacing:.2f}° apart, with windows "
+            f"{windows} radius{_by(_window_setting(declared))}; adjacent objects would overlap and a "
             f"saccade to one would be scored against another",
             blocking=False,
             accepted_in=SESSION_KINDS,
             subjects=(f"array {declared.of!r}",),
         )
     ]
+
+
+def _by(value: object) -> str:
+    """The setting a number of a finding comes from, as " ('set_size')", or "" for a literal: so a
+    layout warning names each setting with its value (the console settings plan's Review Focus 3:
+    "a warning naming the pair and both values")."""
+    return f" ({value.name!r})" if isinstance(value, P) else ""
+
+
+def _window_setting(declared: ObjectWindows) -> object:
+    """What sizes an array's object windows, as declared: their `radius` in degrees, or their
+    `scale`, a multiple of each object's radius (`ObjectWindows`)."""
+    return declared.radius if declared.scale is None else declared.scale
+
+
+def _window_reach(declared: ObjectWindows, array: Array,
+                  params: dict[str, Param]) -> "tuple[float, float] | None":
+    """**An array's object windows' least and greatest radius, in degrees**, over the settings'
+    ranges or at the values set: a radius in degrees as `_span` reads it, its greatest as `_radius`
+    does (a choice that is no finite number left out, XC-426); **a ratio of each object's radius**
+    (`ObjectWindows.scale`; the console settings design's §5), the ratio at its least and its most
+    times half the narrowest and the widest object the array can show (`_narrowest`, `_widest`;
+    STE-05). `None` where nothing can be read, a literal that is no number or no object's width
+    (refused at load: `bad-placement`, `unsized-window`)."""
+    if declared.scale is None:
+        if not (isinstance(declared.radius, P) or _finite(declared.radius)):
+            return None
+        most = _radius(declared.radius, params)
+        return None if most is None else (_span(declared.radius, params, 0.0)[0], most)
+    if not (isinstance(declared.scale, P) or _finite(declared.scale)):
+        return None
+    low, high = _span(declared.scale, params, 0.0)
+    widest = [one[0] for one in (_widest(array.looks, params), _widest(array.among, params))
+              if one is not None]
+    if not widest:
+        return None
+    narrowest = min(_narrowest(array.looks, params), _narrowest(array.among, params))
+    least = low * narrowest / 2.0 if math.isfinite(narrowest) else 0.0
+    return (least, high * max(widest) / 2.0)
+
+
+#: **A window of no size** (`_sizeless_windows`): a gaze window's radius, or an array's object
+#: windows' radius or scale, at or below 0.
+WINDOW_RADIUS = "bad-window-radius"
+
+
+def _sizeless_windows(trial: Trial) -> list[Finding]:
+    """**`bad-window-radius`: a gaze window's radius, or an array's object windows' radius or
+    scale, that can be 0 or below** (the console settings build's whole-build review, I1; the
+    console settings design's §4: "a size or a time below zero" is what cannot be, and a window of
+    no size is none either), refused in every kind: no gaze is inside a window of radius 0 or
+    less (`gaze.Tracked.in_window` compares the gaze's separation with it), so every trial after
+    it ends with no fixation or no answer, and the animal works unrewarded until someone notices.
+    Read as a size is read for `bad-block`: a literal, each choice of a setting, a declared lowest
+    (`Param.low`). **A side left open is read at the setting's start at load and at the value set
+    on every change** (`_at_start`, `at_values`), so `laid_out`'s new-refusal rule refuses a 0 or
+    a -2 typed live, and `preflight.laid_out` one a run starts with. A value that is no finite
+    number is `bad-placement`'s (`_position_kind_faults`, XC-426); nothing here raises on it."""
+    params = {p.name: p for p in trial.params}
+    findings: list[Finding] = []
+
+    def least(value: object) -> "float | None":
+        if not isinstance(value, P):
+            return float(value) if _finite(value) and value <= 0.0 else None
+        param = params.get(value.name)
+        if param is None:
+            return None  # refused as undeclared (`_undeclared_parameters`)
+        if param.choices:
+            below = [float(c) for c in param.choices if _finite(c) and c <= 0.0]
+            return min(below) if below else None
+        return float(param.low) if _finite(param.low) and param.low <= 0.0 else None
+
+    for window in trial.windows:
+        if isinstance(window, Window):
+            subject, what, value = f"window {window.name!r}", "its radius", window.radius
+            unit, fix = "°", "a radius above 0"
+        elif isinstance(window, ObjectWindows):
+            subject = f"the object windows of {window.of!r}"
+            value = _window_setting(window)
+            what, unit, fix = (("their radius", "°", "a radius above 0") if window.scale is None
+                               else ("their scale", " times each object's radius",
+                                     "a scale above 0"))
+        else:
+            continue
+        found = least(value)
+        if found is None:
+            continue
+        said = (f"can be {found:g}{unit} ({value.name!r})" if isinstance(value, P)
+                else f"is {found:g}{unit}")
+        give = f"give {value.name!r} {fix}" if isinstance(value, P) else f"give it {fix}"
+        findings.append(Finding(WINDOW_RADIUS, (
+            f"{subject}: {what} {said}, and a window of no size holds no gaze, so every trial "
+            f"would end with no fixation or no answer; {give}"), subjects=(subject,)))
+    return findings
+
+
+def _unsized_windows(trial: Trial) -> list[Finding]:
+    """**`unsized-window`: object windows by `scale` on an array whose looks have no single size**
+    (`ObjectWindows.scale`; the console settings design's §5), refused at load: a window that is a
+    multiple of its object's radius needs a `Disc`, a `Square`, a `Cross` or a `Polygon`
+    (`task.SIZED_LOOKS`) for every object, each of an array's two looks and each choice of a look
+    setting, so a look with no `size` -- a `Gabor`, a `Look`, a `Blank` -- names no radius."""
+    params = {p.name: p for p in trial.params}
+    findings: list[Finding] = []
+
+    def unsized(looks: object, inside: frozenset = frozenset()) -> list[str]:
+        if isinstance(looks, P):
+            param = params.get(looks.name)
+            if param is None or looks.name in inside:
+                return []
+            return [one for choice in param.choices
+                    for one in unsized(choice, inside | {looks.name})]
+        return [] if isinstance(looks, SIZED_LOOKS) else [type(looks).__name__]
+
+    for declared in trial.windows:
+        if not isinstance(declared, ObjectWindows) or declared.scale is None:
+            continue
+        for name, array in _shown_arrays(trial):
+            if name != declared.of:
+                continue
+            kinds = list(dict.fromkeys(unsized(array.looks) + unsized(array.among)))
+            if not kinds:
+                continue
+            finding = Finding(UNSIZED_WINDOW, (
+                f"the object windows of {declared.of!r} are a multiple of each object's radius "
+                f"(scale), and array {name!r} can draw an object as {', '.join(kinds)}, which has "
+                f"no single size, so its window has no radius; draw every object as a Disc, a "
+                f"Square, a Cross or a Polygon, or give the windows a radius in degrees"),
+                subjects=(f"array {name!r}",))
+            if not _among(finding, findings):
+                findings.append(finding)
+    return findings
+
+
+def _widest(looks: object, params: dict[str, Param],
+            inside: frozenset[str] = frozenset()) -> "tuple[float, object] | None":
+    """**The greatest full width, in degrees, an array's object can be drawn at**, with what gives
+    it (a setting, or the literal): over each appearance `looks` can be -- each choice of a
+    parameter -- the widest of the full widths it declares (`_SIZES`; a `Look`'s are its
+    shape's), each at the most its setting allows (`_span`). `None` where nothing declares a
+    width this check can read, or one can be any size: nothing is judged there. `_narrowest`'s
+    other end, for the two layout warnings that ask how large an object is
+    (`_windows_inside_objects`, `_objects_touch`)."""
+    from wl_xcon import look
+
+    if isinstance(looks, P):
+        param = params.get(looks.name)
+        if param is None or looks.name in inside or not param.choices:
+            return None
+        found = [_widest(choice, params, inside | {looks.name}) for choice in param.choices]
+        found = [one for one in found if one is not None]
+        return max(found, key=lambda one: one[0]) if found else None
+    if isinstance(looks, look.Look):
+        return _widest(looks.shape, params, inside)
+    if not dataclasses.is_dataclass(looks):
+        return None
+    widths = [getattr(looks, f.name) for f in dataclasses.fields(looks) if f.name in _SIZES]
+    found = [(_span(width, params, 0.0)[1], width) for width in widths
+             if isinstance(width, P) or _finite(width)]
+    found = [one for one in found if math.isfinite(one[0])]
+    return max(found, key=lambda one: one[0]) if found else None
+
+
+def _windows_inside_objects(trial: Trial) -> list[Finding]:
+    """**`window-inside-object`: an array's object window smaller than its object** (the console
+    settings design's §4: "a window smaller than its disc"), a warning in every kind: over the
+    settings' ranges, or at the values set (`laid_out`), the windows' radius at its least below
+    the largest object's half-width at its most, so a look landing on an object's edge is outside
+    its window and scored as no answer. **A window declared as a ratio of its object's radius**
+    (`ObjectWindows.scale`; the console settings design's §5: "a ratio below 1 is a warning")
+    is smaller than its object wherever the ratio can be below 1, whatever the object's size."""
+    params = {p.name: p for p in trial.params}
+    findings: list[Finding] = []
+    for declared in trial.windows:
+        if not isinstance(declared, ObjectWindows):
+            continue
+        if declared.scale is not None:
+            if not (isinstance(declared.scale, P) or _finite(declared.scale)):
+                continue  # refused at load (`_position_kind_faults`)
+            ratio = _span(declared.scale, params, 0.0)[0]
+            if not ratio < 1.0:
+                continue
+            for name, array in _shown_arrays(trial):
+                if name != declared.of:
+                    continue
+                finding = Finding("window-inside-object", (
+                    f"array {name!r}'s object windows can be {ratio:g} times its objects' radius"
+                    f"{_by(declared.scale)}, a ratio below 1, smaller than its objects: a look "
+                    f"landing on an object's edge is outside its window, and scored as no answer; "
+                    f"keep the ratio at least 1"), blocking=False, accepted_in=SESSION_KINDS,
+                    subjects=(f"array {name!r}",))
+                if not _among(finding, findings):
+                    findings.append(finding)
+            continue
+        if not (isinstance(declared.radius, P) or _finite(declared.radius)):
+            continue  # refused at load (XC-426)
+        least = _span(declared.radius, params, 0.0)[0]
+        for name, array in _shown_arrays(trial):
+            if name != declared.of:
+                continue
+            sizes = [one for one in (_widest(array.looks, params), _widest(array.among, params))
+                     if one is not None]
+            if not sizes:
+                continue
+            width, given = max(sizes, key=lambda one: one[0])
+            if not least < width / 2.0:
+                continue
+            finding = Finding("window-inside-object", (
+                f"array {name!r}'s object windows can be {least:g}° in radius"
+                f"{_by(declared.radius)}, smaller than its objects, up to {width:g}° across"
+                f"{_by(given)}, {width / 2.0:g}° in radius: a look landing on an object's edge is "
+                f"outside its window, and scored as no answer; keep each window's radius at least "
+                f"its object's"), blocking=False, accepted_in=SESSION_KINDS,
+                subjects=(f"array {name!r}",))
+            if not _among(finding, findings):
+                findings.append(finding)
+    return findings
+
+
+def _objects_touch(trial: Trial) -> list[Finding]:
+    """**`objects-touch`: two of an array's objects closer center to center than their sizes'
+    mean** (the console settings design's §4: "discs touching"), a warning in every kind: the most
+    objects on the smallest ring (`geometry.ring_spacing_deg`, the PI's true circle, 2026-10-19),
+    over the settings' ranges or at the values set (`laid_out`), against the largest mean of two
+    neighbors' widths -- a target's and a distractor's, or two distractors' where there are three
+    objects or more -- so they touch or overlap on the screen, whatever their windows. A set size
+    far past where they are drawn on one another was refused as past its highest
+    (`_overlapping_objects`); every limit that stays is hard since §4, so no open range reaches
+    that refusal, and touching is said here. **A place left empty** (a `Blank` among its looks) is
+    no object (`_neighbors`): with the odd one's empty, distractors neighbor distractors alone."""
+    params = {p.name: p for p in trial.params}
+    findings: list[Finding] = []
+    for name, array in _shown_arrays(trial):
+        if not (_counted(array.n) and _counted(array.radius)):
+            continue  # refused at load (XC-273)
+        most = _whole(_span(array.n, params, 0.0)[1])
+        # The ring at its least, its distance from 0, each choice a point (`_intervals`), as
+        # `_overlapping_objects` reads it (the final re-review's m1).
+        ring = min(0.0 if low <= 0.0 <= high else min(abs(low), abs(high))
+                   for low, high in _intervals(array.radius, params, 0.0))
+        if not (math.isfinite(most) and most >= 2) or not _neighbors(array, most):
+            continue
+        among = _widest(array.among, params)
+        if _drawn_target(array):
+            target = _widest(array.looks, params)
+            if target is None or among is None:
+                continue
+            mean = (target[0] + among[0]) / 2.0
+            if most >= 3:
+                mean = max(mean, among[0])
+            given = _by(among[1]) or _by(target[1])
+        else:  # the odd one's place empty: distractors neighbor distractors alone
+            if among is None:
+                continue
+            mean, given = among[0], _by(among[1])
+        spacing = ring_spacing_deg(ring, most)
+        if spacing >= mean:
+            continue
+        finding = Finding("objects-touch", (
+            f"array {name!r} can put {int(most)} objects{_by(array.n)} on a {ring:g}° ring"
+            f"{_by(array.radius)}, {spacing:.2f}° apart center to center, closer than their sizes' "
+            f"mean ({mean:g}°{given}), so neighbors touch or overlap on the screen"),
+            blocking=False, accepted_in=SESSION_KINDS, subjects=(f"array {name!r}",))
+        if not _among(finding, findings):
+            findings.append(finding)
+    return findings
 
 
 def _overlapping_objects(trial: Trial, raised: dict[str, float]) -> list[Finding]:
@@ -6537,19 +7861,21 @@ def _overlapping_objects(trial: Trial, raised: dict[str, float]) -> list[Finding
     object the array can show, so that the objects are drawn on one another on the tightest ring
     whatever else the console sets (`_narrowest`). The sentence names the fix, the most that ring
     keeps apart (`_most_apart`). A set size sent below its lowest draws fewer objects, further
-    apart, and is never refused here."""
+    apart, and is never refused here. **A place left empty** (a `Blank` among its looks) is no
+    object (`_neighbors`), so its size is not the smallest object's."""
     params = {p.name: p for p in trial.params}
     findings: list[Finding] = []
     for name, array in _shown_arrays(trial):
         if not (isinstance(array.n, P) and array.n.name in raised) or not _counted(array.radius):
             continue  # a ring radius of the wrong kind is refused at load (XC-273)
         n = _whole(raised[array.n.name])
-        if n < 2:
+        if n < 2 or not _neighbors(array, n):
             continue
         ring = min(0.0 if low <= 0.0 <= high else min(abs(low), abs(high))
                    for low, high in _intervals(array.radius, params, 0.0))
         spacing = ring_spacing_deg(ring, n)
-        size = min(_narrowest(array.looks, params), _narrowest(array.among, params))
+        size = min(_narrowest(array.looks, params) if _drawn_target(array) else math.inf,
+                   _narrowest(array.among, params))
         if spacing >= size:
             continue
         most = _most_apart(ring, size)
@@ -6568,6 +7894,23 @@ def _overlapping_objects(trial: Trial, raised: dict[str, float]) -> list[Finding
             f"size only adds work, and far past it the run stalls there, a stop, a pause and the "
             f"out-of-cage limit unheard until it is built")))
     return findings
+
+
+def _drawn_target(array: Array) -> bool:
+    """Whether an array's target's place draws an object: not where its look is a `Blank`, a place
+    left empty (the odd one's, on a catch; the pop-out revision design's §4)."""
+    return not isinstance(array.looks, Blank)
+
+
+def _neighbors(array: Array, most: float) -> bool:
+    """**Whether an array of at most `most` objects draws two side by side** (`objects-touch`,
+    `crowded-array`, `overlapping-objects`), **a place left empty being no object**, as a `Blank`
+    stimulus is none: its distractors' look a `Blank`, only its target is drawn; its target's, its
+    distractors neighbor one another only where there are three places or more. Neither empty, any
+    two places neighbor."""
+    if isinstance(array.among, Blank):
+        return False
+    return _drawn_target(array) or most >= 3
 
 
 def _most_apart(ring: float, size: float) -> int:
@@ -6917,8 +8260,10 @@ def _sized(trial: Trial) -> "list[_Sized]":
             found.append(_Sized(f"window {window.name!r}", "its", "radius", window.radius,
                                 f"window {window.name!r}", _SIZED))
         elif isinstance(window, ObjectWindows):
-            found.append(_Sized(f"the object windows of {window.of!r}", "their", "radius",
-                                window.radius, f"the object windows of {window.of!r}", _SIZED))
+            found.append(_Sized(f"the object windows of {window.of!r}", "their",
+                                "radius" if window.scale is None else "scale",
+                                _window_setting(window), f"the object windows of {window.of!r}",
+                                _SIZED))
     for state, name, updated, array in array_actions(trial):
         how = "updates" if updated else "shows"
         for field, what in (("n", "set size"), ("radius", "ring radius"), ("phase", "phase"),
@@ -7131,11 +8476,12 @@ def _position_kind_faults(trial: Trial) -> list[Finding]:
     # An array's object windows' literal radius, as a window's is above (XC-426): `_crowded`
     # raised on a word.
     for window in trial.windows:
-        if (isinstance(window, ObjectWindows) and not isinstance(window.radius, P)
-                and not _finite(window.radius)):
+        if (isinstance(window, ObjectWindows) and not isinstance(_window_setting(window), P)
+                and not _finite(_window_setting(window))):
+            what = ("radius", "degrees") if window.scale is None else ("scale", "times its objects' radius")
             findings.append(Finding("bad-placement", (
-                f"the object windows of {window.of!r}: their radius is {_said(window.radius)}, "
-                f"which is not a finite number of degrees")))
+                f"the object windows of {window.of!r}: their {what[0]} is "
+                f"{_said(_window_setting(window))}, which is not a finite number of {what[1]}")))
     # A window's radius and an array's set size, ring radius, phase and target index: `None` among
     # a setting's choices (the review of XC-415's fix, M2). **A window's radius, or its object
     # windows', placed by a setting with a choice that is no finite number** (XC-426), as a literal

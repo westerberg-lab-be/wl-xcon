@@ -45,7 +45,7 @@ from wl_xcon import screen as screens  # noqa: E402
 from wl_xcon.findings import SESSION_KINDS  # noqa: E402
 from wl_xcon.link import (  # noqa: E402
     SCHEMA, BackBlock, CheckRun, ClearOwed, Decline, Drawn, Drum, ManualReward, NextBlock,
-    OpenSession, Pause, Pooled, PoolRow, Preflight, PreflightItem, SetParameter, StageRow,
+    OpenSession, Pause, Pooled, PoolRow, Preflight, PreflightItem, SetParameter, Shaping, StageRow,
     StaircaseRow, StartRun, Suggestion, Training, WarningRow,
 )
 from wl_xcon.photometry import SRGB, Gray  # noqa: E402
@@ -96,6 +96,83 @@ class _Dispatch:
         return 200, {"status": "sent", "said": "sent: test"}
 
 
+#: **A box acted on through a selector is opened in its tab's editor first** (`_Opening`; the
+#: summary and editor design of 2026-11-19): the setting's summary line clicked, as a person does,
+#: by the line's own `click()`, so no pointer press holds a frame the test is timing. The box the
+#: selector's first match stands in; nothing where it is open already, stands in none, or is not
+#: there yet (an action waits for it, as Playwright's would, up to `WAIT_S`). A pinned copy in
+#: Runtime's editor is opened by its pinned line, as a person opens it (the build's Task 3).
+_OPEN_ITS_BOX = """(selector) => {
+  let node = null;
+  try { node = document.querySelector(selector); } catch (e) { return "not css"; }
+  if (!node) { return "none"; }
+  const box = node.closest("#params > .editing > .box, #training-params > .editing > .box, " +
+    "#pinned-editing > .box[data-pin]");
+  if (!box || !box.hidden) { return "shown"; }
+  const name = box.getAttribute("data-card") || box.getAttribute("data-pin");
+  const line = Array.from(box.parentNode.parentNode.querySelectorAll(
+    ":scope > .summary .line[data-open]")).find((one) => one.getAttribute("data-open") === name);
+  if (!line) { return "no line"; }
+  line.click();
+  return box.hidden ? "still hidden" : "opened";
+}"""
+
+
+class _Opening:
+    """**A Playwright page whose actions on a setting's box open it first** (the summary and
+    editor design of 2026-11-19: every box stays as it was, in an editor that shows the one
+    opened): a click, a fill, a key, a focus, a hover, a tick, a visibility read or a wait for a
+    box to be shown, given a selector whose first match stands in a box of `#params`' or
+    `#training-params`' editor, clicks that box's summary line first (`_OPEN_ITS_BOX`), so every test of a box's behavior reads as it did
+    on the grid and goes through the line a person uses. Everything else is the page's own."""
+
+    _ACTS = frozenset({"click", "dblclick", "fill", "press", "focus", "check", "uncheck", "hover",
+                       "type", "select_option", "set_checked", "tap", "is_visible",
+                       "wait_for_selector"})
+    _WAITS = frozenset({"click", "dblclick", "fill", "press", "focus", "check", "uncheck", "hover",
+                        "type", "select_option", "set_checked", "tap", "wait_for_selector"})
+
+    def __init__(self, page) -> None:
+        object.__setattr__(self, "_page", page)
+
+    #: What a document going away under `_OPEN_ITS_BOX` says (WebKit's and Chromium's words): a
+    #: page navigating -- a reload the test waits through, as XC-227's does -- has no box to open
+    #: yet, so it is "none", and the wait goes on in the next document.
+    _GONE = ("Execution context was destroyed", "Cannot find context with specified id",
+             "Frame was detached", "Target closed")
+
+    def _opening(self, selector: str) -> str:
+        """`_OPEN_ITS_BOX` on `selector`, a navigation under it read as nothing there yet (the
+        summary and editor build's Task 3: the WebKit sign-in reload flake's first cause, this
+        poll's `evaluate` landing in a document the reload was tearing down)."""
+        from playwright.sync_api import Error
+
+        try:
+            return self._page.evaluate(_OPEN_ITS_BOX, selector)
+        except Error as error:
+            if any(said in str(error) for said in self._GONE):
+                return "none"
+            raise
+
+    def __setattr__(self, name, value) -> None:
+        setattr(self._page, name, value)
+
+    def __getattr__(self, name):
+        attr = getattr(self._page, name)
+        if name not in self._ACTS or not callable(attr):
+            return attr
+
+        def acting(selector, *args, **kwargs):
+            if isinstance(selector, str) and kwargs.get("state", "visible") == "visible":
+                waits = kwargs.get("timeout", WAIT_S * 1000) / 1000 if name in self._WAITS else 0
+                end = time.monotonic() + waits
+                while self._opening(selector) == "none" and time.monotonic() < end:
+                    self._page.wait_for_timeout(50)
+            return attr(selector, *args, **kwargs)
+
+        return acting
+
+
 class _Rig:
     def __init__(self, tmp_path, browser, *, keys: bool = True, gaze: bool = False) -> None:
         self._browser = browser
@@ -144,7 +221,7 @@ class _Rig:
         """A Playwright page, in a context of its own, already at the rig's page."""
         context = self._browser.new_context(ignore_https_errors=True)
         self._contexts.append(context)
-        page = context.new_page()
+        page = _Opening(context.new_page())
         page.set_default_timeout(WAIT_S * 1000)
         page.goto(self.page_url)
         assert page.evaluate("window.isSecureContext"), "the page is not a secure context"
@@ -244,6 +321,18 @@ def _until(page, expression: str, seconds: float = WAIT_S) -> None:
             return
         page.wait_for_timeout(50)  # lets Playwright answer the page's routed requests meanwhile
     pytest.fail(f"timed out after {seconds:g} s waiting for {expression}")
+
+
+def _more(page, root: str = "#params") -> None:
+    """**Open every box's *more* in `root`** as a person does, by its summary (the console
+    interface rework's Task 5: *hand back*, a draw's live numbers and *change the range* sit in a
+    box's *more*); the page keeps each open across the frames that replace the boxes."""
+    names = page.eval_on_selector_all(
+        f"{root} .box", "boxes => boxes.map((box) => box.getAttribute('data-card'))")
+    for name in names:
+        page.click(f'{root} .box[data-card="{name}"] > details.more > summary')
+        page.wait_for_selector(f'{root} .box[data-card="{name}"] > details.more[open]',
+                               state="attached")
 
 
 def _pauses(rig) -> list:
@@ -876,7 +965,7 @@ def test_a_duplicated_tab_forgets_its_copy_and_the_first_tab_keeps_working(rig):
     first = rig.browser_page()
     _sign_in(first)
     copied = first.evaluate("window.sessionStorage.getItem('wlx-signin')")  # never asserted on
-    second = first.context.new_page()  # a tab of the same browser
+    second = _Opening(first.context.new_page())  # a tab of the same browser
     second.set_default_timeout(WAIT_S * 1000)
     second.add_init_script(f"window.sessionStorage.setItem('wlx-signin', {json.dumps(copied)});")
     second.add_init_script(_SIGNOUTS)
@@ -904,7 +993,7 @@ def test_a_duplicate_is_inert_while_it_waits_for_the_lock_and_never_signs_out_th
     first = rig.browser_page()
     _sign_in(first)
     copied = first.evaluate("window.sessionStorage.getItem('wlx-signin')")  # never asserted on
-    second = first.context.new_page()
+    second = _Opening(first.context.new_page())
     second.set_default_timeout(WAIT_S * 1000)
     second.add_init_script(f"window.sessionStorage.setItem('wlx-signin', {json.dumps(copied)});")
     second.add_init_script(_SIGNOUTS)
@@ -927,7 +1016,7 @@ def test_a_duplicate_woken_during_its_wait_never_renews_with_the_originals_token
     first = rig.browser_page()
     _sign_in(first)
     copied = first.evaluate("window.sessionStorage.getItem('wlx-signin')")  # never asserted on
-    second = first.context.new_page()
+    second = _Opening(first.context.new_page())
     second.set_default_timeout(WAIT_S * 1000)
     second.add_init_script(f"window.sessionStorage.setItem('wlx-signin', {json.dumps(copied)});")
     second.goto(rig.page_url)
@@ -967,7 +1056,13 @@ def test_a_page_made_before_the_rig_had_keys_reloads_into_the_sign_in_once_it_ha
     assert len(loads) == 0  # asking again is not reloading
     rig.checker.load()  # what the keys thread does once wl.works answers
     page.wait_for_selector("#signin")
-    assert len(loads) == 1
+    # The sign-in is in the new document before its `load` (it waits on the fonts): Playwright
+    # delivers the event only while it is called, so it is waited for, with a deadline (the
+    # summary and editor build's Task 3: the flake's second cause, `readyState` "interactive").
+    end = time.monotonic() + WAIT_S
+    while not loads and time.monotonic() < end:
+        page.wait_for_timeout(50)
+    assert len(loads) == 1, f"the page reloaded {len(loads)} times into the sign-in, not once"
     _sign_in(page)
     page.click(PAUSE)
     rig.wait_for(lambda: _pauses(rig))
@@ -1366,7 +1461,7 @@ def test_the_page_shows_a_settings_position_eccentricity_and_direction_first(rig
     page = rig.browser_page()
 
     page.locator("#params", has_text="27.236° at 45°").wait_for(state="attached")
-    card = page.locator("#params .param").first
+    card = page.locator("#params .box").first
     text = card.text_content()
 
     assert "target_pos" in text and "27.236° at 45° · (x, y) (20, 20)" in text
@@ -1389,7 +1484,8 @@ def test_the_page_keeps_its_controls_while_a_setting_holds_no_number_or_word(rig
 
     page.locator("#params", has_text="[0.3, 0.6]").wait_for(state="attached")
 
-    assert page.locator("#params .param").first.locator("input").count() == 0
+    assert page.locator("#params .box").count() == 1
+    assert page.locator("#params .box").first.locator("input").count() == 0
     for command in ("pause", "mark", "reward", "stop"):
         assert page.locator(f'#controls [data-cmd="{command}"]').count() == 1, command
 
@@ -1759,6 +1855,9 @@ def test_a_suggestion_is_answered_from_the_trainers_panel(rig):
     rig.hub.offer(frame(**_TRAINING))
     page = rig.browser_page()
     _sign_in(page)
+    # The trainer's panel is the Training tab's since the console settings build's Task 10 (its
+    # design's §8).
+    page.click('label[for="t-training"]')
 
     page.click('#rt-train [data-cmd="confirm"]')
     rig.wait_for(lambda: len(rig.dispatch.seen) == 1)
@@ -1790,6 +1889,33 @@ def test_a_suggestion_is_answered_from_the_trainers_panel(rig):
     assert kept is True
     assert (type(widened), widened.name, widened.value) == (SetParameter, "pairings", 13)
     assert (type(back), back.suggestion) == (BackBlock, 9)
+
+
+def test_freezing_from_the_training_tab_sends_shaping(rig):
+    """**The training switch, from its own tab** (the console settings design's §8; the PI,
+    2026-11-16: "a whole different tab ... easily toggleable"): the Runtime tab's one line names the
+    switch and opens the Training tab; there *frozen* sends `shaping` `frozen` as the member signed
+    in, staged to the next trial; and once the rig says it is frozen the switch shows it pressed,
+    *full task* grayed where the plan declares none. Run in Chromium, and in WebKit
+    (`WLX_BROWSER=webkit`), the engine of the PI's Safari."""
+    rig.hub.offer(frame(**_TRAINING, shaping="on", full_task=True))
+    page = rig.browser_page()
+    _sign_in(page)
+
+    page.locator("#rt-shaping", has_text="training on · stage Fade-in").wait_for()
+    page.click('#rt-shaping label[for="t-training"]')
+    opened = page.is_checked("#t-training")
+    page.click('#shaping [data-cmd="shaping"][data-position="frozen"]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 1)
+    rig.hub.offer(frame(**_TRAINING, shaping="frozen", full_task=False))
+    page.locator('#shaping [data-position="frozen"][aria-pressed="true"]').wait_for()
+    page.locator('#shaping [data-position="full"][disabled]').wait_for(state="attached")
+    page.locator("#rt-shaping", has_text="training frozen").wait_for(state="attached")
+
+    (switched,) = rig.dispatch.seen
+    assert opened is True
+    assert (type(switched), switched.position, switched.by.name) == (
+        Shaping, "frozen", "Jake Westerberg")
 
 
 def test_the_pairings_are_picked_by_their_colors_names_at_the_start_and_on_the_panel(rig):
@@ -1826,7 +1952,8 @@ def test_the_pairings_are_picked_by_their_colors_names_at_the_start_and_on_the_p
     rig.wait_for(lambda: any(isinstance(seen, StartRun) for seen in rig.dispatch.seen))
     rig.hub.offer(frame(**{**_TRAINING, "suggestion": None,
                            "pool": Pooled("pairings", names, 3)}))
-    page.click('label[for="t-runtime"]')
+    # The trainer's panel is the Training tab's since the console settings build's Task 10.
+    page.click('label[for="t-training"]')
     page.locator("#rt-train", has_text="pairings on blue among red, red among blue").wait_for()
     page.get_by_label("add pairing purple among red", exact=True).check()
     page.click('#rt-train [data-cmd="widen"]')
@@ -1855,7 +1982,7 @@ class _BoxRig:
         self._context = browser.new_context()
         self._context.add_init_script(
             "window.localStorage.setItem('wlx-console-name', 'Box Op')")
-        self.page = self._context.new_page()
+        self.page = _Opening(self._context.new_page())
         self.page.set_default_timeout(WAIT_S * 1000)
         self.url = f"http://127.0.0.1:{port}/"
 
@@ -2027,9 +2154,10 @@ def test_a_next_block_the_rig_may_still_apply_says_so(rig):
 def test_hand_back_a_range_and_revert_send_their_bodies(rig):
     """Engine build C3 (the PI, 2026-10-30, Q7a: "Yes, a 'hand back' button"; Q7b: "Yes, range
     changes live"; TSK-43, "Yes, with revert"): *hand back* on a card a person holds sends its
-    setting's name, *change the range* the numbers of the card's draw a person changed, by name,
-    and *revert to this* its moment's change id, each reaching the rig as the signed-in member's.
-    Through the wire, in a real browser."""
+    setting's name, the box's Apply the numbers of the card's draw a person changed, by name, and
+    *revert to this* its moment's change id, each reaching the rig as the signed-in member's.
+    Rewritten for the console interface rework's Task 6: *change the range* is gone, the box's
+    Apply its one send. Through the wire, in a real browser."""
     from wl_xcon.link import HandBack, MomentRow, ParamRow, Revert, SetRange, decode, encode
 
     rows = (
@@ -2043,11 +2171,12 @@ def test_hand_back_a_range_and_revert_send_their_bodies(rig):
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
 
     page.click('[data-cmd="hand_back"][data-name="fix_hold"]')
     rig.wait_for(lambda: rig.dispatch.seen)
     page.fill('#params input[data-number="high"]', "1.5")
-    page.click('[data-cmd="range"][data-name="wait"]')
+    page.click('#params [data-apply="wait"]')
     rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
     page.click('#moments [data-cmd="revert"][data-change="3"]')
     rig.wait_for(lambda: len(rig.dispatch.seen) == 3)
@@ -2062,8 +2191,10 @@ def test_hand_back_a_range_and_revert_send_their_bodies(rig):
 
 def test_a_range_with_nothing_changed_or_a_word_for_a_number_is_not_sent(rig):
     """The page's own refusals of a range, each said and nothing sent, as a setting's are: a
-    range none of whose numbers was changed -- `0.750` is the 0.75 shown -- which would record a
-    change that changed nothing, and a number that is not one."""
+    range none of whose numbers was changed -- `0.750` is the 0.75 shown -- is no draft at all,
+    which would record a change that changed nothing, and a number that is not one is *cannot
+    send*, its Apply off. Rewritten for the console interface rework's Task 6: the box's status
+    line says it, where `#sent` did for *change the range*."""
     from wl_xcon.link import ParamRow, decode, encode
 
     row = ParamRow("wait", "s", 0.5, 2.0, None, False, None, "draw", (),
@@ -2072,13 +2203,16 @@ def test_a_range_with_nothing_changed_or_a_word_for_a_number_is_not_sent(rig):
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
 
     page.fill('#params input[data-number="low"]', "0.750")
-    page.click('[data-cmd="range"][data-name="wait"]')
-    page.wait_for_selector("#sent:has-text(\"not sent: no number of wait's range was changed\")")
+    assert "draft" not in _classes(page, "wait") and _bar(page) is None
+    assert not page.is_visible('#params [data-apply="wait"]')
     page.fill('#params input[data-number="high"]', "soon")
-    page.click('[data-cmd="range"][data-name="wait"]')
-    page.wait_for_selector("#sent:has-text(\"not sent: wait's high needs a number\")")
+    assert _say(page, "wait") == "cannot send · wait's high needs a number"
+    assert page.is_disabled('#params [data-apply="wait"]')
+    page.press('#params input[data-number="high"]', "Enter")
+    time.sleep(0.3)  # housekeeping: room for a wrong send to arrive
 
     assert rig.dispatch.seen == []
 
@@ -2086,7 +2220,9 @@ def test_a_range_with_nothing_changed_or_a_word_for_a_number_is_not_sent(rig):
 def test_a_double_click_on_hand_back_change_the_range_or_revert_is_one_act(rig):
     """Each of the three is held as *clear one* is (the engine C2a plan's Task 9 fix round,
     Important 1): a double click, or two quick clicks, sends one command, never two -- a second
-    hand-back the rig would refuse, a second range or revert it would record again."""
+    hand-back the rig would refuse, a second range or revert it would record again. Rewritten for
+    the console interface rework's Task 6: the range goes by the box's Apply, which is off while
+    its act is out."""
     from wl_xcon.link import HandBack, MomentRow, ParamRow, Revert, SetRange, decode, encode
 
     rows = (
@@ -2099,11 +2235,12 @@ def test_a_double_click_on_hand_back_change_the_range_or_revert_is_one_act(rig):
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
 
     page.dblclick('[data-cmd="hand_back"][data-name="fix_hold"]')
     rig.wait_for(lambda: rig.dispatch.seen)
     page.fill('#params input[data-number="high"]', "1.5")
-    page.dblclick('[data-cmd="range"][data-name="wait"]')
+    page.dblclick('#params [data-apply="wait"]', force=True)
     rig.wait_for(lambda: len(rig.dispatch.seen) >= 2)
     page.dblclick('#moments [data-cmd="revert"][data-change="0"]')
     rig.wait_for(lambda: len(rig.dispatch.seen) >= 3)
@@ -2114,11 +2251,11 @@ def test_a_double_click_on_hand_back_change_the_range_or_revert_is_one_act(rig):
 
 def test_a_range_typed_while_a_frame_arrives_is_still_sent_after_the_field_is_left(rig):
     """Fix round 1 of the C3 plan's Task 18 (review, Important 1): a person types a range's number,
-    a frame that changes the cards arrives, and the field is left before *change the range* is
-    pressed -- in WebKit, Safari's engine, pressing a button does not focus it, so the press
-    itself leaves the field. The frame was held while the field had focus; leaving it must not
-    swap the held frame in over the typed number and the button (the click would then land on
-    nothing: nothing sent, nothing said). The range is sent, with the number typed, and said."""
+    a frame that changes the cards arrives, and the field is left before the send is pressed -- in
+    WebKit, Safari's engine, pressing a button does not focus it, so the press itself leaves the
+    field. Rewritten for the console interface rework's Task 6 (the per-box rule): the frame is no
+    longer held for the tab -- the other box shows it at once -- and the box typed in keeps its
+    draft and its nodes, so its Apply sends the number typed."""
     from wl_xcon.link import ParamRow, SetRange, decode, encode
 
     def rows(hold):
@@ -2132,14 +2269,16 @@ def test_a_range_typed_while_a_frame_arrives_is_still_sent_after_the_field_is_le
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
 
     page.fill('#params input[data-number="high"]', "1.5")
     _offer(rig, 41, params=rows(0.4))
     _arrived(page, 41)
-    assert "0.30" in page.inner_text("#params")  # held while the field has focus
+    rig.wait_for(lambda: _head(page, "fix_hold") == "0.40 s")  # the other box follows the frame
+    assert page.input_value('#params input[data-number="high"]') == "1.5"
     page.evaluate("document.activeElement.blur()")
     time.sleep(0.3)  # housekeeping: the focus-out's release runs on a timer
-    page.click('[data-cmd="range"][data-name="wait"]')
+    page.click('#params [data-apply="wait"]')
     rig.wait_for(lambda: rig.dispatch.seen)
 
     (sent,) = rig.dispatch.seen
@@ -2151,9 +2290,11 @@ def test_a_range_typed_while_a_frame_arrives_is_still_sent_after_the_field_is_le
 def test_a_card_updates_once_a_hand_back_or_a_range_has_applied(rig):
     """Fix round 1 of the C3 plan's Task 18 (review, Important 2): Chromium focuses a button it
     clicks, and the page held every parameter frame while anything inside the cards had focus, so
-    after *hand back* or *change the range* the card went on saying a person held the setting,
-    with a live *hand back*, after the rig had applied it. Only a field being typed in holds the
-    cards; the card shows the applied hand-back and the applied range."""
+    after *hand back* or a range's send the card went on saying a person held the setting, with a
+    live *hand back*, after the rig had applied it. A focused button keeps nothing; the boxes show
+    the applied hand-back and the applied range. Rewritten for the console interface rework's
+    Task 6: the range goes by its box's Apply, and its box keeps its act's numbers until the frame
+    shows them in force."""
     from wl_xcon.link import HandBack, ParamRow, SetRange, decode, encode
 
     held = (ParamRow("fix_hold", "s", 0.1, 1.0, 0.4, False, None, "person", ("near",)),
@@ -2163,21 +2304,26 @@ def test_a_card_updates_once_a_hand_back_or_a_range_has_applied(rig):
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
 
     page.click('[data-cmd="hand_back"][data-name="fix_hold"]')
     rig.wait_for(lambda: len(rig.dispatch.seen) == 1)
     page.fill('#params input[data-number="high"]', "1.5")
-    page.click('[data-cmd="range"][data-name="wait"]')
+    page.click('#params [data-apply="wait"]')
     rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
     applied = (ParamRow("fix_hold", "s", 0.1, 1.0, 0.3, False, None, "conditions", ("near",)),
                ParamRow("wait", "s", 0.5, 2.0, None, False, None, "range", (),
                         "uniform from 0.75 s to 1.5 s", {"low": 0.75, "high": 1.5}))
     rig.hub.offer(decode(encode(frame(params=applied))))
 
-    rig.wait_for(lambda: "set or drawn by its conditions" in page.inner_text("#params")
-                 and page.input_value('#params input[data-number="high"]') == "1.5")
+    # `text_content`: the editor shows one box (the summary and editor design of 2026-11-19), and
+    # `inner_text` reads no box it hides.
+    rig.wait_for(lambda: "set or drawn by its conditions" in page.text_content("#params")
+                 and page.input_value('#params input[data-number="high"]') == "1.5"
+                 and _say(page, "wait") != "sending…")
     assert [type(seen) for seen in rig.dispatch.seen] == [HandBack, SetRange]
     assert 'data-cmd="hand_back"' not in page.inner_html("#params")
+    assert "draft" not in _classes(page, "wait")
 
 
 def _offer(rig, trial, **fields) -> None:
@@ -2206,35 +2352,36 @@ def _range_rows(hold=0.3):
     )
 
 
-def test_a_range_typed_and_left_unsent_says_the_cards_wait_for_it(rig):
-    """Fix round 2 of the C3 plan's Task 18 (re-review, New Breakage 1): a number typed into a
-    range and walked away from holds the parameter cards, and the page says so, under that card's
-    range editor, with the field marked pending -- never a silent freeze. Put back, or sent, the
-    line goes and the held frame is shown."""
+def test_a_range_typed_and_left_unsent_says_not_sent_and_the_boxes_follow_the_frame(rig):
+    """Was `test_a_range_typed_and_left_unsent_says_the_cards_wait_for_it` (fix round 2 of the C3
+    plan's Task 18, New Breakage 1: never a silent freeze of the cards). Rewritten for the console
+    interface rework's Task 6, whose per-box rule replaces the freeze: a number typed into a range
+    and walked away from is a draft its box says is *not sent*, Apply live, while every other box
+    follows the frame at once; put back, the draft goes."""
     from wl_xcon.link import decode, encode
 
     rig.hub.offer(decode(encode(frame(params=_range_rows(0.3)))))
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
     page.fill('#params input[data-number="high"]', "1.5")
     page.mouse.click(2, 2)  # a neutral spot: the field loses focus
-    rig.hub.offer(decode(encode(frame(params=_range_rows(0.4)))))
+    _offer(rig, 41, params=_range_rows(0.4))
 
-    page.wait_for_selector("#params .rhold", state="visible", timeout=5000)
-    assert "not sent: press change the range, or put its numbers back" in (
-        page.inner_text("#params .rhold"))
-    assert "pending" in page.get_attribute('#params input[data-number="high"]', "class")
-    assert "0.30" in page.inner_text("#params")
+    rig.wait_for(lambda: _head(page, "fix_hold") == "0.40 s")
+    assert _say(page, "wait") == "not sent" and page.is_visible('#params [data-apply="wait"]')
+    assert page.input_value('#params input[data-number="high"]') == "1.5"
+    assert _bar(page) == "1 edit not sent: wait"
 
     page.fill('#params input[data-number="high"]', "1.25")
-    page.mouse.click(2, 2)
-    rig.wait_for(lambda: "0.40" in page.inner_text("#params"))
+    assert "draft" not in _classes(page, "wait") and _bar(page) is None
 
 
 def test_a_range_typed_as_the_same_number_does_not_hold_the_cards(rig):
-    """Fix round 2 (New Breakage 1): "1.250" over 1.25 is the number in force, as *change the
-    range* reads it ("no number was changed"), so it holds nothing: the cards follow the next
+    """Fix round 2 (New Breakage 1): "1.250" over 1.25 is the number in force, as the rig reads
+    it, so it is no draft (the console interface rework's Task 6: "a draft equal to what is in
+    force is no draft"): its box says nothing is waiting to be sent, and the boxes follow the next
     frame."""
     from wl_xcon.link import decode, encode
 
@@ -2242,18 +2389,20 @@ def test_a_range_typed_as_the_same_number_does_not_hold_the_cards(rig):
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
     page.fill('#params input[data-number="high"]', "1.250")
     page.mouse.click(2, 2)
     rig.hub.offer(decode(encode(frame(params=_range_rows(0.4)))))
 
-    rig.wait_for(lambda: "0.40" in page.inner_text("#params"))
-    assert not page.is_visible("#params .rhold")
+    rig.wait_for(lambda: "0.40" in page.text_content("#params"))
+    assert "draft" not in _classes(page, "wait") and _bar(page) is None
 
 
 def test_a_range_press_the_rig_did_not_take_can_be_sent_again(rig):
     """Fix round 2 (New Breakage 2): the typed numbers count as sent only when the answer says
-    "sent". After "not delivered" the same press is sent again, not refused as "no number was
-    changed"."""
+    "sent". After "not delivered" the box has its draft back, saying why, and the same Apply
+    sends it again. Rewritten for the console interface rework's Task 6: the box's Apply for *change
+    the range*, its status line for `#sent`."""
     from wl_xcon.link import SetRange, decode, encode
     from wl_xcon import serve
 
@@ -2261,17 +2410,18 @@ def test_a_range_press_the_rig_did_not_take_can_be_sent_again(rig):
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
     rig.dispatch.answers = serve.not_delivered("the rig is not connected")
     page.fill('#params input[data-number="high"]', "1.5")
-    page.click('[data-cmd="range"][data-name="wait"]')
-    page.wait_for_selector("#sent:has-text('not delivered')")
+    page.click('#params [data-apply="wait"]')
+    _says(rig, page, "wait", "not sent · not delivered", start=True)
+    assert not page.is_disabled('#params [data-apply="wait"]')
     rig.dispatch.answers = None
-    time.sleep(1.2)  # housekeeping: past the double-click hold
-    page.click('[data-cmd="range"][data-name="wait"]')
+    page.click('#params [data-apply="wait"]')
     rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
 
+    assert [seen.numbers for seen in rig.dispatch.seen] == [{"high": 1.5}, {"high": 1.5}]
     assert [type(seen) for seen in rig.dispatch.seen] == [SetRange, SetRange]
-    assert "no number" not in page.inner_text("#sent")
 
 
 def test_a_press_is_not_lost_when_a_frame_lands_between_the_mouse_down_and_up(rig):
@@ -2291,12 +2441,13 @@ def test_a_press_is_not_lost_when_a_frame_lands_between_the_mouse_down_and_up(ri
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
 
     page.hover('[data-cmd="hand_back"][data-name="fix_hold"]')
     page.mouse.down()
     offer(41, 3.0, first)
     _arrived(page, 41)
-    assert "2.00" in page.inner_text("#params")  # held under the press
+    assert "2.00" in page.text_content("#params")  # held under the press
     page.mouse.up()
     rig.wait_for(lambda: len(rig.dispatch.seen) == 1)
 
@@ -2338,21 +2489,22 @@ def test_an_older_held_frame_never_replaces_a_newer_one_after_a_press_expires(ri
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
     page.evaluate("window.__t = performance.now(); performance.now = function () { return window.__t; };")
 
     page.hover('[data-cmd="hand_back"][data-name="fix_hold"]')
     page.mouse.down()
     _offer(rig, 41, params=_gain_rows(3.0), moments=(_moment(4, "gain 2.00 to 3.00"), first))
     _arrived(page, 41)
-    assert "2.00" in page.inner_text("#params") and "gain 2.00" not in page.inner_text("#moments")
+    assert "2.00" in page.text_content("#params") and "gain 2.00" not in page.inner_text("#moments")
     page.evaluate("window.__t += 10001")
     _offer(rig, 42, params=_gain_rows(4.0), moments=(second, first))
-    rig.wait_for(lambda: "4.00" in page.inner_text("#params"))
+    rig.wait_for(lambda: "4.00" in page.text_content("#params"))
     # The focus-out's release runs on a timer of 0 ms; this returns once a later one has run.
     page.evaluate("() => { document.dispatchEvent(new Event('focusout'));"
                   " return new Promise(function (done) { setTimeout(done, 50); }); }")
 
-    assert "4.00" in page.inner_text("#params") and "3.00" not in page.inner_text("#params")
+    assert "4.00" in page.text_content("#params") and "3.00" not in page.text_content("#params")
     assert "gain 3.00 to 4.00" in page.inner_text("#moments")
 
 
@@ -2366,66 +2518,78 @@ def test_a_press_the_page_never_sees_end_shows_the_held_frame(rig):
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
 
     page.hover('[data-cmd="hand_back"][data-name="fix_hold"]')
     page.mouse.down()
     _offer(rig, 41, params=_gain_rows(3.0))
     _arrived(page, 41)
-    assert "2.00" in page.inner_text("#params")
+    assert "2.00" in page.text_content("#params")
     page.evaluate("window.dispatchEvent(new Event('blur'))")
-    rig.wait_for(lambda: "3.00" in page.inner_text("#params"), seconds=4)
+    rig.wait_for(lambda: "3.00" in page.text_content("#params"), seconds=4)
     page.mouse.up()
 
     page.hover('[data-cmd="hand_back"][data-name="fix_hold"]')
     page.mouse.down()
     _offer(rig, 42, params=_gain_rows(4.0))
     _arrived(page, 42)
-    assert "3.00" in page.inner_text("#params")
-    rig.wait_for(lambda: "4.00" in page.inner_text("#params"), seconds=14)
+    assert "3.00" in page.text_content("#params")
+    rig.wait_for(lambda: "4.00" in page.text_content("#params"), seconds=14)
 
 
 def test_a_correction_typed_while_a_range_press_is_out_stays_to_be_sent(rig):
     """Fix round 3 (New Breakage 2): the rig answers a range at its next trial boundary. A number
-    typed meanwhile (1.6 after 1.5 was sent) is not what was sent, so when the answer comes it is
-    still pending, and sends."""
-    from wl_xcon.link import SetRange, decode, encode
+    typed meanwhile (1.6 after 1.5 was sent) is not what was sent, so once the rig stages the
+    first it is a draft over it, saying the first waits, and its Apply sends it. Rewritten for the
+    console interface rework's Task 6: the box keeps its nodes while its act is out."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import SetRange, Staged, decode, encode
 
     rig.hub.offer(decode(encode(frame(params=_range_rows()))))
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
     rig.dispatch.delay = 3.0
     page.fill('#params input[data-number="high"]', "1.5")
-    page.click('[data-cmd="range"][data-name="wait"]')
+    page.click('#params [data-apply="wait"]')
     rig.wait_for(lambda: rig.dispatch.seen)
     page.fill('#params input[data-number="high"]', "1.6")
+    assert _say(page, "wait") == "sending…"
     page.wait_for_selector("#sent:has-text('sent: test')", timeout=10000)
     rig.dispatch.delay = 0.0
+    _offer(rig, 41, params=_range_rows(), staged=(Staged(
+        "wait", "uniform from 0.75 s to 1.25 s", "uniform from 0.75 s to 1.5 s", Box("Jake Westerberg"),
+        False, kind="range", cid=rig.dispatch.seen[-1].cid),))
 
-    assert "pending" in page.get_attribute('#params input[data-number="high"]', "class")
-    time.sleep(1.2)  # housekeeping: past the double-click hold
-    page.click('[data-cmd="range"][data-name="wait"]')
+    _says(rig, page, "wait", "not sent · range uniform from 0.75 s to 1.5 s is waiting")
+    page.click('#params [data-apply="wait"]')
     rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
     assert [seen.numbers for seen in rig.dispatch.seen if isinstance(seen, SetRange)] == [
         {"high": 1.5}, {"high": 1.6}]
 
 
-def test_a_second_range_press_while_the_first_is_out_is_refused_and_said(rig):
-    """Fix round 3 (New Breakage 3): while a card's range is out and unanswered, a second press
-    (past the double-click hold) is not sent again, and the page says why."""
+def test_a_second_apply_while_the_first_is_out_is_held_off_and_the_box_says_sending(rig):
+    """Was `test_a_second_range_press_while_the_first_is_out_is_refused_and_said` (fix round 3, New
+    Breakage 3: while a card's range is out and unanswered, a second press is not sent again).
+    Rewritten for the console interface rework's Task 6: the box says *sending…* and its Apply is
+    off while its act is out (the controls review's §2, rule 5), so a second press sends
+    nothing."""
     from wl_xcon.link import decode, encode
 
     rig.hub.offer(decode(encode(frame(params=_range_rows()))))
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
     rig.dispatch.delay = 3.0
     page.fill('#params input[data-number="high"]', "1.5")
-    page.click('[data-cmd="range"][data-name="wait"]')
+    page.click('#params [data-apply="wait"]')
     rig.wait_for(lambda: rig.dispatch.seen)
-    time.sleep(1.3)  # housekeeping: past the double-click hold
-    page.click('[data-cmd="range"][data-name="wait"]')
-    page.wait_for_selector("#sent:has-text('still being sent')", timeout=5000)
+    time.sleep(1.3)  # housekeeping: past a double click's span
+    assert _say(page, "wait") == "sending…"
+    assert page.is_disabled('#params [data-apply="wait"]')
+    page.click('#params [data-apply="wait"]', force=True)
     page.wait_for_selector("#sent:has-text('sent: test')", timeout=10000)
 
     assert len(rig.dispatch.seen) == 1
@@ -2445,6 +2609,7 @@ def test_a_press_a_menu_or_a_drag_takes_over_or_no_primary_press_leaves_the_card
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
     button = '[data-cmd="hand_back"][data-name="fix_hold"]'
 
     page.hover(button)
@@ -2452,47 +2617,55 @@ def test_a_press_a_menu_or_a_drag_takes_over_or_no_primary_press_leaves_the_card
     _offer(rig, 41, params=_gain_rows(3.0))
     _arrived(page, 41)
     if ending == "contextmenu":
-        assert "2.00" in page.inner_text("#params")  # held under the press
+        assert "2.00" in page.text_content("#params")  # held under the press
         page.evaluate("(b) => document.querySelector(b).dispatchEvent(new MouseEvent("
                       "'contextmenu', {bubbles: true, cancelable: true}))", button)
     elif ending == "dragstart":
-        assert "2.00" in page.inner_text("#params")  # held under the press
+        assert "2.00" in page.text_content("#params")  # held under the press
         page.evaluate("(b) => document.querySelector(b).dispatchEvent(new Event("
                       "'dragstart', {bubbles: true}))", button)
 
-    rig.wait_for(lambda: "3.00" in page.inner_text("#params"), seconds=4)
+    rig.wait_for(lambda: "3.00" in page.text_content("#params"), seconds=4)
     page.mouse.up(button="middle" if ending == "middle" else "left")
 
 
 def test_a_double_click_on_change_the_range_never_says_not_sent_while_the_rig_answers(rig):
     """The C3 plan's Task 18, its deferred minor (re-review 3, minor 2): the rig answers a range at
-    its next trial boundary, and a double click's second press reached the refusal of a range
-    still out, so the page said in red "not sent: the range of wait is still being sent" until the
-    answer came, up to a trial, though the range was sent. The second press of a double click is
-    dropped first, as a clear's is: the line never reads "not sent" -- each text it shows is kept
-    as it is shown -- and one range is sent."""
+    its next trial boundary, and a double click's second press said in red "not sent: the range
+    of wait is still being sent" until the answer came, though the range was sent. Rewritten for
+    the console interface rework's Task 6, where the box's Apply sends the range: neither `#sent`
+    nor the box's status line ever reads "not sent" -- each text shown is kept as it is shown --
+    and one range is sent."""
     from wl_xcon.link import SetRange, decode, encode
 
     rig.hub.offer(decode(encode(frame(params=_range_rows()))))
     page = rig.browser_page()
     _sign_in(page)
     page.click('label[for="t-task"]')
+    _more(page)
+    page.fill('#params input[data-number="high"]', "1.5")
     page.evaluate("""() => {
       window.__said = [];
-      new MutationObserver(function () {
+      const keep = () => {
         window.__said.push(document.getElementById('sent').textContent);
-      }).observe(document.getElementById('sent'),
-                 {childList: true, characterData: true, subtree: true});
+        const say = document.querySelector('#params .box[data-card="wait"] > .status > .say');
+        if (say) { window.__said.push(say.textContent); }
+      };
+      new MutationObserver(keep).observe(document.getElementById('sent'),
+        {childList: true, characterData: true, subtree: true});
+      new MutationObserver(keep).observe(document.getElementById('params'),
+        {childList: true, characterData: true, subtree: true});
     }""")
     rig.dispatch.delay = 3.0
-    page.fill('#params input[data-number="high"]', "1.5")
-    page.dblclick('[data-cmd="range"][data-name="wait"]')
+    page.dblclick('#params [data-apply="wait"]', force=True)
     page.wait_for_selector("#sent:has-text('sent: test')", timeout=10000)
     rig.dispatch.delay = 0.0
 
     said = page.evaluate("window.__said")
-    assert [line for line in said if line.startswith("not sent")] == []
-    assert said[-1] == "sent: test"
+    # Before the press the box rightly says its draft is *not sent*; from the press on, never.
+    assert "sending…" in said and "sent: test" in said
+    after = said[said.index("sending…"):]
+    assert [line for line in after if line.startswith("not sent")] == []
     assert [type(seen) for seen in rig.dispatch.seen] == [SetRange]
 
 
@@ -2604,7 +2777,7 @@ class _DemoBox:
         self._context.add_init_script(
             "window.wlxBlocked = []; document.addEventListener('securitypolicyviolation',"
             " (e) => window.wlxBlocked.push(e.violatedDirective));")
-        self.page = self._context.new_page()
+        self.page = _Opening(self._context.new_page())
         self.page.set_default_timeout(WAIT_S * 1000)
         self.url = f"http://127.0.0.1:{port}/"
 
@@ -3065,7 +3238,7 @@ class _LiveDemo:
             "(() => { const sent = window.fetch; window.wlxGazeAt = 0;"
             " window.fetch = function (url) { if (url === '/gaze') {"
             " window.wlxGazeAt = performance.now(); } return sent.apply(this, arguments); }; })()")
-        self.page = self._context.new_page()
+        self.page = _Opening(self._context.new_page())
         self.page.set_default_timeout(WAIT_S * 1000)
         self.at: tuple[float, float] | None = None
 
@@ -3237,3 +3410,3333 @@ def test_holding_b_is_tracker_lost(live, began):
     finally:
         live.page.keyboard.up("b")
     assert _states(began) == FIXATED_STATES
+
+
+def test_switching_fix_hold_to_nonaging_sends_its_shortest_and_longest(rig):
+    """The timing switch (the console settings design's §3; the PI, 2026-11-16): on the card of a
+    timing setting held fixed, *drawn* opens its shapes; non-aging, its shortest and longest typed,
+    and the box's Apply (since the console interface rework's Task 6; its drawn side's own *apply*
+    is gone) sends a `form` of those two numbers, reaching the rig as the signed-in member's. A
+    frame arriving meanwhile leaves the card on its drawn side, a draft. Through the wire, in a
+    real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import ParamRow, SetForm, decode, encode
+
+    rows = (ParamRow.of("fix_hold", "s", 0.05, 2.0, 0.3, False, (), "task", (), None, None,
+                        "drawn"),)
+    rig.hub.offer(decode(encode(frame(params=rows))))
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+
+    page.click('[data-switch="drawn"][data-name="fix_hold"]')
+    rig.hub.offer(decode(encode(frame(params=rows, trial_index=41))))
+    page.select_option('select[data-shape="fix_hold"]', "non_aging")
+    fields = '#params [data-fields="non_aging"]'
+    page.fill(f'{fields} input[data-form="shortest"]', "0.75")
+    page.fill(f'{fields} input[data-form="longest"]', "1.25")
+    page.click('#params [data-apply="fix_hold"]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.shape, sent.numbers, sent.values, sent.weights,
+            sent.by.name) == (SetForm, "fix_hold", "non_aging",
+                              {"shortest": 0.75, "longest": 1.25}, (), (), "Jake Westerberg")
+
+
+def test_scaling_disc_size_sends_its_factor(rig):
+    """A size's switch (the console settings design's §5; the PI, 2026-11-16, "Size = factor x
+    eccentricity"): on the card of a size held fixed, *scaled* opens its factor; typed, the box's
+    Apply (since the console interface rework's Task 6) sends a `form` of shape `scaled` with that
+    one number, reaching the rig as the signed-in member's. A frame arriving meanwhile leaves the
+    card on its scaled side. Through the wire, in a real browser: run with `WLX_BROWSER=webkit`
+    too, for Safari."""
+    from wl_xcon.link import ParamRow, SetForm, decode, encode
+
+    rows = (ParamRow.of("disc_size", "deg", 0.0, None, 1.0, False, (), "task", (), None, None,
+                        "scaled"),)
+    rig.hub.offer(decode(encode(frame(params=rows))))
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+
+    page.click('[data-switch="scaled"][data-name="disc_size"]')
+    rig.hub.offer(decode(encode(frame(params=rows, trial_index=41))))
+    assert page.is_visible('#params [data-fields="scaled"] input[data-form="factor"]')
+    page.fill('#params [data-fields="scaled"] input[data-form="factor"]', "0.3")
+    page.click('#params [data-apply="disc_size"]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.shape, sent.numbers, sent.values, sent.weights,
+            sent.by.name) == (SetForm, "disc_size", "scaled", {"factor": 0.3}, (), (),
+                              "Jake Westerberg")
+
+
+def test_picking_a_hue_swatch_sends_color(rig):
+    """A color setting's card (the console settings design's §6; the PI, 2026-11-16, "you select a
+    set, and then you have hue options from the set"): pressing a hue's swatch is a draft, the
+    swatch pressed and nothing sent (the console interface design's call: "a swatch or a tick is a
+    draft"), and the box's Apply sends a `color` of its set and hue, reaching the rig as the
+    signed-in member's; a frame arriving meanwhile leaves the box as it was. Rewritten for the
+    rework's Task 6: the swatch sent on its click before. Through the wire, in a real browser: run
+    with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import ParamRow, SetColor, decode, encode
+
+    color = {
+        "sets": {"isohue": {"apex": [0.31272, 0.329], "luminance_cd_m2": 15.0, "design": None,
+                            "hues": {"green": {"xy": [0.31324, 0.50711], "srgb": "#4a9a3e"},
+                                     "red": {"xy": [0.45955, 0.32918], "srgb": "#c76f6a"}}}},
+        "set": "isohue", "hue": "green", "approximate": True,
+        "saturation": {"setting": None, "value": 1.0, "cd_m2": 15.0},
+        "luminance": {"setting": None, "value": 15.0, "cd_m2": 15.0, "set_wide": False},
+    }
+    rows = (ParamRow.of("distractor_appearance", "appearance", None, None, None, False,
+                        source="run", color=color),)
+    rig.hub.offer(decode(encode(frame(params=rows))))
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+
+    page.select_option('select[data-colorset="distractor_appearance"]', "isohue")
+    page.click('#params .hue[data-name="distractor_appearance"][data-color="red"]')
+    rig.hub.offer(decode(encode(frame(params=rows, trial_index=41))))
+    _arrived(page, 41)
+    assert rig.dispatch.seen == [] and _say(page, "distractor_appearance") == "not sent"
+    assert page.get_attribute('#params .hue[data-color="red"]', "aria-pressed") == "true"
+    page.click('#params [data-apply="distractor_appearance"]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.colorset, sent.color, sent.by.name) == (
+        SetColor, "distractor_appearance", "isohue", "red", "Jake Westerberg")
+
+
+def _looks_row(look=None, **fields):
+    """The fixation point's look as the rig makes its row (`ParamRow.of`): a disc, a ring or a
+    square of one gray, `look` the one in force (the disc by default), its choices their words."""
+    from wl_xcon.link import ParamRow
+    from wl_xcon.task import Annulus, P, Square
+
+    gray = Gray(P("fix_luminance"))
+    looks = (Disc(size=0.3, color=gray), Annulus(inner=0.15, outer=0.3, color=gray),
+             Square(size=0.3, color=gray))
+    row = ParamRow.of("fix_look", "appearance", None, None, looks[0] if look is None else look,
+                      False, choices=looks, source="task", section="Stimuli")
+    return dataclasses.replace(row, **fields), looks
+
+
+def test_a_looks_shape_is_picked_on_its_box_and_applied(rig):
+    """The pop-out revision's design §2 (a look's shape is "a setting on the console"; its plan's
+    Task 5b): a setting whose choices are looks, none a color-set light, shows them as segments,
+    each saying its kind and its words whole in its title, the one in force pressed. Pressing the
+    square is a draft, as a swatch is -- nothing sent, a frame arriving meanwhile leaving it, the
+    summary line "in force → the square", **each said as its segment says it** ("Disc → Square",
+    the words whole in the line's title; the pop-out revision's Amendments, item 6: a look's words
+    run too long for a line) -- and the box's Apply sends a `choice` of the square's words as the
+    signed-in member's; the box then waits, its line "Disc → Square" again, and is in force with
+    the square pressed. The ring pressed and a hold typed ride one Apply all, and *withdraw* takes
+    the act back. In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, ApplyMany, SetChoice, Staged, Withdraw
+
+    jake = Box("Jake Westerberg")
+    row, looks = _looks_row()
+    disc, ring, square = row.choices
+    page = _task6_page(rig, params=_task6_rows() + (row,))
+    _open(page, "fix_look")
+    segments = f'{_b("fix_look")} [data-choices="fix_look"] .ch'
+    assert page.eval_on_selector_all(segments, "(all) => all.map((one) => [one.textContent, "
+                                     "one.parentElement.title, one.getAttribute('aria-pressed')])"
+                                     ) == [
+        ["Disc", disc, "true"], ["Ring", ring, "false"], ["Square", square, "false"]]
+
+    page.click(f'{segments}[data-choice="{square}"]')
+    _offer(rig, 41, params=_task6_rows() + (row,))
+    _arrived(page, 41)
+    assert rig.dispatch.seen == [] and _say(page, "fix_look") == "not sent"
+    assert page.get_attribute(f'{segments}[data-choice="{square}"]', "aria-pressed") == "true"
+    mark, said, title = _marked(page, "fix_look")
+    assert (mark, said) == ("●", "Disc → Square"), (mark, said)
+    assert disc in title, title
+    page.click(f'{_b("fix_look")} [data-apply]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.choice, sent.by.name) == (
+        SetChoice, "fix_look", square, "Jake Westerberg")
+    _offer(rig, 42, params=_task6_rows() + (row,),
+           staged=(Staged("fix_look", disc, square, jake, False, cid=sent.cid),))
+    _says(rig, page, "fix_look", "waiting · you")
+    assert _marked(page, "fix_look")[:2] == ("◷", "Disc → Square")
+    held, _ = _looks_row(looks[2], applied=Applied(43, str(jake)))
+    _offer(rig, 43, params=_task6_rows() + (held,))
+    _says(rig, page, "fix_look", "in force from trial 43")
+    assert page.get_attribute(f'{segments}[data-choice="{square}"]', "aria-pressed") == "true"
+    assert "draft" not in _classes(page, "fix_look")
+
+    page.click(f'{segments}[data-choice="{ring}"]')
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+    page.click("#drafts-apply")
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    together = rig.dispatch.seen[-1]
+    assert type(together) is ApplyMany
+    assert sorted((type(change).__name__, change.name) for change in together.changes) == [
+        ("SetChoice", "fix_look"), ("SetParameter", "fix_hold")]
+    (picked,) = [change for change in together.changes if isinstance(change, SetChoice)]
+    assert picked.choice == ring
+    _offer(rig, 44, params=_task6_rows() + (held,),
+           staged=(Staged("fix_look", square, ring, jake, False, cid=together.cid),
+                   Staged("fix_hold", 0.3, 0.5, jake, False, cid=together.cid)))
+    _says(rig, page, "fix_look", "waiting · you")
+    page.click(f'{_b("fix_look")} [data-withdraw="{together.cid}"]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 3)
+    assert (type(rig.dispatch.seen[-1]), rig.dispatch.seen[-1].cid) == (Withdraw, together.cid)
+
+
+def test_a_choice_in_a_group_box_follows_the_frame_and_rides_its_apply(rig):
+    """A setting's segments in a group's box (the console interface design's goal 8), its sentence
+    with the segments in their place: a hold's luminance typed is a draft, and a frame that moves
+    the look in force -- another person's change -- moves the segment pressed with it, the box kept
+    for the draft (`follow`), so no look the rig no longer holds becomes a draft of its own; the
+    ring pressed then rides the box's one Apply with the luminance, one `apply_many`. In a real
+    browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import Applied, ApplyMany, GroupRow, ParamRow, SetChoice, SetParameter
+
+    def rows(look=None, **fields):
+        shown, looks = _looks_row(look, group="Fixation point", **fields)
+        luminance = ParamRow.of("fix_luminance", "cd/m2", 0.0, 80.0, 40.0, False, source="task",
+                                step=0.5, group="Fixation point", section="Stimuli")
+        return _task6_rows() + (shown, luminance), looks
+
+    groups = (GroupRow("Fixation point", ("fix_look", "fix_luminance"),
+                       "The point is {fix_look} at {fix_luminance} cd/m²", "Stimuli"),)
+    first, looks = rows()
+    page = _task6_page(rig, params=first, groups=groups)
+    _open(page, "Fixation point")
+    box = _b("Fixation point")
+    disc, ring, square = next(row for row in first if row.name == "fix_look").choices
+    segment = f'{box} [data-choices="fix_look"] .ch'
+
+    page.fill(f'{box} input[data-param="fix_luminance"]', "30")
+    moved, _ = rows(looks[2], source="person", changed=True, applied=Applied(42, "kim"))
+    _offer(rig, 42, params=moved, groups=groups)
+    _arrived(page, 42)
+    _until(page, "document.querySelector('" + box + " [data-choices=\"fix_look\"] .ch.on')"
+                 ".getAttribute('data-choice').indexOf('Square') === 0")
+    assert page.input_value(f'{box} input[data-param="fix_luminance"]') == "30"
+    page.click(f'{segment}[data-choice="{ring}"]')
+    page.click(f'{box} [data-apply]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+
+    (sent,) = rig.dispatch.seen
+    assert type(sent) is ApplyMany
+    assert sorted((type(change).__name__, change.name, getattr(change, "choice", None) or
+                   getattr(change, "value", None)) for change in sent.changes) == [
+        (SetChoice.__name__, "fix_look", ring), (SetParameter.__name__, "fix_luminance", 30)]
+
+
+def test_defining_a_color_by_hue_angle_previews_and_saves(rig):
+    """A section's New color… panel (the console settings design's §6; the PI, 2026-11-16: "1,2,or
+    3. you select an option and then enter the info", "Saved into a color set file"): by hue angle,
+    290°, named violet, into the card's set, a frame arriving meanwhile; *preview* shows what `wlx
+    serve` answers for it (`GET /color-preview`), its swatch and its sentence, and *save as a
+    proposal* sends a `define_color` of those numbers as the signed-in member's. The panel says
+    where it goes. Rewritten for the console interface rework's Task 7: the panel was each color
+    card's own, keyed by its setting; it is now its section's one (the design's call), keyed by the
+    section, here Other, the card's row naming none. Through the wire, in a real browser: run with
+    `WLX_BROWSER=webkit` too, for Safari."""
+    from pathlib import Path
+
+    from wl_xcon.link import DefineColor, ParamRow, decode, encode
+    from wl_xcon.photometry import ColorSet
+    from wl_xcon.serve import color_preview
+    from wl_xcon.web import NEW_COLOR_SAVED
+
+    isohue = ColorSet.load(Path(__file__).parent / "fixtures" / "isohue_design.json")
+    color = {
+        "sets": {"isohue": {"apex": list(isohue.apex), "luminance_cd_m2": 15.0,
+                            "design": dict(isohue.design),
+                            "hues": {hue: {"xy": list(xy), "srgb": "#808080"}
+                                     for hue, xy in isohue.colors.items()}}},
+        "set": "isohue", "hue": "green", "approximate": True,
+        "saturation": {"setting": None, "value": 1.0, "cd_m2": 15.0},
+        "luminance": {"setting": None, "value": 15.0, "cd_m2": 15.0, "set_wide": False},
+    }
+    rows = (ParamRow.of("distractor_appearance", "appearance", None, None, None, False,
+                        source="run", color=color),)
+    rig.hub.offer(decode(encode(frame(params=rows))))
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+    panel = '[data-newc="Other"]'
+    _open(page, "new-color:Other")
+    assert page.evaluate("document.querySelector('[data-newc=\"Other\"]').open")
+    page.fill(f'{panel} [data-newc-fields="hue_angle"] input[data-newc-num="hue_deg"]', "290")
+    page.fill(f"{panel} input[data-newc-name]", "violet")
+    assert page.inner_text(f"{panel} .src") == f"{NEW_COLOR_SAVED[0]}isohue{NEW_COLOR_SAVED[1]}"
+    rig.hub.offer(decode(encode(frame(params=rows, trial_index=41))))
+
+    page.click(f'{panel} [data-cmd="preview_color"]')
+    _, expected = color_preview(rig.hub.snapshot(on_box=False, stale_after_s=5.0)[0],
+                                {"set": ["isohue"], "method": ["hue_angle"], "hue_deg": ["290"]})
+    page.wait_for_function(
+        "said => (document.querySelector('[data-newc=\"Other\"] .newc-out') || "
+        "{}).textContent.trim() === said", arg=expected["said"])
+    shown = page.eval_on_selector(f"{panel} .newc-out .chip", "chip => chip.style.background")
+    rgb = tuple(int(expected["srgb"][i:i + 2], 16) for i in (1, 3, 5))
+    assert shown in (expected["srgb"], "rgb({}, {}, {})".format(*rgb)), shown
+    assert expected["in_srgb"] is True and expected["x"] is not None
+    page.click(f'{panel} [data-cmd="define_color"]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.colorset, sent.new_set, sent.name, sent.method, dict(sent.numbers),
+            sent.by.name) == (DefineColor, "isohue", False, "violet", "hue_angle",
+                              {"hue_deg": 290.0}, "Jake Westerberg")
+
+
+def _sectioned(rig, task="tasks/fixation_detection.py", **over):
+    """A frame whose cards sit in three sections: Timing, Gaze windows and, nested under Stimuli,
+    the fixation point; offered to the rig, through the wire."""
+    from wl_xcon.link import ParamRow, decode, encode
+
+    rows = (
+        ParamRow.of("fix_hold", "s", 0.1, 1.0, 0.3, False, section="Timing"),
+        ParamRow.of("fix_window", "deg", 0.0, 9.0, 2.0, False, section="Gaze windows",
+                    changed=True),
+        ParamRow.of("fix_size", "deg", 0.0, 9.0, 0.5, False, section="Stimuli/fixation point"),
+    )
+    rig.hub.offer(decode(encode(frame(params=rows, task=task, **over))))
+
+
+def _open(page, name: str, root: str = "#params") -> None:
+    """**Open setting `name` in its tab's editor** as a person does, by a click on its summary
+    line (the summary and editor design of 2026-11-19)."""
+    page.click(f'{root} > .summary .line[data-open="{name}"]')
+
+
+def _opened(page, root: str = "#params") -> list:
+    """What the editor of `root` shows: each box's or panel's name not hidden, or the
+    placeholder's words."""
+    return page.evaluate("""(root) => { const editor = document.querySelector(root + ' > .editing');
+        return editor === null ? null : Array.from(editor.children).filter((child) => !child.hidden)
+        .map((child) => child.getAttribute('data-card') || child.getAttribute('data-newc') ||
+        child.textContent.trim()); }""", root)
+
+
+def test_a_store_that_throws_still_opens_a_setting(rig):
+    """The summary and editor design's goal 5, with the browser's store failing -- a private
+    window, blocked site data -- on every read and write before the page runs: a click still opens
+    a setting and a frame keeps it opened, for as long as the page is shown; a reload shows the
+    placeholder; nothing is raised into the page. Replaces `test_a_store_that_throws_leaves_every_
+    section_open`: the sections no longer fold. In a real browser: run with `WLX_BROWSER=webkit`
+    too, for Safari."""
+    _sectioned(rig)
+    page = rig.browser_page()
+    page.add_init_script(
+        "const boom = () => { throw new Error('storage is blocked'); };"
+        "Storage.prototype.getItem = boom; Storage.prototype.setItem = boom;"
+        "Storage.prototype.removeItem = boom;")
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.reload()
+    page.click('label[for="t-task"]')
+
+    assert _opened(page) == ["click a setting above to change it"]
+    _open(page, "fix_window")
+    assert _opened(page) == ["fix_window"]
+    _sectioned(rig, trial_index=41)
+    _until(page, "document.querySelector('#params .summary') !== null")
+    page.wait_for_timeout(300)  # housekeeping: past the frame's patch
+    assert _opened(page) == ["fix_window"]
+    page.reload()
+    page.click('label[for="t-task"]')
+
+    assert _opened(page) == ["click a setting above to change it"]
+    assert not [e for e in errors if "storage is blocked" in e], errors
+
+
+def _training_rows(gain, step=0.1):
+    """A Training tab's cards: a bar a person holds (*hand back* live on it), the run's gain, and
+    a stage's step in a section nested under Training, so a frame can change each."""
+    from wl_xcon.link import ParamRow
+
+    return tuple(dataclasses.replace(row, section=section) for row, section in (
+        (ParamRow("move_up_bar", "fraction", 0.5, 1.0, 0.9, False, None, "person", ("near",)),
+         "Training"),
+        (ParamRow("gain", "", None, None, gain, False, None, "run"), "Training"),
+        (ParamRow.of("fade_in_step", "fraction", 0.05, 1.0, step, False), "Training/Fade-in"),
+    ))
+
+
+def test_a_press_on_a_training_card_is_not_lost_when_a_frame_lands_under_it(rig):
+    """The whole-build review's I3: the Training tab's cards are held while a pointer is down
+    inside them, as the Task parameters tab's are (fix round 2 of the C3 plan's Task 18), so a
+    frame that changes them mid-press does not replace *hand back* under the mouse -- WebKit never
+    focuses a clicked button. The press arrives, and the frame held under it is shown once it is
+    up. In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import HandBack
+
+    _offer(rig, 40, params=_training_rows(2.0))
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-training"]')
+    _more(page, "#training-params")
+
+    page.hover('#training-params [data-cmd="hand_back"][data-name="move_up_bar"]')
+    page.mouse.down()
+    _offer(rig, 41, params=_training_rows(3.0))
+    _arrived(page, 41)
+    assert "2.00" in page.text_content("#training-params")  # held under the press
+    page.mouse.up()
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 1)
+    rig.wait_for(lambda: "3.00" in page.text_content("#training-params"))
+
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.by.name) == (HandBack, "move_up_bar", "Jake Westerberg")
+
+
+def test_the_training_tabs_opened_setting_is_kept_under_its_own_key(rig):
+    """The summary and editor design's goal 5 on the Training tab: the setting opened in its
+    editor stays opened across a frame that changes its boxes and across a reload, kept for its
+    task under the Training tab's own key, `wlx.training-opened.<task>`; the Task parameters tab's
+    is not touched. Replaces `test_a_collapsed_training_section_stays_collapsed_across_a_frame`:
+    the sections no longer fold. In a real browser: run with `WLX_BROWSER=webkit` too, for
+    Safari."""
+    _offer(rig, 40, params=_training_rows(2.0))
+    page = rig.browser_page()
+    page.click('label[for="t-training"]')
+    assert _opened(page, "#training-params") == ["click a setting above to change it"]
+
+    _open(page, "fade_in_step", "#training-params")
+    assert _opened(page, "#training-params") == ["fade_in_step"]
+    _offer(rig, 41, params=_training_rows(2.0, step=0.3))
+    _arrived(page, 41)
+    _until(page, "document.querySelector('#training-params').textContent.indexOf('0.30') !== -1")
+
+    assert _opened(page, "#training-params") == ["fade_in_step"]
+    assert page.evaluate("window.localStorage.getItem('wlx.training-opened.tasks/"
+                         "fixation_detection.py')") == "fade_in_step"
+    assert page.evaluate("window.localStorage.getItem('wlx.opened.tasks/"
+                         "fixation_detection.py')") is None
+    page.reload()
+    page.click('label[for="t-training"]')
+    assert _opened(page, "#training-params") == ["fade_in_step"]
+    assert page.get_attribute('#training-params .line[data-open="fade_in_step"]',
+                              "aria-pressed") == "true"
+
+
+# --- the console interface rework's Task 5: the box, drawn (the design of 2026-11-19) ----------
+
+#: The widths a trainer's laptop gives the page (the design's "How it is judged done": "no text
+#: past a box at 1024, 1280 and 1440 wide"), each at a laptop's height.
+WIDTHS = (1024, 1280, 1440)
+LAPTOP_H = 800
+
+#: A refusal as long as the one the layout review found on `fix_hold` (about 100 words), so a box
+#: holding one is measured.
+_LONG_WHY = ("'fix_hold' at 30 is refused, and the previous value stands: the trial ends "
+             "NO_FIXATION after 10 s, while the hold can take up to 30 s, so some trials could "
+             "never be answered, and an animal held that long learns nothing from the trial it "
+             "cannot finish; shorten the hold, or lengthen the timeout so that the longest hold "
+             "and the time to acquire the point both fit inside it, then apply again (XC-343)")
+
+
+def _popout_session(tmp_path):
+    """**The pop-out search's session** as `_popout_frame` and `_popout_own` read it: its rows
+    (`Session.parameters`) and its groups (`Session.groups`), schema 23."""
+    from wl_xcon.dio import Simulated as Card
+    from wl_xcon.taskd import Session, SessionSpec
+    from wl_xcon.welfare import Deployment, Simulated as Pump
+
+    import _sessions
+    from _demo import ALLOCATION, POPOUT, xtasks_or_skip
+
+    spec = SessionSpec(
+        task=str(xtasks_or_skip() / POPOUT), allocation=ALLOCATION, root=tmp_path,
+        session_id="2027-01-14_01", subject="A", trials=1, frame_period=1 / 240, seed=1,
+        values={"pairings": 66}, bounds=_sessions.bounds(), already_delivered_today=0.0,
+        deployment=Deployment.RIG_FIXED, geometry=DIRECT, session_kind="training",
+        calibration=SRGB, plan="training")
+    return Session(spec, card=Card(), pump=Pump())
+
+
+def _popout_own(tmp_path, **over):
+    """**The pop-out search's own rows and groups, as its session makes them** (the ledger's ruling
+    for the summary and editor build's Task 3: "a new test on the wl-xtasks pop-out's own rows"):
+    nothing changed in them -- no long plain name, no staged change -- but a setting that holds no
+    value yet shown at its task's start (`Param.start`), as a run shows it."""
+    import importlib.util
+
+    from wl_xcon.link import GroupRow, ParamRow
+    from _demo import POPOUT, xtasks_or_skip
+
+    session = _popout_session(tmp_path)
+    spec = importlib.util.spec_from_file_location("popout_own", xtasks_or_skip() / POPOUT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    starts = {param.name: param.start for param in module.TASK.params}
+    rows = tuple(ParamRow.of(*row) for row in session.parameters)
+    rows = tuple(dataclasses.replace(row, value=starts[row.name])
+                 if row.value is None and isinstance(starts.get(row.name), (int, float)) else row
+                 for row in rows)
+    return frame(params=rows, groups=tuple(GroupRow(*group) for group in session.groups),
+                 task="tasks/popout_search.py", **over)
+
+
+def _popout_frame(tmp_path, **over):
+    """**The pop-out search's own settings as its session makes their rows** (`Session.parameters`,
+    schema 23; the PI's try-out task), with the states a box must hold without overrunning: a plain
+    name of the longest a task may declare (`task.LABEL_LIMIT`), `fix_hold` drawn by a person with
+    its profile, a size scaled, a value over a draw with its live numbers, a change staged, the
+    long refusal (`_LONG_WHY`), and a change in force with a warning; the color boxes as the rig
+    makes them."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, ParamRow, Refused, Staged
+    from wl_xcon.task import LABEL_LIMIT, NonAging
+    from wl_xcon.variation import profile
+
+    rows = {row[0]: ParamRow.of(*row) for row in _popout_session(tmp_path).parameters}
+    shape = {"shape": "non_aging", "numbers": {"shortest": 0.5, "longest": 1.25},
+             "values": [], "weights": [], "by": "person"}
+    drawn = profile(NonAging(minimum=0.5, mean=0.25, maximum=1.25)).as_dict()
+    rows["fix_hold"] = dataclasses.replace(
+        rows["fix_hold"], label="Fixation hold, before the array is shown"[:LABEL_LIMIT],
+        source="form", switch="drawn", shape=shape, profile=drawn,
+        help="How long gaze must stay on the fixation point before the array appears.")
+    rows["fix_acquisition"] = dataclasses.replace(
+        rows["fix_acquisition"], source="range", draw="uniform from 1 to 3.5 s, changed live",
+        numbers={"low": 1.0, "high": 3.5}, conditions=("near", "far", "middle"), more=4)
+    rows["disc_size"] = dataclasses.replace(rows["disc_size"], source="task", switch="scaled")
+    rows["set_size"] = dataclasses.replace(
+        rows["set_size"], applied=Applied(39, "jake (box, unverified)"),
+        warned=("crowded-array: 12 objects on a 6° ring leave 1.1° between windows of 1.6°",))
+    by = Box("Jake Westerberg")
+    return frame(params=tuple(rows.values()), task="tasks/popout_search.py",
+                 staged=(Staged("fix_window", 2.0, 1.5, by, False, cid="box-2"),),
+                 refusals=(Refused("fix_hold", by, _LONG_WHY, cid="box-1", value=30.0),),
+                 **over)
+
+
+#: **What passes a box's edge, measured** (the layout review's finding 1: "this bug is invisible
+#: to a test that reads the HTML"): for every box on the shown tab, each descendant whose right
+#: edge passes the box's, and each whose own content is wider than it is. A text cut short on
+#: purpose -- `text-overflow: ellipsis` over `overflow: hidden` -- is excepted only where its
+#: `title` holds it whole, and so is what it holds, which it clips; a field, whose text scrolls
+#: inside it, is excepted from the second; and what a closed `<details>` holds, which is not shown
+#: (both engines still lay it out). Each found as `name: tag.class (why)`.
+_OVERRUNS = """(root) => {
+  const found = [];
+  const cut = (node) => {
+    const style = getComputedStyle(node);
+    return style.textOverflow === 'ellipsis' && style.overflowX === 'hidden' &&
+      Boolean(node.getAttribute('title'));
+  };
+  const clipped = (node, box) => {
+    for (let at = node.parentElement; at && at !== box; at = at.parentElement) {
+      if (cut(at)) { return true; }
+      if (at.tagName === 'DETAILS' && !at.open && node.closest('summary') === null) { return true; }
+    }
+    return false;
+  };
+  for (const box of document.querySelectorAll(root + ' .box')) {
+    const edge = box.getBoundingClientRect().right;
+    for (const node of box.querySelectorAll('*')) {
+      const rect = node.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) { continue; }
+      if (clipped(node, box)) { continue; }
+      const said = box.getAttribute('data-card') + ': ' + node.tagName.toLowerCase() + '.' +
+        (node.getAttribute('class') || '').split(' ').join('.');
+      if (rect.right > edge + 0.5) { found.push(said + ' (right edge ' + Math.round(rect.right - edge) + ' px past)'); }
+      if (node instanceof SVGElement || ['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName)) { continue; }
+      if (node.scrollWidth > node.clientWidth + 1 && node.clientWidth > 0 && !cut(node)) {
+        found.push(said + ' (' + node.scrollWidth + ' px of content in ' + node.clientWidth + ')');
+      }
+    }
+  }
+  return found;
+}"""
+
+
+#: **What passes a summary line's edge, a section's or the summary's** (the summary and editor
+#: design's "How it is judged done": "no text past its line or the editor's edge"): each line's
+#: mark, name and value inside its line, each section's header inside its section and each
+#: section inside the summary; a text cut short with an ellipsis is a line's design (its whole in
+#: the line's `title`, the header's in its own), so it is found only where no title holds it; and
+#: the page scrolling across.
+_LINE_OVERRUNS = """(root) => {
+  const found = [];
+  const past = (inner, outer) => inner.right > outer.right + 0.5 || inner.left < outer.left - 0.5 ||
+    inner.bottom > outer.bottom + 0.5 || inner.top < outer.top - 0.5;
+  for (const line of document.querySelectorAll(root + ' > .summary .line')) {
+    const edge = line.getBoundingClientRect();
+    for (const part of line.children) {
+      const rect = part.getBoundingClientRect();
+      if (rect.width > 0 && past(rect, edge)) { found.push(line.getAttribute('data-open') + ': ' + part.className); }
+      if (part.scrollWidth > part.clientWidth + 1 && !line.getAttribute('title')) {
+        found.push(line.getAttribute('data-open') + ': ' + part.className + ' cut with no title');
+      }
+    }
+  }
+  const whole = document.querySelector(root + ' > .summary').getBoundingClientRect();
+  for (const section of document.querySelectorAll(root + ' > .summary .ssec')) {
+    const head = section.querySelector(':scope > h4') || section.querySelector(':scope > .skeep > h4');
+    if (past(head.getBoundingClientRect(), section.getBoundingClientRect())) { found.push('header ' + head.textContent); }
+    if (head.scrollWidth > head.clientWidth + 1 && !head.title) { found.push('header cut ' + head.textContent); }
+    if (past(section.getBoundingClientRect(), whole)) { found.push('section ' + section.getAttribute('data-section')); }
+  }
+  if (document.documentElement.scrollWidth > window.innerWidth) { found.push('the page scrolls across'); }
+  return found;
+}"""
+
+#: **What passes the editor's edge, or its box's, for every setting opened in turn**: each line
+#: of the tab clicked (its own `click()`, so no pointer press holds a frame), then every shown
+#: node in the editor whose right edge passes the editor's, and `_OVERRUNS` on the box shown.
+_EDITOR_OVERRUNS = """(root) => {
+  const overruns = """ + _OVERRUNS + """;
+  const found = [];
+  const editor = document.querySelector(root + ' > .editing');
+  for (const line of document.querySelectorAll(root + ' > .summary .line[data-open]')) {
+    line.click();
+    const edge = editor.getBoundingClientRect().right;
+    for (const node of editor.querySelectorAll('*')) {
+      const rect = node.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) { continue; }
+      const shut = node.parentElement && node.parentElement.closest('details:not([open])');
+      if (shut && node.closest('summary') === null) { continue; }
+      if (rect.right > edge + 0.5) {
+        found.push(line.getAttribute('data-open') + ': ' + node.tagName.toLowerCase() + '.' +
+          (node.getAttribute('class') || '') + ' past the editor by ' + Math.round(rect.right - edge));
+      }
+    }
+    found.push(...overruns(root));
+  }
+  return found;
+}"""
+
+
+def test_no_text_passes_its_box_at_three_widths(rig, tmp_path):
+    """The PI, trying the console in Safari (2026-11-19): "text overruns the boxes, eg, color
+    section". At 1024, 1280 and 1440 wide, on the Task parameters and the Training tabs, no
+    summary line's text passes its line (`_LINE_OVERRUNS`), and with each setting opened in turn
+    no text passes the editor or its box (`_EDITOR_OVERRUNS`): not the color boxes, not the
+    longest plain name, not the long refusal, not a drawn box's shapes; and again with every box's
+    *more* and every New color panel open. Rewritten for the summary and editor design of
+    2026-11-19 from the grid's boxes to the lines and the editor. Through the wire, in a real
+    browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(_popout_frame(tmp_path))))
+    page = rig.browser_page()
+    for tab, root in (("t-task", "#params"), ("t-training", "#training-params")):
+        page.click(f'label[for="{tab}"]')
+        page.wait_for_selector(f"{root} .box", state="attached")
+        assert page.locator(f"{root} > .summary .line").count() > 0, (tab, "the summary's lines")
+        if root == "#params":
+            assert page.locator("#params .box .clr").count() >= 2, "the color boxes are measured"
+            # One for each section holding a color card: Colors, and the fixation point's since
+            # the pop-out's revision gave its two looks their hues.
+            assert page.locator("#params > .summary .line.newcolor").count() == 2
+        for width in WIDTHS:
+            page.set_viewport_size({"width": width, "height": LAPTOP_H})
+            assert page.evaluate(_LINE_OVERRUNS, root) == [], (tab, width)
+            page.evaluate(f"document.querySelectorAll('{root} > .editing details')"
+                          ".forEach((d) => {{ d.open = false; }})")
+            assert page.evaluate(_EDITOR_OVERRUNS, root) == [], (tab, width, "closed")
+            page.evaluate(f"document.querySelectorAll('{root} > .editing details')"
+                          ".forEach((d) => {{ d.open = true; }})")
+            assert page.evaluate(_EDITOR_OVERRUNS, root) == [], (tab, width, "open")
+            assert page.evaluate(_LINE_OVERRUNS, root) == [], (tab, width, "after")
+
+
+def test_an_open_more_stays_open_across_a_frame(rig):
+    """The console interface rework's Task 5: a box's *more* a person opened stays open when a
+    frame replaces the boxes (as a section does, `applySections`), and one they closed again stays
+    closed; the frame's news shows in it. In a real browser: run with `WLX_BROWSER=webkit` too, for
+    Safari."""
+    from wl_xcon.link import ParamRow
+
+    def rows(why):
+        return (ParamRow.of("fix_hold", "s", 0.0, None, 0.5, False, why={"low": why}),
+                ParamRow.of("timeout", "s", 0.0, None, 2.0, False))
+
+    _offer(rig, 40, params=rows("below 0 cannot be"))
+    page = rig.browser_page()
+    page.click('label[for="t-task"]')
+    _more(page)
+    page.click('#params .box[data-card="timeout"] > details.more > summary')
+    _offer(rig, 41, params=rows("a reason of trial 41"))
+    _arrived(page, 41)
+    # `text_content`: the editor shows one box, and `inner_text` reads no box it hides.
+    rig.wait_for(lambda: "a reason of trial 41" in page.text_content("#params"))
+
+    assert page.evaluate("[document.querySelector('#params .box[data-card=\"fix_hold\"] > "
+                         "details.more').open, document.querySelector('#params "
+                         ".box[data-card=\"timeout\"] > details.more').open]") == [True, False]
+
+
+def test_the_first_setting_starts_within_260px_at_1280x800(rig, tmp_path):
+    """The design's "How it is judged done": "the first setting within the first 260 px at 1280 ×
+    800" (the layout review's finding 4: about 500 px went before it), which the summary and
+    editor design makes the first summary line's (its call: "The 260 px rule becomes: the first
+    summary line within 260 px of the top at 1280 × 800"). Measured from the top of the page,
+    unscrolled, on the Task parameters tab: the one bar that stays in view (the console interface
+    rework's Task 8) put the session's details behind *session*, so the tabs follow it."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(_popout_frame(tmp_path))))
+    page = rig.browser_page()
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.click('label[for="t-task"]')
+    page.wait_for_selector("#params .box", state="attached")
+    assert page.locator("#params > .summary .line").count() > 0, "the summary's lines"
+
+    top = page.evaluate("document.querySelector('#params > .summary .line').getBoundingClientRect()"
+                        ".top + window.scrollY")
+    assert top <= 260, top
+
+
+def test_every_popout_line_is_above_the_fold_at_1280x800(rig, tmp_path):
+    """The summary and editor design's goal 1: "all of the pop-out's Task parameters fit above
+    the editor on a 1280 × 800 screen with the top bar", judged as its call says: the pop-out as
+    built, at 1280 × 800 with the demo screen's column shown (as in the PI's try-out), no banner,
+    the drafts bar at the window's foot (fixed, not in the flow; none here), the last summary
+    line's bottom within 800 px, unscrolled. Through the wire, in a real browser: run with
+    `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(_popout_frame(tmp_path, demo=True))))
+    page = rig.browser_page()
+    page.set_viewport_size({"width": 1280, "height": LAPTOP_H})
+    page.click('label[for="t-task"]')
+    page.wait_for_selector("#params .box", state="attached")
+    assert page.locator("#params > .summary .line").count() > 0, "the summary's lines"
+    assert page.is_visible("#demo-pane"), "the demo screen's column is shown"
+    assert not page.is_visible("#stream") and not page.is_visible("#drafts")
+
+    bottoms = page.evaluate("""() => Array.from(document.querySelectorAll(
+        '#params > .summary .line')).map((line) => [line.getAttribute('data-open'),
+        line.getBoundingClientRect().bottom + window.scrollY])""")
+    assert len(bottoms) >= 15, bottoms
+    below = [(name, round(bottom)) for name, bottom in bottoms if bottom > LAPTOP_H]
+    assert below == [], below
+    # In columns (the design's goal 1): two at 1280 wide beside the demo screen, as wide as the
+    # longest plain name a task may declare with its value (the ledger's ruling for the build's
+    # Task 2, which the four of the design cut: `test_no_popout_name_is_cut_at_1280`).
+    columns = page.evaluate("""() => new Set(Array.from(document.querySelectorAll(
+        '#params > .summary > .ssec')).map((section) => Math.round(
+        section.getBoundingClientRect().left))).size""")
+    assert columns == 2, columns
+
+
+#: **The special kinds' shares** (`popout_search.py`'s Special trials), by name.
+SHARES = ("target_absent_percent", "odd_place_empty_percent", "distractor_alone_percent",
+          "odd_one_alone_percent")
+
+
+def _heads_kept(page, root: str = "#params") -> list:
+    """Each section of subsections alone whose header stands in another column than its first
+    subsection, or at a column's foot with nothing under it, by name: the header stranded."""
+    return page.evaluate("""(root) => Array.from(document.querySelectorAll(
+        root + ' > .summary > .ssec')).filter((section) => !section.querySelector(':scope > .line')
+        && section.querySelector('.ssec')).filter((section) => {
+          const head = section.querySelector(':scope > h4, :scope > .skeep > h4');
+          const first = section.querySelector('.ssec');
+          const h = head.getBoundingClientRect(), f = first.getBoundingClientRect();
+          return Math.round(h.left) !== Math.round(f.left) || f.top < h.bottom - 1;
+        }).map((section) => section.getAttribute('data-section'))""", root)
+
+
+#: **The special trials' shares a test sets** (the PI, 2026-11-20, "Shorter line, no cut"): all at
+#: 0, one at 10, two on, all at 10 and all at 100, each with the line it says.
+SHARE_CASES = (
+    ({}, "none"),
+    ({"target_absent_percent": 10}, "absent 10%"),
+    ({"target_absent_percent": 10, "odd_place_empty_percent": 5}, "absent 10% · empty 5%"),
+    (dict.fromkeys(SHARES, 10), "4 kinds · 40% of trials"),
+    (dict.fromkeys(SHARES, 100), "4 kinds · 400% of trials"),
+)
+
+
+@pytest.mark.parametrize("width", [1024, 1280, 1440])
+def test_turning_special_trials_on_moves_nothing_in_the_summary(rig, tmp_path, width):
+    """The pop-out revision's whole-build review, I1 (the summary and editor design's anti-goal:
+    "the page jumping under the pointer"): **the summary's columns are sized from the widest value
+    each setting can show** (`web._widest`), never from the values in force, and a group's line by
+    its name. On the pop-out's own rows at 1024, 1280 and 1440 wide, 800 high, the demo screen's
+    column shown, the four shares at 0, one at 10, two on, all at 10 and all at 100 move no line,
+    no header, the legend nor the editor's top, and keep the columns; and **a section of subsections
+    alone keeps its header with its first subsection** in its column (WebKit left "Stimuli · 16
+    settings" alone at a column's foot). **And the Special trials line is never cut** (the PI,
+    2026-11-20, from his try-out: "Shorter line, no cut"): it says only the shares that are on, in
+    short words, "none" with every share at 0, or, where those would not fit, how many kinds and
+    their sum -- its value never wider than its box (`scrollWidth <= clientWidth`) -- and its title
+    holds every share whole. In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import decode, encode
+
+    made = _popout_own(tmp_path, demo=True)
+    labels = {row.name: row.label for row in made.params if row.name in SHARES}
+
+    def offer(shares, trial):
+        rig.hub.offer(decode(encode(dataclasses.replace(made, trial_index=trial, params=tuple(
+            dataclasses.replace(row, value=shares.get(row.name, 0)) if row.name in SHARES else row
+            for row in made.params)))))
+
+    offer({}, 40)
+    page = rig.browser_page()
+    page.set_viewport_size({"width": width, "height": LAPTOP_H})
+    page.click('label[for="t-task"]')
+    page.wait_for_selector("#params > .summary .line", state="visible")
+    _arrived(page, 40)
+    before = _rects(page)
+    assert before[-1][0] == "editing", before[-1]
+    assert _heads_kept(page) == []
+    line = '#params > .summary .line[data-open="Special trials"]'
+    for trial, (shares, said) in enumerate(SHARE_CASES, start=41):
+        offer(shares, trial)
+        _arrived(page, trial)
+        page.wait_for_function(f"() => document.querySelector({line!r} + ' > .lv')"
+                               f".textContent === {said!r}")
+        assert _rects(page) == before, shares
+        assert _heads_kept(page) == [], shares
+        shown = page.evaluate(f"""() => {{ const lv = document.querySelector({line!r} + ' > .lv');
+            return [lv.scrollWidth, lv.clientWidth]; }}""")
+        assert shown[0] <= shown[1], (shares, said, shown)
+        title = page.get_attribute(line, "title")
+        for name, label in labels.items():
+            assert f"{label} {shares.get(name, 0)}%" in title, (name, title)
+
+
+def test_the_special_trials_line_says_the_rest_are_normal_search(rig, tmp_path):
+    """The pop-out revision's plan, Amendments, item 4 (the console interface design's goal 8:
+    "the remainder shown as "normal search""; the PI, 2026-11-19, "One box after Timing"): **the
+    special trials are one box, its section right after Timing**, read as one sentence, and after
+    it the trials it leaves normal -- "70 normal search" from the shares in force, as the rig
+    renders it -- and while a draft is open, from the box's own fields as they are typed: "40
+    normal search", "none normal search" at 100, and past 100 the warning's own words after it; a
+    field emptied counts none, and Discard says the values in force again. Through the wire, in a
+    real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon import web
+    from wl_xcon.check import IN_PROPORTION
+    from wl_xcon.link import decode, encode
+
+    made = _popout_own(tmp_path)
+    shares = {"target_absent_percent": 20, "odd_place_empty_percent": 10}
+    made = dataclasses.replace(made, params=tuple(
+        dataclasses.replace(row, value=shares[row.name]) if row.name in shares else row
+        for row in made.params))
+    rig.hub.offer(decode(encode(made)))
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+    page.wait_for_selector("#params > .summary .line", state="visible")
+    sections = page.eval_on_selector_all("#params > .summary > .ssec", "(all) => all.map((one) => "
+                                         "one.getAttribute('data-section'))")
+    assert sections[:3] == ["Timing", "Special trials", "Gaze windows"], sections
+    _open(page, "Special trials")
+    box = _b("Special trials")
+    rest = f"{box} > .editor > .gr"
+    assert page.text_content(rest) == "70 normal search"
+    assert web._rest_said(30) == "70 normal search"
+
+    page.fill(f'{box} input[data-param="distractor_alone_percent"]', "30")
+    assert page.text_content(rest) == "40 normal search"
+    page.fill(f'{box} input[data-param="odd_one_alone_percent"]', "40")
+    assert page.text_content(rest) == "none normal search" == web._rest_said(100)
+    page.fill(f'{box} input[data-param="odd_one_alone_percent"]', "45")
+    assert page.text_content(rest) == f"none normal search: {IN_PROPORTION}" == web._rest_said(105)
+    page.fill(f'{box} input[data-param="odd_one_alone_percent"]', "")
+    assert page.text_content(rest) == "40 normal search"
+    page.click(f"{box} [data-discard]")
+    page.wait_for_function(f"() => document.querySelector({rest!r}).textContent === "
+                           f"'70 normal search'")
+
+
+def _rects(page, root: str = "#params") -> list:
+    """Where everything above the editor stands: each summary line, each section's header, the
+    legend and the find box, in page coordinates."""
+    return page.evaluate("""(root) => Array.from(document.querySelectorAll(
+        root + ' > .summary .line, ' + root + ' > .summary .ssec > h4, ' + root +
+        ' > .summary .skeep > h4, ' + root + ' > .legend, ' +
+        root + ' > .editing')).map((node) => { const r = node.getBoundingClientRect();
+        return [node.getAttribute('data-open') || node.className, Math.round(r.left * 10),
+                Math.round((r.top + window.scrollY) * 10), Math.round(r.width * 10),
+                Math.round(r.height * 10)]; })""", root)
+
+
+def test_a_click_opens_a_setting_and_nothing_above_moves(rig, tmp_path):
+    """The summary and editor design's goal 2 and its anti-goal ("the page jumping under the
+    pointer: opening a setting changes nothing above the editor"): at 1280 × 800 the editor first
+    says "click a setting above to change it"; a click on a summary line opens that setting's box
+    there, alone, its line pressed; and opening three in turn -- a drawn hold with its long
+    refusal, the pairings' grid, a whole count -- leaves every line, every header, the legend and
+    the editor's top where they were. Through the wire, in a real browser: run with
+    `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(_popout_frame(tmp_path))))
+    page = rig.browser_page()
+    page.set_viewport_size({"width": 1280, "height": LAPTOP_H})
+    page.click('label[for="t-task"]')
+    lines = page.locator("#params > .summary .line[data-open]")
+    assert lines.count() == page.locator("#params > .editing > .box").count() + 2, (
+        "a line for every box, and the New color… of Colors and of the fixation point")
+    assert _opened(page) == ["click a setting above to change it"]
+    before = _rects(page)
+    editor_top = before[-1][2]
+    heights = page.eval_on_selector_all(
+        "#params > .summary .line", "lines => lines.map((line) => line.getBoundingClientRect().height)")
+    assert len(set(heights)) == 1 and 18 <= heights[0] <= 22, heights
+
+    for name in ("fix_hold", "pairings", "set_size"):
+        _open(page, name)
+        assert _opened(page) == [name], name
+        pressed = page.eval_on_selector_all(
+            "#params > .summary .line[aria-pressed='true']",
+            "lines => lines.map((line) => line.getAttribute('data-open'))")
+        assert pressed == [name], (name, pressed)
+        after = _rects(page)
+        assert after[:-1] == before[:-1], name
+        assert after[-1][2] == editor_top, name
+    assert page.is_visible(f'{_b("set_size")} input[data-param="set_size"]')
+    assert rig.dispatch.seen == [], "opening a setting sends nothing"
+
+
+def test_the_opened_setting_survives_a_frame_and_a_reload(rig):
+    """The summary and editor design's goal 5: the setting opened stays opened across a frame that
+    changes it, a tab switch and a reload, kept per task in the browser's own storage
+    (`wlx.opened.<task>`); another task's settings open with nothing opened, and the first task's
+    opens again on return. Replaces `test_sections_open_as_last_left_per_task`: the sections no
+    longer fold. In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    _sectioned(rig)
+    page = rig.browser_page()
+    page.click('label[for="t-task"]')
+    assert _opened(page) == ["click a setting above to change it"]
+    _open(page, "fix_window")
+    assert _opened(page) == ["fix_window"]
+
+    from wl_xcon.link import ParamRow, decode, encode
+    rows = (ParamRow.of("fix_hold", "s", 0.1, 1.0, 0.3, False, section="Timing"),
+            ParamRow.of("fix_window", "deg", 0.0, 9.0, 3.5, False, section="Gaze windows",
+                        changed=True),
+            ParamRow.of("fix_size", "deg", 0.0, 9.0, 0.5, False, section="Stimuli/fixation point"))
+    line = '#params > .summary .line[data-open="fix_window"]'
+    page.evaluate("(line) => { document.querySelector(line).wlxSame = true; }", line)
+    rig.hub.offer(decode(encode(frame(params=rows, trial_index=41))))
+    _until(page, "document.querySelector('#params input[data-param=\"fix_window\"]')"
+                 ".value === '3.50'")
+    assert _opened(page) == ["fix_window"]
+    # The line takes the frame's value in place, its node kept (`patchLine`).
+    # Degrees said short on the line (the ledger's ruling for the build's Task 2).
+    assert page.text_content(f"{line} > .lv") == "3.50°"
+    assert page.evaluate("(line) => document.querySelector(line).wlxSame === true", line)
+    assert "changed" in page.get_attribute(line, "class").split()
+    page.click('label[for="t-runtime"]')
+    page.click('label[for="t-task"]')
+    assert _opened(page) == ["fix_window"]
+    _open(page, "fix_size")
+    kept = page.evaluate("window.localStorage.getItem('wlx.opened.tasks/fixation_detection.py')")
+    assert kept == "fix_size"
+
+    page.reload()
+    page.click('label[for="t-task"]')
+    assert _opened(page) == ["fix_size"]
+    assert page.is_visible(f'{_b("fix_size")} input[data-param="fix_size"]')
+
+    _sectioned(rig, task="tasks/popout_search.py", trial_index=42)
+    _until(page, "document.querySelector('#params .summary').getAttribute('data-task')"
+                 " === 'tasks/popout_search.py'")
+    assert _opened(page) == ["click a setting above to change it"]
+    _sectioned(rig, trial_index=43)
+    _until(page, "document.querySelector('#params .summary').getAttribute('data-task')"
+                 " === 'tasks/fixation_detection.py'")
+    assert _opened(page) == ["fix_size"]
+
+
+def test_an_opened_setting_that_is_gone_shows_the_placeholder(rig):
+    """The plan's Review Focus 2: the setting opened disappears -- a run without it, a group
+    regrouped -- and the editor falls back to "click a setting above to change it", the stored
+    name dropped, so it does not come back with the setting, and nothing is raised into the page.
+    In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    errors = []
+    page = _task6_page(rig, params=_group_rows(), groups=_move_up())
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    key = "wlx.opened.tasks/fixation_detection.py"
+    assert page.locator('#params > .summary .line[data-open="set_size"]').count() == 1
+    _open(page, "set_size")
+    assert _opened(page) == ["set_size"]
+
+    _offer(rig, 41, params=tuple(row for row in _group_rows() if row.name != "set_size"),
+           groups=_move_up())
+    _until(page, "document.querySelector('#params .box[data-card=\"set_size\"]') === null")
+    assert _opened(page) == ["click a setting above to change it"]
+    assert page.evaluate(f"window.localStorage.getItem('{key}')") is None
+    _offer(rig, 42, params=_group_rows(), groups=_move_up())
+    _until(page, "document.querySelector('#params .box[data-card=\"set_size\"]') !== null")
+    assert _opened(page) == ["click a setting above to change it"], "dropped, not kept"
+
+    _open(page, "Move up")
+    assert _opened(page) == ["Move up"]
+    _offer(rig, 43, params=_group_rows(), groups=())
+    _until(page, "document.querySelector('#params .box[data-card=\"move_up_bar\"]') !== null")
+    assert _opened(page) == ["click a setting above to change it"]
+    assert page.evaluate(f"window.localStorage.getItem('{key}')") is None
+    assert page.locator('#params > .summary .line[aria-pressed="true"]').count() == 0
+    assert errors == []
+
+
+def test_a_group_line_opens_its_sentence(rig):
+    """The summary and editor design's goal 6: a group is one line -- its title, its settings'
+    values joined -- and one editor, its sentence with its fields in place and one Apply, which
+    sends one `apply_many` of what it changed under one command id, as its box did on the grid.
+    In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import ApplyMany, SetParameter
+
+    page = _task6_page(rig, params=_group_rows(), groups=_move_up())
+    line = '#params > .summary .line[data-open="Move up"]'
+    assert page.locator(line).count() == 1, "a group is one line"
+    assert page.text_content(f"{line} > .ln") == "Move up"
+    assert page.text_content(f"{line} > .lv") == "80% · 50"
+    assert page.locator('#params > .summary .line[data-open="move_up_bar"]').count() == 0
+
+    _open(page, "Move up")
+    assert _opened(page) == ["Move up"]
+    box = _b("Move up")
+    assert page.eval_on_selector_all(
+        f"{box} .editor .sentence > *",
+        "parts => parts.map((p) => p.matches('.gs') ? p.textContent : '[' +"
+        " p.querySelector('input').value + ']')"
+    ) == ["Move up when at least ", "[80]", " of the last ", "[50]", " answers are right"]
+    page.fill(f'{box} input[data-param="move_up_bar"]', "90")
+    page.fill(f'{box} input[data-param="move_up_window"]', "51")
+    assert page.locator(f"{box} [data-apply]").count() == 1
+    page.click(f"{box} [data-apply]")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    time.sleep(0.3)  # housekeeping: room for a wrong second send to arrive
+
+    (sent,) = rig.dispatch.seen
+    assert type(sent) is ApplyMany and sent.cid
+    assert [(type(change), change.name, change.value) for change in sent.changes] == [
+        (SetParameter, "move_up_bar", 0.9), (SetParameter, "move_up_window", 51.0)]
+
+
+def test_new_color_opens_from_the_colors_section(rig):
+    """The summary and editor design's call "Colors: the *New color…* panel opens from the Colors
+    section's header in the summary, into the editor": the Colors section's lines end with *New
+    color…*, which opens its section's panel in the editor, unfolded, the color boxes hidden; what
+    is typed in it stays across a frame; opening a color box hides it again. In a real browser:
+    run with `WLX_BROWSER=webkit` too, for Safari."""
+    from pathlib import Path
+
+    from wl_xcon.link import ParamRow, decode, encode
+    from wl_xcon.photometry import ColorSet
+
+    isohue = ColorSet.load(Path(__file__).parent / "fixtures" / "isohue_design.json")
+    color = {
+        "sets": {"isohue": {"apex": list(isohue.apex), "luminance_cd_m2": 15.0,
+                            "design": dict(isohue.design),
+                            "hues": {hue: {"xy": list(xy), "srgb": "#808080"}
+                                     for hue, xy in isohue.colors.items()}}},
+        "set": "isohue", "hue": "green", "approximate": True,
+        "saturation": {"setting": None, "value": 1.0, "cd_m2": 15.0},
+        "luminance": {"setting": None, "value": 15.0, "cd_m2": 15.0, "set_wide": False},
+    }
+    rows = (ParamRow.of("fix_hold", "s", 0.1, 1.0, 0.3, False, section="Timing"),
+            ParamRow.of("odd_color", "appearance", None, None, None, False, source="run",
+                        color=color, section="Colors"),
+            ParamRow.of("distractor_color", "appearance", None, None, None, False, source="run",
+                        color=color, section="Colors"))
+    rig.hub.offer(decode(encode(frame(params=rows))))
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+    colors = page.eval_on_selector_all(
+        '#params > .summary .ssec[data-section="Colors"] > .line',
+        "lines => lines.map((line) => line.getAttribute('data-open'))")
+    assert colors == ["odd_color", "distractor_color", "new-color:Colors"], colors
+
+    _open(page, "new-color:Colors")
+    assert _opened(page) == ["Colors"]
+    assert page.evaluate("document.querySelector('#params > .editing > [data-newc=\"Colors\"]').open")
+    page.fill('[data-newc="Colors"] input[data-newc-name]', "violet")
+    rig.hub.offer(decode(encode(frame(params=rows, trial_index=41))))
+    _arrived(page, 41)
+    assert _opened(page) == ["Colors"]
+    assert page.input_value('[data-newc="Colors"] input[data-newc-name]') == "violet"
+    _open(page, "odd_color")
+    assert _opened(page) == ["odd_color"]
+    assert not page.is_visible('[data-newc="Colors"]')
+
+
+def test_runtime_still_needed_reads_as_words_at_three_widths(rig):
+    """The workflow review's F12: Runtime's "Still needed" drew `this block has no percentage
+    rule, so this changes nothing here` one letter per line down 950 px. At 1024, 1280 and 1440
+    wide, each sentence of the pane's rows is at least eight ems wide and no taller than three of
+    its lines. In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(frame(rule=None, clearing=False, owed={"ecc 10": 18}))))
+    page = rig.browser_page()
+    page.wait_for_selector("#rt-need .kv .nm", state="visible")
+    for width in WIDTHS:
+        page.set_viewport_size({"width": width, "height": LAPTOP_H})
+        shapes = page.evaluate("""() => Array.from(document.querySelectorAll('#rt-need .kv > .nm'))
+          .map((span) => {
+            const rect = span.getBoundingClientRect();
+            const line = parseFloat(getComputedStyle(span).lineHeight) ||
+              1.4 * parseFloat(getComputedStyle(span).fontSize);
+            const em = parseFloat(getComputedStyle(span).fontSize);
+            return [span.textContent.slice(0, 40), rect.width / em, rect.height / line];
+          })""")
+        assert any("no percentage rule" in said for said, _, _ in shapes), shapes
+        narrow = [(said, round(wide, 1), round(tall, 1)) for said, wide, tall in shapes
+                  if wide < 8 or tall > 3.2]
+        assert narrow == [], (width, narrow)
+
+
+# --- the console interface rework's Task 6: drafts, Apply, Apply all and withdraw ---------------
+#
+# The PI, 2026-11-19: "i prefer an apply button in each box for making a change". Nothing a box
+# holds is sent until its Apply, Enter in one of its fields, or Apply all; each box says where it
+# stands in one status line (the plan's "Words on the page"); a frame is patched box by box, so a
+# press lands on a node no frame replaced. Through the wire, in a real browser: each runs in
+# Chromium in the suite and in WebKit (`WLX_BROWSER=webkit`), for Safari, by the builder.
+
+def _b(name: str, root: str = "#params") -> str:
+    return f'{root} .box[data-card="{name}"]'
+
+
+def _say(page, name: str, root: str = "#params") -> str:
+    return page.text_content(f"{_b(name, root)} > .status > .say").strip()
+
+
+def _says(rig, page, name: str, said: str, root: str = "#params", start: bool = False) -> None:
+    """Wait until box `name`'s status line says `said` (or starts with it), failing with what it
+    said instead."""
+    end = time.monotonic() + WAIT_S
+    while time.monotonic() < end:
+        now = _say(page, name, root)
+        if (now.startswith(said) if start else now == said):
+            return
+        page.wait_for_timeout(50)
+    pytest.fail(f"{name}'s status line says {_say(page, name, root)!r}, not {said!r}")
+
+
+def _classes(page, name: str, root: str = "#params") -> list:
+    return page.get_attribute(_b(name, root), "class").split()
+
+
+def _head(page, name: str, root: str = "#params") -> str:
+    return page.text_content(f"{_b(name, root)} > .head .now").strip()
+
+
+def _bar(page) -> str | None:
+    """The drafts bar's words, or None while it is hidden."""
+    if not page.is_visible("#drafts"):
+        return None
+    return page.text_content("#drafts-say").strip()
+
+
+def _sent_of(rig, kind) -> list:
+    return [seen for seen in rig.dispatch.seen if isinstance(seen, kind)]
+
+
+def _task6_rows(hold=0.3, deadline=0.6, size=4, **over):
+    """A Timing section's two holds, a whole count in Stimuli and the reward size, each as the rig
+    makes their rows (`ParamRow.of`): `fix_hold` 0.1 to 1 s at a 0.05 step, `set_size` 1 to 36
+    whole; `over` replaces fields of a row by its name."""
+    from wl_xcon.link import ParamRow
+
+    rows = {
+        "fix_hold": ParamRow.of("fix_hold", "s", 0.1, 1.0, hold, False, source="task", step=0.05,
+                                section="Timing"),
+        "response_deadline": ParamRow.of("response_deadline", "s", 0.2, 2.0, deadline, False,
+                                         source="task", step=0.05, section="Timing"),
+        "set_size": ParamRow.of("set_size", "objects", 1.0, 36.0, size, False, source="task",
+                                whole=True, step=1.0, section="Stimuli"),
+        "reward_correct": ParamRow.of("reward_correct", "mL", 0.0, 0.4, 0.15, True, step=0.01),
+    }
+    for name, fields in over.items():
+        rows[name] = dataclasses.replace(rows[name], **fields)
+    return tuple(rows.values())
+
+
+def _task6_page(rig, trial=40, **fields):
+    _offer(rig, trial, params=fields.pop("params", _task6_rows()), **fields)
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+    page.wait_for_selector(_b("fix_hold"), state="visible")
+    return page
+
+
+def test_nothing_is_sent_until_apply(rig):
+    """The design's goal 2: typing, −/+ (Shift-click steps ten times as far) and a segment of the
+    fixed/drawn switch each make a draft the box shows as *not sent*, and nothing is sent -- past
+    the 600 ms the old fields and arrows waited before sending on their own; the head still says
+    the value in force; a frame arriving leaves every draft; the drafts bar counts them in the
+    boxes' order."""
+    from wl_xcon.link import ParamRow
+
+    wait = ParamRow.of("wait", "s", 0.05, 2.0, 0.5, False, source="task", step=0.05,
+                       switch="drawn", section="Timing")
+    page = _task6_page(rig, params=_task6_rows() + (wait,))
+
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+    page.click(f'{_b("set_size")} [data-dir="1"]')
+    page.click(f'{_b("set_size")} [data-dir="1"]', modifiers=["Shift"])
+    page.click(f'{_b("wait")} [data-switch="drawn"]')
+    page.fill(f'{_b("wait")} [data-fields="non_aging"] input[data-form="shortest"]', "0.4")
+    page.fill(f'{_b("wait")} [data-fields="non_aging"] input[data-form="longest"]', "0.9")
+    _offer(rig, 41, params=_task6_rows() + (wait,))
+    _arrived(page, 41)
+    time.sleep(0.8)  # housekeeping: past the old fields' and arrows' 600 ms
+
+    assert rig.dispatch.seen == []
+    for name in ("fix_hold", "set_size", "wait"):
+        assert _say(page, name) == "not sent", name
+        assert "draft" in _classes(page, name), name
+    assert page.input_value(f'{_b("set_size")} input[data-param="set_size"]') == "15"
+    assert page.input_value(f'{_b("fix_hold")} input[data-param="fix_hold"]') == "0.5"
+    assert _head(page, "fix_hold") == "0.30 s"
+    assert _head(page, "set_size") == "4 objects"
+    assert page.is_visible(f'{_b("wait")} [data-side="drawn"]')
+    assert _bar(page) == "3 edits not sent: fix_hold, wait, set_size"
+    assert "draft" not in _classes(page, "response_deadline")
+
+
+def test_escape_leaves_a_drawn_settings_shape_select_and_returns_to_its_line(rig, tmp_path):
+    """The pop-out revision's whole-build review, M3 (the summary and editor design's goal 7): in
+    a drawn setting's editor **Esc leaves the shape `<select>`**, and a second Esc returns to the
+    setting's summary line, as from a field. In a real browser: run with `WLX_BROWSER=webkit` too,
+    for Safari."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(_popout_frame(tmp_path))))
+    page = rig.browser_page()
+    _sign_in(page)
+    page.set_viewport_size({"width": 1280, "height": LAPTOP_H})
+    page.click('label[for="t-task"]')
+    _open(page, "fix_hold")
+    shape = f'{_b("fix_hold")} select'
+    page.focus(shape)
+    assert page.evaluate("document.activeElement.tagName") == "SELECT"
+    page.keyboard.press("Escape")
+    assert page.evaluate("document.activeElement.tagName") != "SELECT"
+    page.keyboard.press("Escape")
+    assert page.evaluate("document.activeElement.getAttribute('data-open')") == "fix_hold"
+
+
+def test_enter_applies_and_escape_undoes(rig):
+    """The controls review's F7, as the design takes it: in a box's field Esc puts the box back to
+    the value in force, the field keeping focus, and a second Esc leaves the field; ↑ and ↓ step
+    it, Shift ten steps; Enter is Apply, sending the box's one change under a command id of the
+    page's own, and the box says *sending…* until a frame answers it."""
+    from wl_xcon.link import SetParameter
+
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+
+    page.fill(field, "0.5")
+    assert _say(page, "fix_hold") == "not sent"
+    page.press(field, "Escape")
+    assert page.input_value(field) == "0.30"
+    assert _say(page, "fix_hold") == "0.10 to 1.00"
+    assert page.evaluate("document.activeElement.getAttribute('data-param')") == "fix_hold"
+    page.press(field, "Escape")
+    assert page.evaluate("document.activeElement.getAttribute('data-param')") is None
+
+    size = f'{_b("set_size")} input[data-param="set_size"]'
+    page.focus(size)
+    page.press(size, "ArrowUp")
+    assert page.input_value(size) == "5"
+    page.press(size, "Shift+ArrowUp")
+    assert page.input_value(size) == "15"
+    page.press(size, "Escape")
+    assert page.input_value(size) == "4"
+
+    page.fill(field, "0.45")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    _says(rig, page, "fix_hold", "sending…")
+
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.value, sent.by.name) == (
+        SetParameter, "fix_hold", 0.45, "Jake Westerberg")
+    assert isinstance(sent.cid, str) and 1 <= len(sent.cid) <= 64
+    assert page.is_disabled(f'{_b("fix_hold")} [data-apply]')
+
+
+def test_a_draft_equal_to_the_value_in_force_is_no_draft(rig):
+    """The controls review's §2, rule 4: typing a value back to the one in force, as a number
+    (`0.3` is `0.30`), or stepping away and back, clears *not sent*: no draft, no Apply, nothing
+    in the drafts bar."""
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+
+    page.fill(field, "0.8")
+    assert _say(page, "fix_hold") == "not sent" and _bar(page) == "1 edit not sent: fix_hold"
+    page.fill(field, "0.3")
+    assert _say(page, "fix_hold") == "0.10 to 1.00"
+    assert "draft" not in _classes(page, "fix_hold")
+    assert not page.is_visible(f'{_b("fix_hold")} [data-apply]')
+    assert _bar(page) is None
+    page.click(f'{_b("set_size")} [data-dir="1"]')
+    assert _say(page, "set_size") == "not sent"
+    page.click(f'{_b("set_size")} [data-dir="-1"]')
+    assert _say(page, "set_size") == "1 to 36 · whole number"
+    assert _bar(page) is None
+    assert rig.dispatch.seen == []
+
+
+def test_the_box_walks_through_its_states(rig):
+    """The design's goal 4, every outcome in one reserved line: *not sent* → *sending…* →
+    *waiting · you* (the rig's staged row naming the page's command id, the head
+    saying what waits, *withdraw* offered) → *in force from trial N*; then *refused <value> ·
+    <reason>*, the draft kept for correction with Apply live; and *in force, with a warning*."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, Refused, Staged
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+
+    page.fill(field, "0.5")
+    assert _say(page, "fix_hold") == "not sent"
+    page.click(f'{_b("fix_hold")} [data-apply]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+    assert _say(page, "fix_hold") == "sending…"
+    cid = rig.dispatch.seen[-1].cid
+    _offer(rig, 41, params=_task6_rows(), staged=(Staged("fix_hold", 0.3, 0.5, jake, False, cid=cid),))
+    _says(rig, page, "fix_hold", "waiting · you")
+    assert _head(page, "fix_hold") == "0.30 → 0.50 s"
+    assert page.is_visible(f'{_b("fix_hold")} [data-withdraw="{cid}"]')
+    assert "staged" in _classes(page, "fix_hold") and "draft" not in _classes(page, "fix_hold")
+    _offer(rig, 42, params=_task6_rows(0.5, fix_hold={"applied": Applied(42, str(jake))}))
+    _says(rig, page, "fix_hold", "in force from trial 42")
+    assert page.input_value(field) == "0.50"
+
+    page.fill(field, "0.95")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    again = rig.dispatch.seen[-1].cid
+    why = ("'fix_hold' at 0.95 is refused, and the previous value stands: the hold and the time "
+           "to acquire the point no longer fit inside the timeout")
+    _offer(rig, 43, params=_task6_rows(0.5, fix_hold={"applied": Applied(42, str(jake))}),
+           refusals=(Refused("fix_hold", jake, why, cid=again, value=0.95),))
+    _says(rig, page, "fix_hold", "refused 0.95 · the hold and the time to acquire", start=True)
+    assert page.input_value(field) == "0.95"
+    assert {"refused", "draft"} <= set(_classes(page, "fix_hold"))
+    assert page.is_visible(f'{_b("fix_hold")} [data-apply]')
+    assert not page.is_disabled(f'{_b("fix_hold")} [data-apply]')
+
+    page.fill(f'{_b("response_deadline")} input[data-param="response_deadline"]', "0.8")
+    page.click(f'{_b("response_deadline")} [data-apply]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 3)
+    warned = "crowded-array: 12 objects on a 6° ring leave 1.1° between windows of 1.6°"
+    _offer(rig, 44, params=_task6_rows(0.5, 0.8, fix_hold={"applied": Applied(42, str(jake))},
+                                       response_deadline={"applied": Applied(44, str(jake)),
+                                                          "warned": (warned,)}),
+           refusals=(Refused("fix_hold", jake, why, cid=again, value=0.95),))
+    _says(rig, page, "response_deadline", "in force, with a warning · from trial 44")
+    assert "warned" in _classes(page, "response_deadline")
+
+
+def test_a_later_accepted_change_clears_the_refusal(rig):
+    """The design's goal 4: "a refusal is cleared by a later accepted change of that setting". The
+    frame keeps its last refusals, so the rig still sends this one after a later change of the
+    setting was staged and applied; the box says the change in force, not the old refusal, and so
+    does its summary line, the rig's ! dropped (the summary and editor build's Task 2: the page's
+    "cleared-refusal marks")."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, Refused, Staged
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.95")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    refused = (Refused("fix_hold", jake, "'fix_hold' at 0.95 is refused, and the previous value "
+                       "stands: it does not fit", cid=rig.dispatch.seen[-1].cid, value=0.95),)
+    _offer(rig, 41, params=_task6_rows(), refusals=refused)
+    _says(rig, page, "fix_hold", "refused 0.95 · it does not fit")
+
+    page.fill(field, "0.4")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    cid = rig.dispatch.seen[-1].cid
+    _offer(rig, 42, params=_task6_rows(), refusals=refused,
+           staged=(Staged("fix_hold", 0.3, 0.4, jake, False, cid=cid),))
+    _says(rig, page, "fix_hold", "waiting · you")
+    _offer(rig, 43, params=_task6_rows(0.4, fix_hold={"applied": Applied(43, str(jake))}),
+           refusals=refused)
+
+    _says(rig, page, "fix_hold", "in force from trial 43")
+    assert "refused" not in _classes(page, "fix_hold")
+    assert "applied" in _classes(page, "fix_hold")
+    assert page.get_attribute(_line("fix_hold"), "data-said").startswith("refused 0.95"), (
+        "the rig's line still says the refusal")
+    assert _marked(page, "fix_hold") == ("", "0.40 s", "fix_hold · 0.40 s · in force from trial 43")
+    assert "refused" not in page.get_attribute(_line("fix_hold"), "class").split()
+
+
+def test_apply_all_sends_one_command_and_both_take_effect_on_one_trial(rig):
+    """The design's goal 2: "Apply all stages them together, on the same trial". Two drafts, one
+    press: one `apply_many` of both changes under one command id; both boxes say *sending…*, then
+    *waiting* as the rig stages them under that id, and *in force from trial 41* together."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, ApplyMany, SetParameter, Staged
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig)
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+    page.fill(f'{_b("response_deadline")} input[data-param="response_deadline"]', "0.8")
+    assert _bar(page) == "2 edits not sent: fix_hold, response_deadline"
+
+    page.click("#drafts-apply")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    time.sleep(0.3)  # housekeeping: room for a wrong second send to arrive
+
+    (sent,) = rig.dispatch.seen
+    assert type(sent) is ApplyMany and sent.by.name == "Jake Westerberg"
+    assert [(type(change), change.name, change.value) for change in sent.changes] == [
+        (SetParameter, "fix_hold", 0.5), (SetParameter, "response_deadline", 0.8)]
+    assert _say(page, "fix_hold") == _say(page, "response_deadline") == "sending…"
+    assert _bar(page) is None
+    _offer(rig, 41, params=_task6_rows(), staged=(
+        Staged("fix_hold", 0.3, 0.5, jake, False, cid=sent.cid),
+        Staged("response_deadline", 0.6, 0.8, jake, False, cid=sent.cid)))
+    _says(rig, page, "response_deadline", "waiting · you")
+    assert _say(page, "fix_hold") == "waiting · you"
+    applied = Applied(41, str(jake))
+    _offer(rig, 42, params=_task6_rows(0.5, 0.8, fix_hold={"applied": applied},
+                                       response_deadline={"applied": applied}))
+    _says(rig, page, "response_deadline", "in force from trial 41")
+    assert _say(page, "fix_hold") == "in force from trial 41"
+
+
+def test_a_reward_box_is_left_out_of_apply_all_and_says_so(rig):
+    """The design's call (XC-527): a reward size is sent alone, by its own Apply, never in Apply
+    all and never withdrawn, and its box says so ("sent alone · cannot be withdrawn"); the bar says
+    so too, and Apply all sends the rest without it."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import ApplyMany, SetParameter, Staged
+
+    page = _task6_page(rig)
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+    page.fill(f'{_b("reward_correct")} input[data-param="reward_correct"]', "0.2")
+
+    assert _say(page, "reward_correct") == "not sent · sent alone · cannot be withdrawn"
+    assert _bar(page) == ("2 edits not sent: fix_hold, reward_correct · reward_correct is sent "
+                          "alone, by its own Apply")
+    page.click("#drafts-apply")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    (together,) = rig.dispatch.seen
+    assert type(together) is ApplyMany and [c.name for c in together.changes] == ["fix_hold"]
+    assert _bar(page) == "1 edit not sent: reward_correct · reward_correct is sent alone, by its own Apply"
+    assert page.is_disabled("#drafts-apply")
+    assert _say(page, "reward_correct") == "not sent · sent alone · cannot be withdrawn"
+
+    page.click(f'{_b("reward_correct")} [data-apply]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    alone = rig.dispatch.seen[-1]
+    assert (type(alone), alone.name, alone.value) == (SetParameter, "reward_correct", 0.2)
+    _offer(rig, 41, params=_task6_rows(), staged=(
+        Staged("reward_correct", 0.15, 0.2, Box("Jake Westerberg"), True, cid=alone.cid),))
+    _says(rig, page, "reward_correct", "waiting · you")
+    assert page.locator(f'{_b("reward_correct")} [data-withdraw]').count() == 0
+
+
+def test_withdraw_on_one_box_says_it_takes_back_the_whole_act(rig):
+    """The design's call: "withdrawing from any of its boxes withdraws all of it, and the box says
+    so first". Three applied together each offer *withdraw all 3*, its title naming them; one
+    press sends one `withdraw` of the act's id, and all three go back to the value in force,
+    saying so. And the plan's Review Focus 3: a withdrawal after the boundary passed is refused,
+    "already in force from trial N", and the box says it is in force."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, Refused, Staged, Withdraw
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig)
+    for name, value in (("fix_hold", "0.5"), ("response_deadline", "0.8"), ("set_size", "6")):
+        page.fill(f'{_b(name)} input[data-param="{name}"]', value)
+    page.click("#drafts-apply")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    cid = rig.dispatch.seen[-1].cid
+    staged = (Staged("fix_hold", 0.3, 0.5, jake, False, cid=cid),
+              Staged("response_deadline", 0.6, 0.8, jake, False, cid=cid),
+              Staged("set_size", 4, 6, jake, False, cid=cid))
+    _offer(rig, 41, params=_task6_rows(), staged=staged)
+    _says(rig, page, "set_size", "waiting · you")
+
+    for name in ("fix_hold", "response_deadline", "set_size"):
+        button = f'{_b(name)} [data-withdraw="{cid}"]'
+        assert page.text_content(button) == "withdraw all 3", name
+        assert page.get_attribute(f'{_b(name)} .wd', "title") == (
+            "withdraws the 3 applied together: fix_hold, response_deadline, set_size")
+    page.click(f'{_b("set_size")} [data-withdraw="{cid}"]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    assert _say(page, "fix_hold") == "withdrawing…"
+    _offer(rig, 42, params=_task6_rows(), withdrawals=(cid,))
+    for name, value in (("fix_hold", "0.30"), ("response_deadline", "0.60"), ("set_size", "4")):
+        _says(rig, page, name, "withdrawn · it never applied")
+        assert page.input_value(f'{_b(name)} input[data-param="{name}"]') == value, name
+    taken = rig.dispatch.seen[-1]
+    assert (type(taken), taken.cid) == (Withdraw, cid)
+    assert len(_sent_of(rig, Withdraw)) == 1
+
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.5")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 3)
+    late = rig.dispatch.seen[-1].cid
+    _offer(rig, 43, params=_task6_rows(), staged=(Staged("fix_hold", 0.3, 0.5, jake, False, cid=late),))
+    _says(rig, page, "fix_hold", "waiting · you")
+    assert page.text_content(f'{_b("fix_hold")} [data-withdraw]') == "withdraw"
+    page.click(f'{_b("fix_hold")} [data-withdraw="{late}"]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 4)
+    why = (f"the change sent as '{late}' is not withdrawn: it is already in force from trial 44, "
+           "so nothing of it waits to be taken back; change the setting again to move it")
+    _offer(rig, 44, params=_task6_rows(0.5, fix_hold={"applied": Applied(44, str(jake))}),
+           refusals=(Refused("withdraw", jake, why, cid=late),))
+    _says(rig, page, "fix_hold", "not withdrawn · it is already in force from trial 44", start=True)
+    assert "applied" in _classes(page, "fix_hold")
+    assert page.input_value(field) == "0.50"
+
+
+def test_a_withdrawal_answered_after_the_next_frame_still_puts_the_box_back(rig):
+    """A withdrawal's answer may come after the frame that shows the act no longer waiting (found
+    under the suite's load in the console interface rework's Task 7, on
+    `test_withdraw_on_one_box_says_it_takes_back_the_whole_act`): that frame has not applied the
+    act, so the box keeps no draft of what it sent, and once the answer comes it goes back to the
+    value in force, saying it was withdrawn. The rig here answers the withdrawal a second late."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Staged, Withdraw
+
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.5")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    cid = rig.dispatch.seen[-1].cid
+    _offer(rig, 41, params=_task6_rows(),
+           staged=(Staged("fix_hold", 0.3, 0.5, Box("Jake Westerberg"), False, cid=cid),))
+    _says(rig, page, "fix_hold", "waiting · you")
+    page.evaluate("document.activeElement.blur()")
+
+    rig.dispatch.delay = 1.0
+    page.click(f'{_b("fix_hold")} [data-withdraw="{cid}"]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    _offer(rig, 42, params=_task6_rows(), withdrawals=(cid,))
+    _arrived(page, 42)
+    assert _say(page, "fix_hold") != "not sent" and _bar(page) is None
+
+    _says(rig, page, "fix_hold", "withdrawn · it never applied")
+    assert page.input_value(field) == "0.30" and _bar(page) is None
+    assert [type(seen) for seen in rig.dispatch.seen][-1] is Withdraw
+
+
+def test_a_withdrawal_is_said_done_only_on_the_rigs_word(rig):
+    """The whole-build review's I1, its probe: a withdrawal answered *sent* whose act waits no more
+    has not been shown withdrawn -- a frame in which the change is in force instead (the boundary
+    applied it before the press arrived) leaves the box saying *withdrawing…*, never "withdrawn ·
+    it never applied"; the rig's refusal that follows is said. And a withdrawal the rig did is
+    said withdrawn only on the frame that lists its act (`Telemetry.withdrawals`)."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, Refused, Staged
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.5")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    cid = rig.dispatch.seen[-1].cid
+    _offer(rig, 41, params=_task6_rows(), staged=(Staged("fix_hold", 0.3, 0.5, jake, False, cid=cid),))
+    _says(rig, page, "fix_hold", "waiting · you")
+    page.evaluate("document.activeElement.blur()")
+    page.click(f'{_b("fix_hold")} [data-withdraw="{cid}"]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    rig.wait_for(lambda: page.text_content("#sent").strip().startswith("sent"))
+
+    in_force = _task6_rows(0.5, fix_hold={"applied": Applied(42, str(jake))})
+    _offer(rig, 42, params=in_force)
+    _arrived(page, 42)
+    assert _say(page, "fix_hold") == "withdrawing…"
+    assert float(page.input_value(field)) == 0.5
+    why = (f"the change sent as '{cid}' is not withdrawn: it is already in force from trial 42, "
+           "so nothing of it waits to be taken back; change the setting again to move it")
+    _offer(rig, 43, params=in_force, refusals=(Refused("withdraw", jake, why, cid=cid),))
+    _says(rig, page, "fix_hold", "not withdrawn · it is already in force from trial 42", start=True)
+
+    page.fill(field, "0.6")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 3)
+    again = rig.dispatch.seen[-1].cid
+    _offer(rig, 44, params=in_force, refusals=(Refused("withdraw", jake, why, cid=cid),),
+           staged=(Staged("fix_hold", 0.5, 0.6, jake, False, cid=again),))
+    _says(rig, page, "fix_hold", "waiting · you")
+    page.evaluate("document.activeElement.blur()")
+    page.click(f'{_b("fix_hold")} [data-withdraw="{again}"]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 4)
+    _offer(rig, 45, params=in_force, refusals=(Refused("withdraw", jake, why, cid=cid),))
+    _arrived(page, 45)
+    assert _say(page, "fix_hold") == "withdrawing…"
+    _offer(rig, 46, params=in_force, refusals=(Refused("withdraw", jake, why, cid=cid),),
+           withdrawals=(again,))
+    _says(rig, page, "fix_hold", "withdrawn · it never applied")
+    assert page.input_value(field) == "0.50"
+
+
+def test_an_act_the_rig_never_answers_lets_its_box_go(rig):
+    """The whole-build review's I2, its probe: an Apply answered *sent* that no frame then answers
+    -- here another person's 0.35 comes into force and nothing names the act -- never leaves its
+    box *sending…* with Apply, Discard and Esc dead. Esc lets it go at once, the box back to the
+    value in force, saying the rig has not confirmed it, once a frame has come without the rig's
+    word (before one, see the next test); and left alone, `ANSWER_FRAMES` frames
+    later the box says so itself, the edit a draft again, Apply and Discard live, until its news
+    changes."""
+    from wl_xcon.link import Applied
+
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    other = _task6_rows(0.35, fix_hold={"applied": Applied(41, "Kim")})
+    unconfirmed = "not confirmed by the rig · check the value in force"
+
+    page.fill(field, "0.5")
+    page.evaluate("document.getElementById('sent').textContent = ''")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    rig.wait_for(lambda: page.text_content("#sent").strip().startswith("sent"))
+    assert page.is_disabled(f'{_b("fix_hold")} [data-discard]'), "held until a frame has come"
+    _offer(rig, 41, params=other)
+    _arrived(page, 41)
+    assert _say(page, "fix_hold") == "sending…"
+    assert not page.is_disabled(f'{_b("fix_hold")} [data-discard]'), "Discard lets it go"
+    page.focus(field)
+    page.press(field, "Escape")
+    _says(rig, page, "fix_hold", unconfirmed)
+    assert page.input_value(field) == "0.35" and _bar(page) is None
+
+    page.fill(field, "0.5")
+    page.evaluate("document.getElementById('sent').textContent = ''")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    rig.wait_for(lambda: page.text_content("#sent").strip().startswith("sent"))
+    page.evaluate("document.activeElement.blur()")
+    for trial in (42, 43):
+        _offer(rig, trial, params=other)
+        _arrived(page, trial)
+        assert _say(page, "fix_hold") == "sending…", trial
+    _offer(rig, 44, params=other)
+    _says(rig, page, "fix_hold", unconfirmed)
+    assert page.input_value(field) == "0.5" and "draft" in _classes(page, "fix_hold")
+    assert not page.is_disabled(f'{_b("fix_hold")} [data-apply]')
+    assert not page.is_disabled(f'{_b("fix_hold")} [data-discard]')
+    _offer(rig, 45, params=_task6_rows(0.4, fix_hold={"applied": Applied(45, "Kim")}))
+    _says(rig, page, "fix_hold", "not sent · Kim changed this from trial 45")
+
+
+def test_enter_then_escape_before_a_frame_keeps_the_change_on_its_way(rig):
+    """The fix wave's re-review, N1: type, Enter, Esc to leave the field -- the design's keys, done
+    before the rig's next frame -- never discards a change the rig has: the line stays *sending…*,
+    the field keeps the sent value, Discard stays held, Esc leaves the field, and the frame that
+    then shows it waiting says *waiting · you*. Discard and Esc let an answered act go only once a
+    frame has passed without the rig's word on it. Run in WebKit too, for Safari."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Staged
+
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.5")
+    page.evaluate("document.getElementById('sent').textContent = ''")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    rig.wait_for(lambda: page.text_content("#sent").strip().startswith("sent"))
+    assert page.is_disabled(f'{_b("fix_hold")} [data-discard]'), "Discard held before any frame"
+    page.press(field, "Escape")
+    assert page.evaluate("document.activeElement.getAttribute('data-param')") is None, (
+        "Esc with no draft leaves the field")
+    assert _say(page, "fix_hold") == "sending…"
+    assert page.input_value(field) == "0.5" and _bar(page) is None
+    cid = rig.dispatch.seen[-1].cid
+    _offer(rig, 41, params=_task6_rows(),
+           staged=(Staged("fix_hold", 0.3, 0.5, Box("Jake Westerberg"), False, cid=cid),))
+    _says(rig, page, "fix_hold", "waiting · you")
+    assert page.input_value(field) == "0.5"
+
+
+def test_a_fault_in_the_answers_handler_is_never_said_not_delivered(rig):
+    """The whole-build review's M4: `deliver`'s "not delivered" is for a command that did not reach
+    `wlx serve`, never for one whose answer came and whose handler then raised -- here a page fault
+    made while the rig took a second to answer. The answer's own words stay."""
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.5")
+    rig.dispatch.delay = 1.0
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    # The fault: `CSS.escape`, which the page's answer handler calls (`cardOf`), raises until the
+    # page puts it back itself, 2.5 s on -- Playwright's own calls use it too, so none is made
+    # meanwhile; what `#sent` says is gathered by the page as it changes.
+    page.evaluate("""() => {
+        const sent = document.getElementById('sent');
+        window.__said = [];
+        new MutationObserver(() => window.__said.push(sent.textContent.trim())).observe(
+            sent, {childList: true, characterData: true, subtree: true});
+        const escape = CSS.escape;
+        CSS.escape = () => { throw new Error('a fault in the answer handler'); };
+        setTimeout(() => { CSS.escape = escape; }, 2500);
+    }""")
+    time.sleep(3.0)  # housekeeping: the answer comes at 1 s, the page's fault ends at 2.5 s
+    said = page.evaluate("window.__said")
+    assert said and said[-1] == "sent: test", said
+    assert not any(line.startswith("not delivered") for line in said), said
+
+
+def test_a_change_under_a_draft_leaves_the_draft_and_says_who(rig):
+    """The plan's Review Focus 4: someone else changes a setting under a trainer's draft (another
+    console, a staircase, a revert): the draft is untouched, the head shows the new value in force,
+    and the status says who changed it -- while it waits, and once it is in force; the trainer's
+    Apply still sends the draft."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, SetParameter, Staged
+
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.8")
+    _offer(rig, 41, params=_task6_rows(), staged=(
+        Staged("fix_hold", 0.3, 0.6, Box("Ana"), False, cid="other-console-1"),))
+    _arrived(page, 41)
+
+    _says(rig, page, "fix_hold", "not sent · Ana (box, unverified) is changing this to 0.60")
+    assert page.input_value(field) == "0.8"
+    assert _head(page, "fix_hold") == "0.30 → 0.60 s"
+    page.evaluate("document.activeElement.blur()")
+    _offer(rig, 42, params=_task6_rows(0.6, fix_hold={"applied": Applied(42, "Ana (box, unverified)")}))
+    _arrived(page, 42)
+    _says(rig, page, "fix_hold", "not sent · Ana (box, unverified) changed this from trial 42")
+    assert page.input_value(field) == "0.8"
+    assert _head(page, "fix_hold") == "0.60 s"
+
+    page.click(f'{_b("fix_hold")} [data-apply]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.value) == (SetParameter, "fix_hold", 0.8)
+
+
+def _matrix_rows(trial):
+    """The boxes a press is tried on, each with a head the frame of trial 41 changes: a plain
+    field, a whole count's −/+, a timing switch, a pool's ticks (66, then 70: blue among green
+    added), a color's swatches and a held setting's *hand back*."""
+    from wl_xcon.link import ParamRow
+
+    later = trial > 40
+    color = {
+        "sets": {"isohue": {"apex": [0.31272, 0.329], "luminance_cd_m2": 15.0, "design": None,
+                            "hues": {"green": {"xy": [0.31324, 0.50711], "srgb": "#4a9a3e"},
+                                     "red": {"xy": [0.45955, 0.32918], "srgb": "#c76f6a"}}}},
+        "set": "isohue", "hue": "green", "approximate": True,
+        "saturation": {"setting": None, "value": 1.0, "cd_m2": 15.0},
+        "luminance": {"setting": None, "value": 15.0, "cd_m2": 15.0, "set_wide": False},
+    }
+    look = ParamRow.of("distractor_appearance", "appearance", None, None, None, False,
+                       source="run", color=color, section="Colors")
+    look = dataclasses.replace(look, words="Disc, " + ("darker" if later else "green"))
+    return _task6_rows(0.35 if later else 0.3, size=6 if later else 4) + (
+        ParamRow.of("wait", "s", 0.05, 2.0, 0.55 if later else 0.5, False, source="task",
+                    step=0.05, switch="drawn", section="Timing"),
+        ParamRow.of("gap", "s", 0.1, 2.0, 0.65 if later else 0.6, False, source="person",
+                    conditions=("near",), step=0.05, section="Timing"),
+        look, _pool_row(70 if later else 66))
+
+
+_PRESSED = {
+    "field": (_b("fix_hold") + ' input[data-param="fix_hold"]', "fix_hold", "0.35 s"),
+    "stepper": (_b("set_size") + ' [data-dir="1"]', "set_size", "6 objects"),
+    "segment": (_b("wait") + ' [data-switch="drawn"]', "wait", "0.55 s"),
+    "tick": (_b("pairings") + ' input.tick[aria-label="green among red"]', "pairings",
+             "3 of 12 pairs"),
+    "swatch": (_b("distractor_appearance") + ' .hue[data-color="red"]', "distractor_appearance",
+               "Disc, darker"),
+    "apply": (_b("fix_hold") + " [data-apply]", "fix_hold", "0.35 s"),
+    "withdraw": (_b("fix_hold") + " [data-withdraw]", "fix_hold", "0.35 → 0.50 s"),
+    "hand back": (_b("gap") + ' [data-cmd="hand_back"]', "gap", "0.65 s"),
+    # A summary line (the summary and editor build's Task 2: the plan's Review Focus 1).
+    "line": ('#params > .summary .line[data-open="set_size"]', "set_size", "6 objects"),
+    # Runtime's pinned line and its box's + there (the summary and editor build's Task 3).
+    "pinned line": ('#pinned > .line[data-open="set_size"]', "set_size", "6 objects"),
+    "pinned stepper": ('#pinned-editing > .box[data-pin="set_size"] [data-dir="1"]', "set_size",
+                       "6 objects"),
+}
+
+
+@pytest.mark.parametrize("control", [
+    "field", "stepper", "segment", "tick", "swatch", "apply", "withdraw", "hand back", "line",
+    "pinned line", "pinned stepper"])
+def test_a_press_during_frames_acts_once(rig, control):
+    """The plan's Review Focus 1: a frame lands while a trainer presses a box's control -- a field,
+    −/+, a segment of the switch, a tick, a swatch, Apply, *withdraw*, *hand back*, a summary line
+    (the summary and editor build's Task 2, which opens its setting), Runtime's pinned line and
+    its box's + there (the build's Task 3) -- a frame that
+    changes that box's head and every neighbor's: the press acts once, and the box shows the
+    frame's news after. The mouse goes down, the frame of trial 41 arrives, the mouse comes up.
+    Run in WebKit too, where earlier fix rounds found a frame replacing the button under a press."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import HandBack, SetColor, SetParameter, Staged, Withdraw
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig, params=_matrix_rows(40))
+    if control == "hand back":
+        _more(page)
+    if control.startswith("pinned"):
+        _pin(page, "set_size")
+        page.click('label[for="t-runtime"]')
+        if control == "pinned stepper":
+            page._page.click('#pinned > .line[data-open="set_size"]')
+    staged = ()
+    if control == "apply":
+        page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+    if control == "withdraw":
+        page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+        page.press(f'{_b("fix_hold")} input[data-param="fix_hold"]', "Enter")
+        rig.wait_for(lambda: rig.dispatch.seen)
+        staged = (Staged("fix_hold", 0.3, 0.5, jake, False, cid=rig.dispatch.seen[-1].cid),)
+        _offer(rig, 40, params=_matrix_rows(40), staged=staged)
+        _says(rig, page, "fix_hold", "waiting · you")
+        page.evaluate("document.activeElement.blur()")
+    before = len(rig.dispatch.seen)
+    target, name, news = _PRESSED[control]
+
+    page.hover(target)
+    page.mouse.down()
+    _offer(rig, 41, params=_matrix_rows(41), staged=staged)
+    _arrived(page, 41)
+    page.mouse.up()
+    rig.wait_for(lambda: _head(page, name) == news)
+    time.sleep(0.3)  # housekeeping: room for a wrong second send to arrive
+    sent = rig.dispatch.seen[before:]
+
+    if control == "field":
+        field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+        assert page.evaluate("document.activeElement.getAttribute('data-param')") == "fix_hold"
+        assert page.input_value(field) == "0.35", "an untouched field follows the frame"
+        assert _say(page, "fix_hold") != "not sent"
+        page.fill(field, "0.5")
+        page.press(field, "Enter")
+        rig.wait_for(lambda: len(rig.dispatch.seen) == before + 1)
+        assert [(type(s), s.value) for s in rig.dispatch.seen[before:]] == [(SetParameter, 0.5)]
+    elif control == "stepper":
+        assert sent == []
+        assert page.input_value(f'{_b("set_size")} input[data-param="set_size"]') == "5"
+        assert _say(page, "set_size") == "not sent"
+    elif control == "segment":
+        assert sent == []
+        assert page.is_visible(f'{_b("wait")} [data-side="drawn"]')
+        assert _say(page, "wait") == "cannot send · wait's shortest needs a number"
+    elif control == "tick":
+        # The tick pressed stays a draft; the one the frame added follows it, untouched by hand;
+        # its Apply sends the pool's number with both.
+        assert sent == []
+        assert page.is_checked(target) and page.is_checked(
+            _b("pairings") + ' input.tick[aria-label="blue among green"]')
+        assert _say(page, "pairings") == "not sent"
+        page.click(f'{_b("pairings")} [data-apply]')
+        rig.wait_for(lambda: len(rig.dispatch.seen) == before + 1)
+        (ticked,) = rig.dispatch.seen[before:]
+        assert (type(ticked), ticked.name, ticked.value) == (SetParameter, "pairings", 70 + 2048)
+    elif control == "swatch":
+        assert sent == []
+        assert page.get_attribute(target, "aria-pressed") == "true"
+        assert _say(page, "distractor_appearance") == "not sent"
+        page.click(f'{_b("distractor_appearance")} [data-apply]')
+        rig.wait_for(lambda: len(rig.dispatch.seen) == before + 1)
+        (picked,) = rig.dispatch.seen[before:]
+        assert (type(picked), picked.colorset, picked.color) == (SetColor, "isohue", "red")
+    elif control == "apply":
+        assert [(type(s), s.name, s.value) for s in sent] == [(SetParameter, "fix_hold", 0.5)]
+        assert _say(page, "fix_hold") == "sending…"
+    elif control == "withdraw":
+        assert [(type(s), s.cid) for s in sent] == [(Withdraw, staged[0].cid)]
+    elif control == "line":
+        assert sent == [] and _opened(page) == ["set_size"]
+        assert page.text_content(target + " > .lv") == "6"
+    elif control == "pinned line":
+        assert sent == [] and page._page.is_visible(_pinned("set_size"))
+        assert page.get_attribute(target, "aria-pressed") == "true"
+        assert page.text_content(target + " > .lv") == "6"
+    elif control == "pinned stepper":
+        assert sent == []
+        assert page.input_value(f'{_pinned("set_size")} input[data-param="set_size"]') == "5"
+        assert page.input_value(f'{_b("set_size")} input[data-param="set_size"]') == "5"
+        assert _say(page, "set_size") == "not sent"
+    else:
+        assert [(type(s), s.name) for s in sent] == [(HandBack, "gap")]
+    for neighbor, shown in (("response_deadline", "0.60 s"), ("set_size", "6 objects"),
+                            ("wait", "0.55 s"), ("gap", "0.65 s")):
+        assert _head(page, neighbor) == shown, neighbor
+
+
+def test_tab_reaches_apply_on_every_box(rig):
+    """The controls review's F7: in Safari, Tab did not reach a single button on a card (its
+    default Tabs to fields and pop-ups only). From a box's field with a draft, Tab reaches that
+    box's Discard and then its Apply, on every box, before leaving it: both carry `tabindex="0"`.
+    Run in WebKit, where this is the test."""
+    page = _task6_page(rig)
+    for name, value in (("fix_hold", "0.5"), ("response_deadline", "0.8"), ("set_size", "6"),
+                        ("reward_correct", "0.2")):
+        field = f'{_b(name)} input[data-param="{name}"]'
+        page.fill(field, value)
+        page.focus(field)
+        reached = []
+        for _ in range(2):
+            page.keyboard.press("Tab")
+            reached.append(page.evaluate(
+                "(() => { const at = document.activeElement; const box = at.closest('.box');"
+                " return [box ? box.getAttribute('data-card') : null,"
+                " at.getAttribute('data-discard') !== null ? 'Discard' :"
+                " at.getAttribute('data-apply') !== null ? 'Apply' : at.tagName]; })()"))
+        assert reached == [[name, "Discard"], [name, "Apply"]], (name, reached)
+
+
+def test_drafts_survive_a_tab_switch_and_are_dropped_at_the_runs_end(rig):
+    """The design's call: drafts are kept per setting across frames and tab switches, dropped at
+    the run's end and on a reload, and closing the page with drafts asks once (`beforeunload`)."""
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.5")
+    page.click('label[for="t-training"]')
+    _offer(rig, 41, params=_task6_rows())
+    _arrived(page, 41)
+    page.click('label[for="t-task"]')
+
+    assert page.input_value(field) == "0.5" and _say(page, "fix_hold") == "not sent"
+    asked = []
+    page.on("dialog", lambda dialog: (asked.append(dialog.type), dialog.accept()))
+    page.reload()
+    page.click('label[for="t-task"]')
+    assert page.input_value(field) == "0.30" and _bar(page) is None
+    assert asked in ([], ["beforeunload"]), asked
+
+    page.fill(field, "0.5")
+    page.fill(f'{_b("set_size")} input[data-param="set_size"]', "6")
+    page.evaluate("document.activeElement.blur()")
+    _offer(rig, 42, params=_task6_rows(), phase="between_runs")
+    _arrived(page, 42)
+    rig.wait_for(lambda: page.input_value(field) == "0.30")
+    assert page.input_value(f'{_b("set_size")} input[data-param="set_size"]') == "4"
+    assert "draft" not in _classes(page, "fix_hold") and _bar(page) is None
+
+
+def test_a_whole_box_refuses_a_point_at_the_keyboard_and_on_paste(rig):
+    """The plan's Review Focus 5 and the design's goal 6: a whole setting's field takes no `.` at
+    the keyboard, saying so; a fraction that arrives anyway -- pasted, here inserted as a paste
+    inserts it, with no key pressed -- is *cannot send · whole numbers only*, its Apply off, Enter
+    and Apply all sending nothing."""
+    page = _task6_page(rig)
+    field = f'{_b("set_size")} input[data-param="set_size"]'
+    page.fill(field, "")
+    page.type(field, "4.")
+    assert page.input_value(field) == "4"
+    assert _say(page, "set_size") == "whole numbers only"
+    # The whole-build review's I5: the fraction's digits after a refused point are refused too, so
+    # "12.5" never reads "125", and what was typed cannot be sent while it stands.
+    page.type(field, "5")
+    assert page.input_value(field) == "4" and _say(page, "set_size") == "whole numbers only"
+    page.fill(field, "")
+    page.type(field, "12.5")
+    assert page.input_value(field) == "12"
+    assert _say(page, "set_size") == "cannot send · whole numbers only"
+    assert page.is_disabled(f'{_b("set_size")} [data-apply]')
+    page.press(field, "Enter")
+    time.sleep(0.3)  # housekeeping: room for a wrong send to arrive
+    assert rig.dispatch.seen == []
+    page.press(field, "Backspace")
+    assert page.input_value(field) == "1" and _say(page, "set_size") == "not sent"
+    page.type(field, "5")
+    assert page.input_value(field) == "15", "a digit after any other edit is typed"
+
+    page.fill(field, "")
+    page.focus(field)
+    page.keyboard.insert_text("4.5")
+    assert page.input_value(field) == "4.5"
+    assert _say(page, "set_size") == "cannot send · whole numbers only"
+    assert "cannot" in _classes(page, "set_size")
+    assert page.is_disabled(f'{_b("set_size")} [data-apply]')
+    page.press(field, "Enter")
+    assert _bar(page) == "1 edit not sent: set_size · set_size cannot send: whole numbers only"
+    assert page.is_disabled("#drafts-apply")
+    time.sleep(0.3)  # housekeeping: room for a wrong send to arrive
+    assert rig.dispatch.seen == []
+
+
+def test_an_act_refused_on_one_box_is_refused_on_every_box_of_it(rig):
+    """The controls' ruling (the plan's Review Focus 2): a frame keeps only the last refusals, so a
+    large act refused whole may not leave one on every box of it; any refusal carrying the act's
+    id refuses all of it. A box of the act with no refusal of its own in the frame says it was
+    refused with the changes applied together, its draft back; the one that has its own says it."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Refused
+
+    page = _task6_page(rig)
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.95")
+    page.fill(f'{_b("response_deadline")} input[data-param="response_deadline"]', "0.8")
+    page.click("#drafts-apply")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    cid = rig.dispatch.seen[-1].cid
+    _offer(rig, 41, params=_task6_rows(), refusals=(Refused(
+        "fix_hold", Box("Jake Westerberg"), "'fix_hold' at 0.95 is refused, and the previous "
+        "value stands: it does not fit; so none of the 2 applied together is staged", cid=cid,
+        value=0.95),))
+
+    _says(rig, page, "response_deadline", "refused · with the changes applied together")
+    assert {"refused", "draft"} <= set(_classes(page, "response_deadline"))
+    assert page.input_value(f'{_b("response_deadline")} input[data-param="response_deadline"]') == "0.8"
+    assert _say(page, "fix_hold").startswith("refused 0.95 · it does not fit")
+    assert _bar(page) == "2 edits not sent: fix_hold, response_deadline"
+
+
+def test_a_box_the_find_box_hides_stays_hidden_while_its_act_is_out(rig):
+    """The find box's mark is the page's own (`nofind`), kept when the script brings a box up to
+    date: Apply all of a draft the find box now hides leaves it hidden while its act is out."""
+    page = _task6_page(rig)
+    page.fill(f'{_b("response_deadline")} input[data-param="response_deadline"]', "0.8")
+    page.fill("#pfind", "fix_")
+    assert not page.is_visible(_b("response_deadline")) and page.is_visible(_b("fix_hold"))
+    rig.dispatch.delay = 2.0
+    # Pressed and read in one turn of the page's script (the console interface rework's Task 8): a
+    # box brought up to date as its act is sent keeps its mark, whatever answers or frames follow.
+    assert page.evaluate("(() => { document.getElementById('drafts-apply').click(); return "
+                         "document.querySelector('#params .box[data-card=\"response_deadline\"]')"
+                         ".classList.contains('nofind'); })()")
+    rig.wait_for(lambda: rig.dispatch.seen)
+
+    assert _say(page, "response_deadline") == "sending…"
+    assert not page.is_visible(_b("response_deadline")) and page.is_visible(_b("fix_hold"))
+
+
+# --- the console interface rework's Task 7: the pairings grid, group boxes and percents ---------
+
+#: The pop-out's four colors in its pool's order, each with a swatch as the rig sends one.
+_POOL_COLORS = {"blue": "#2476c8", "purple": "#8a5cc2", "red": "#bf5c5c", "green": "#3f9a4a"}
+
+
+def _pool_row(value=66, **fields):
+    """A pool's setting's row as the rig makes it (`taskd.pool_members`): its twelve pairs in the
+    pool's order -- blue among purple 1, blue among red 2 ... green among red 2048 -- `on` as
+    `value` holds them, in the Colors section."""
+    from wl_xcon.link import ParamRow, PoolMember
+
+    pairs = [(odd, among) for odd in _POOL_COLORS for among in _POOL_COLORS if among != odd]
+    members = tuple(
+        PoolMember(bit=1 << at, odd=odd, among=among, odd_hex=_POOL_COLORS[odd],
+                   among_hex=_POOL_COLORS[among], on=bool(value >> at & 1))
+        for at, (odd, among) in enumerate(pairs))
+    return ParamRow.of("pairings", "pairings", 1.0, 4095.0, value, False, source="run",
+                       whole=True, step=1.0, section="Colors", members=members, **fields)
+
+
+def _tick(name: str) -> str:
+    return f'{_b("pairings")} input.tick[aria-label="{name}"]'
+
+
+def test_pairings_are_a_grid_of_twelve_ticks(rig):
+    """The design's goal 7 (the PI, 2026-11-19: "what are pairings?"; "4 × 4 grid, add or
+    remove"): the pool's 66 shows as a grid of twelve ticks, blue among red and red among blue
+    ticked, the diagonal empty; ticking green among red is a draft, nothing sent, and its Apply
+    sends one `set` of the pool's number, 66 + 2048, as the record keeps it; a tick put back is no
+    draft; unticking sends less, a pair taken away live as one is added. None ticked cannot be
+    sent."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, SetParameter, Staged
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig, params=_task6_rows() + (_pool_row(),))
+
+    ticks = page.eval_on_selector_all(
+        f'{_b("pairings")} input.tick', "ticks => ticks.map((t) => [t.getAttribute('aria-label'),"
+        " Number(t.getAttribute('data-bit')), t.checked])")
+    assert len(ticks) == 12 and [bit for _, bit, _ in ticks] == [1 << n for n in range(12)]
+    assert [said for said, _, on in ticks if on] == ["blue among red", "red among blue"]
+    assert page.eval_on_selector_all(f'{_b("pairings")} td.diag',
+                                     "cells => cells.map((c) => c.children.length)") == [0] * 4
+    assert _head(page, "pairings") == "2 of 12 pairs"
+    assert "wide" in _classes(page, "pairings")
+
+    page.click(_tick("green among red"))
+    assert _say(page, "pairings") == "not sent" and rig.dispatch.seen == []
+    assert _bar(page) == "1 edit not sent: pairings"
+    page.click(_tick("green among red"))
+    assert _say(page, "pairings") != "not sent" and _bar(page) is None
+    page.click(_tick("green among red"))
+    page.click(f'{_b("pairings")} [data-apply]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+    time.sleep(0.3)  # housekeeping: room for a wrong second send to arrive
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.value) == (SetParameter, "pairings", 66 + 2048)
+
+    _offer(rig, 41, params=_task6_rows() + (_pool_row(),),
+           staged=(Staged("pairings", 66.0, 2114.0, jake, False, cid=sent.cid),))
+    _says(rig, page, "pairings", "waiting · you")
+    assert _head(page, "pairings") == "2 of 12 pairs → 3 of 12 pairs"
+    _offer(rig, 42, params=_task6_rows() + (_pool_row(2114, applied=Applied(42, str(jake))),))
+    _says(rig, page, "pairings", "in force from trial 42")
+    assert page.is_checked(_tick("green among red"))
+
+    page.click(_tick("blue among red"))
+    page.click(_tick("red among blue"))
+    page.click(_tick("green among red"))
+    assert _say(page, "pairings") == "cannot send · tick at least one pair"
+    page.click(_tick("green among red"))
+    page.click(f'{_b("pairings")} [data-apply]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    assert (rig.dispatch.seen[-1].name, rig.dispatch.seen[-1].value) == ("pairings", 2048)
+
+
+def _group_rows(bar=0.8, window=50, **over):
+    from wl_xcon.link import ParamRow
+
+    rows = {
+        "move_up_bar": ParamRow.of("move_up_bar", "fraction", 0.0, 1.0, bar, False,
+                                   source="task", step=0.05, percent=True, label="Bar to move up",
+                                   group="Move up", section="Rules"),
+        "move_up_window": ParamRow.of("move_up_window", "answers", 1.0, 200.0, window, False,
+                                      source="task", whole=True, step=1.0, label="Answers judged",
+                                      group="Move up", section="Rules"),
+    }
+    for name, fields in over.items():
+        rows[name] = dataclasses.replace(rows[name], **fields)
+    return _task6_rows() + tuple(rows.values())
+
+
+def _move_up():
+    from wl_xcon.link import GroupRow
+
+    return (GroupRow("Move up", ("move_up_bar", "move_up_window"),
+                     "Move up when at least {move_up_bar} of the last {move_up_window} answers "
+                     "are right", "Rules"),)
+
+
+def test_a_group_box_applies_its_settings_together(rig):
+    """The design's goal 8 and its call "withdraw takes back the whole act": a group's box is one
+    box with one Apply -- its sentence with each field in place -- and that Apply sends one
+    `apply_many` of the settings it changed under one command id, staged together or refused
+    whole; its box says *sending…*, then *waiting · you*, and *withdraw all 2* takes the whole act
+    back by that id. A group with one field changed still sends one `apply_many`. Its draft is
+    named by the group in the drafts bar, and Apply all carries it."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import ApplyMany, SetParameter, Staged, Withdraw
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig, params=_group_rows(), groups=_move_up())
+    box = _b("Move up")
+    assert page.eval_on_selector_all(
+        f"{box} .editor .sentence > *",
+        "parts => parts.map((p) => p.matches('.gs') ? p.textContent : '[' +"
+        " p.querySelector('input').value + ']' + (p.querySelector('.unit') ?"
+        " p.querySelector('.unit').textContent : ''))"
+    ) == ["Move up when at least ", "[80]%", " of the last ", "[50]", " answers are right"]
+    assert page.locator('#params .box[data-card="move_up_bar"]').count() == 0
+
+    page.fill(f'{box} input[data-param="move_up_bar"]', "90")
+    page.click(f'{box} input[data-param="move_up_window"] ~ [data-dir="1"]')
+    assert _say(page, "Move up") == "not sent" and rig.dispatch.seen == []
+    assert _bar(page) == "1 edit not sent: Move up"
+    page.click(f"{box} [data-apply]")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    time.sleep(0.3)  # housekeeping: room for a wrong second send to arrive
+
+    (sent,) = rig.dispatch.seen
+    assert type(sent) is ApplyMany and sent.cid
+    assert [(type(change), change.name, change.value) for change in sent.changes] == [
+        (SetParameter, "move_up_bar", 0.9), (SetParameter, "move_up_window", 51.0)]
+    assert _say(page, "Move up") == "sending…"
+    staged = (Staged("move_up_bar", 0.8, 0.9, jake, False, cid=sent.cid),
+              Staged("move_up_window", 50.0, 51.0, jake, False, cid=sent.cid))
+    _offer(rig, 41, params=_group_rows(), groups=_move_up(), staged=staged)
+    _says(rig, page, "Move up", "waiting · you")
+    assert page.text_content(f"{box} [data-withdraw]") == "withdraw all 2"
+    assert _head(page, "Move up") == "80 → 90 % · 50 → 51 answers"
+    page.click(f'{box} [data-withdraw="{sent.cid}"]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    assert (type(rig.dispatch.seen[-1]), rig.dispatch.seen[-1].cid) == (Withdraw, sent.cid)
+
+    _offer(rig, 42, params=_group_rows(), groups=_move_up(), withdrawals=(sent.cid,))
+    _says(rig, page, "Move up", "withdrawn · it never applied")
+    page.fill(f'{box} input[data-param="move_up_window"]', "60")
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+    assert _bar(page) == "2 edits not sent: fix_hold, Move up"
+    page.click(f"{box} [data-apply]")
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 3)
+    alone = rig.dispatch.seen[-1]
+    assert type(alone) is ApplyMany and [(c.name, c.value) for c in alone.changes] == [
+        ("move_up_window", 60.0)]
+    _offer(rig, 43, params=_group_rows(), groups=_move_up(), staged=(
+        Staged("move_up_window", 50.0, 60.0, jake, False, cid=alone.cid),))
+    _says(rig, page, "Move up", "waiting · you")
+    assert _bar(page) == "1 edit not sent: fix_hold"
+
+
+def test_a_percent_field_shows_80_and_sends_0_8(rig):
+    """The design's call: "a fraction may be shown as a percent ... its steps, limits and the rig's
+    sentences are converted on the page, and the setting, the command and the record keep the
+    fraction": the bar's 0.8 shows as 80 with `%`, steps by 5 and stops at 100; typed back to 80 it
+    is no draft; 80 is sent as 0.8, and 33.3 as 0.333 -- never 0.33299999999999996, the noise of
+    33.3 / 100 -- and the value in force comes back as 33.3."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Applied, SetParameter
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig, params=_group_rows(), groups=())
+    field = f'{_b("move_up_bar")} input[data-param="move_up_bar"]'
+    assert page.input_value(field) == "80" and _head(page, "move_up_bar") == "80 %"
+    assert page.text_content(f'{_b("move_up_bar")} .editor .unit') == "%"
+
+    page.click(f'{_b("move_up_bar")} [data-dir="1"]')
+    assert page.input_value(field) == "85" and _say(page, "move_up_bar") == "not sent"
+    page.click(f'{_b("move_up_bar")} [data-dir="1"]', modifiers=["Shift"])
+    assert page.input_value(field) == "100"
+    page.fill(field, "80")
+    assert _say(page, "move_up_bar") != "not sent" and _bar(page) is None
+    page.fill(field, "90")
+    page.fill(field, "80.0")
+    assert _bar(page) is None, "80.0 is the 80 in force"
+
+    page.fill(field, "33.3")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name) == (SetParameter, "move_up_bar")
+    assert sent.value == 0.333 and repr(sent.value) == "0.333"
+    _offer(rig, 41, params=_group_rows(0.333, move_up_bar={"applied": Applied(41, str(jake))}))
+    _says(rig, page, "move_up_bar", "in force from trial 41")
+    assert page.input_value(field) == "33.3" and _head(page, "move_up_bar") == "33.3 %"
+
+    page.fill(field, "80")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    assert repr(rig.dispatch.seen[-1].value) == "0.8"
+
+
+# --- the console interface rework's Task 8: the page around the boxes ---------------------------
+#
+# One bar that stays in view, the find box on both settings tabs, what is not sent counted where a
+# person looks, pins to Runtime, the demo's keys folded, and the density that brings the page to
+# the mock-up the PI approved (`ui-review/shots/layout/mockup.html`). Through the wire, in a real
+# browser: each runs in Chromium in the suite and in WebKit (`WLX_BROWSER=webkit`), for Safari, by
+# the builder.
+
+def _rect(page, selector: str) -> dict:
+    return page.evaluate("(s) => { const r = document.querySelector(s).getBoundingClientRect();"
+                         " return {top: r.top, bottom: r.bottom, left: r.left, right: r.right,"
+                         " height: r.height}; }", selector)
+
+
+def test_the_top_bar_stays_in_view_while_settings_scroll(rig, tmp_path):
+    """The design's call: "the top of the page becomes one bar that stays in view: state, trial,
+    correct, fluid, cage time and the run's buttons; the session's details behind a *session*
+    button" (the layout review's finding 4: *stop run*, *give reward* and the trial count scrolled
+    away). At 1280 × 800 on the Task parameters tab, scrolled to its foot, the bar is still at the
+    top of the window with the trial, the right answers, the fluid and the cage time, and the run's
+    buttons in it; *stop run* there opens its confirm in view and sends nothing; the session's
+    details are behind *session* on the settings tabs and shown on Runtime."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(_popout_frame(tmp_path, trial_index=9))))
+    page = rig.browser_page()
+    _sign_in(page)
+    page.set_viewport_size({"width": 1280, "height": LAPTOP_H})
+    assert page.is_visible("#head-id") and page.get_attribute("#session-btn", "aria-expanded") == "true"
+    page.click('label[for="t-task"]')
+    page.wait_for_selector("#params > .summary .line", state="visible")
+    assert not page.is_visible("#head-id"), "the session's details are behind *session* here"
+    assert page.get_attribute("#session-btn", "aria-expanded") == "false"
+    # A tall setting opened, its reasons and its draw's profile shown, so the page runs past the
+    # window (rewritten for the summary and editor design of 2026-11-19: one box is shown).
+    _open(page, "fix_hold")
+    page.click(f'{_b("fix_hold")} > details.more > summary')
+
+    page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+    # One box shown, not the grid's twenty, so the page runs less far past the window than it did.
+    assert page.evaluate("window.scrollY") > 100, "the settings scroll"
+    bar = _rect(page, "#bar")
+    assert abs(bar["top"]) < 1 and bar["bottom"] < 100, bar
+    said = " ".join(page.text_content("#bar-nums").split())
+    for word in ("trial 9", "correct", "fluid today", "cage"):
+        assert word in said, (word, said)
+    for cmd in ("pause", "mark", "reward", "stop"):
+        button = _rect(page, f'#bar [data-cmd="{cmd}"]')
+        assert bar["top"] <= button["top"] and button["bottom"] <= bar["bottom"], cmd
+    last = page.evaluate("document.querySelector('#params > .editing > .box:not([hidden])')"
+                         ".getBoundingClientRect().bottom")
+    assert last <= LAPTOP_H + 1, "the opened box is scrolled up under the bar"
+
+    page.click('#bar [data-cmd="stop"]')
+    confirm = _rect(page, "#stop-confirm")
+    assert page.is_visible("#stop-confirm") and 0 <= confirm["top"] and confirm["bottom"] <= LAPTOP_H
+    page.click("#stop-no")
+    page.click("#session-btn")
+    assert page.is_visible("#head-id") and page.is_visible("#task-sel")
+    assert page.get_attribute("#session-btn", "aria-expanded") == "true"
+    page.click("#session-btn")
+    assert not page.is_visible("#head-id")
+    page.click('label[for="t-runtime"]')
+    assert page.is_visible("#head-id"), "shown on Runtime"
+    assert rig.dispatch.seen == []
+
+
+def _found(page, root: str = "#params") -> list:
+    """The summary lines the find box leaves undimmed, by the setting each opens (rewritten for
+    the summary and editor design of 2026-11-19: the boxes are in the editor, one shown)."""
+    return page.eval_on_selector_all(
+        f"{root} > .summary .line[data-open]:not(.nofind):not(.newcolor)",
+        "lines => lines.map((line) => line.getAttribute('data-open'))")
+
+
+def test_find_matches_a_plain_name_a_code_name_and_a_section(rig):
+    """The design's goal 5 ("the find box matches both, and section names") and the ledger's find
+    ruling for Task 8: on both settings tabs, the find box finds a box by its plain name, its code
+    name, or the name of a section it stands in -- a parent's finding its subsections' boxes -- and
+    a group's box by its title and by each of its settings' plain and code names; each tab's box
+    finds on its own tab alone; cleared, every box is shown again."""
+    from wl_xcon.link import ParamRow
+
+    rows = _group_rows() + (
+        ParamRow.of("fix_window", "deg", 0.0, 9.0, 2.0, False, label="Fixation window",
+                    section="Gaze windows"),
+        ParamRow.of("fix_size", "deg", 0.0, 9.0, 0.5, False, section="Stimuli/fixation point"),
+        ParamRow.of("move_back_bar", "fraction", 0.0, 1.0, 0.5, False, label="Bar to move back",
+                    section="Training"),
+        ParamRow.of("crowd_step", "objects", 1.0, 10.0, 1.0, False, whole=True, step=1.0,
+                    section="Training/staircases"),
+    )
+    rows = tuple(dataclasses.replace(row, label="Fixation hold") if row.name == "fix_hold" else row
+                 for row in rows)
+    page = _task6_page(rig, params=rows, groups=_move_up())
+    every = _found(page)
+    assert {"fix_hold", "Move up", "fix_window", "fix_size", "set_size"} <= set(every)
+
+    page.fill("#pfind", "fix_win")
+    assert page.is_visible('#params > .summary .line[data-open="set_size"]'), (
+        "a line not found is dimmed, not hidden (the summary and editor design's goal 8)")
+    for typed, found in (("fixation hold", ["fix_hold"]), ("FIX_WIN", ["fix_window"]),
+                         ("stimuli", ["set_size", "fix_size"]),
+                         ("fixation point", ["fix_size"]), ("gaze", ["fix_window"]),
+                         ("move up", ["Move up"]), ("answers judged", ["Move up"]),
+                         ("move_up_window", ["Move up"]), ("rules", ["Move up"])):
+        page.fill("#pfind", typed)
+        assert _found(page) == found, typed
+    page.click('label[for="t-training"]')
+    assert set(_found(page, "#training-params")) == {"move_back_bar", "crowd_step"}, (
+        "the Task parameters tab's find box finds there alone")
+    for typed, found in (("bar to move back", ["move_back_bar"]), ("crowd_st", ["crowd_step"]),
+                         ("staircases", ["crowd_step"]),
+                         ("training", ["move_back_bar", "crowd_step"])):
+        page.fill("#tfind", typed)
+        assert _found(page, "#training-params") == found, typed
+    page.fill("#tfind", "")
+    page.click('label[for="t-task"]')
+    page.fill("#pfind", "")
+    assert _found(page) == every
+
+
+def test_a_section_and_its_tab_count_the_edits_not_sent(rig):
+    """The console interface rework's Task 8: each section's header counts what in it is not sent
+    after the rig's counts ("Timing · 2 settings · 1 not sent"), a group's settings
+    each once and a parent taking in its subsections, and each settings tab's label says how many
+    while any exists; a frame keeps them, and Discard all clears them, leaving the rig's counts
+    as they were."""
+    from wl_xcon.link import ParamRow
+
+    rows = _group_rows() + (
+        ParamRow.of("crowd_step", "objects", 1.0, 10.0, 1.0, False, whole=True, step=1.0,
+                    section="Training/staircases"),)
+    page = _task6_page(rig, params=rows, groups=_move_up())
+
+    def header(name, root="#params"):
+        # The summary's section header (the summary and editor design of 2026-11-19).
+        return " ".join(page.text_content(
+            f'{root} .ssec[data-section="{name}"] > h4, '
+            f'{root} .ssec[data-section="{name}"] > .skeep > h4').split())
+
+    def tab(which):
+        return " ".join(page.text_content(f'label[for="{which}"]').split())
+
+    assert (header("Timing"), tab("t-task")) == ("Timing · 2 settings", "Task parameters")
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+    assert header("Timing") == "Timing · 2 settings · 1 not sent"
+    assert tab("t-task") == "Task parameters · 1 not sent"
+    page.fill(f'{_b("response_deadline")} input[data-param="response_deadline"]', "0.8")
+    page.fill(f'{_b("Move up")} input[data-param="move_up_bar"]', "90")
+    page.fill(f'{_b("Move up")} input[data-param="move_up_window"]', "51")
+    assert header("Timing") == "Timing · 2 settings · 2 not sent"
+    assert header("Rules") == "Rules · 2 settings · 2 not sent"
+    assert header("Stimuli") == "Stimuli · 1 setting"
+    assert tab("t-task") == "Task parameters · 4 not sent"
+    page.click('label[for="t-training"]')
+    page.fill(f'{_b("crowd_step", "#training-params")} input[data-param="crowd_step"]', "2")
+    assert header("Training", "#training-params") == "Training · 1 setting · 1 not sent"
+    assert header("Training/staircases", "#training-params") == (
+        "staircases · 1 setting · 1 not sent")
+    assert tab("t-training") == "Training · 1 not sent"
+    _offer(rig, 41, params=rows, groups=_move_up())
+    _arrived(page, 41)
+    page.click('label[for="t-task"]')
+    assert header("Timing") == "Timing · 2 settings · 2 not sent"
+    page.click(f'{_b("fix_hold")} [data-discard]')
+    assert header("Timing") == "Timing · 2 settings · 1 not sent"
+
+    page.click("#drafts-discard")
+    assert (header("Timing"), header("Rules"), tab("t-task"), tab("t-training")) == (
+        "Timing · 2 settings", "Rules · 2 settings", "Task parameters",
+        "Training")
+    assert rig.dispatch.seen == []
+
+
+#: Each text of a box that is cut short where it is drawn (`scrollWidth` past `clientWidth`): what
+#: a person reads is what fits, so a test that reads `textContent` cannot tell (the whole-build
+#: review's I4).
+_CUT = """(selector) => Array.from(document.querySelectorAll(selector)).filter(
+    (node) => node.scrollWidth > node.clientWidth + 0.5).map(
+    (node) => [node.closest('.box').getAttribute('data-card'), node.className, node.textContent,
+               node.scrollWidth, node.clientWidth])"""
+
+
+def test_a_waiting_box_shows_what_waits_and_for_whom_at_three_widths(rig):
+    """The whole-build review's I4: a box waiting for the next trial -- this page's change and
+    another console's, beside *withdraw* -- shows the value in force and what waits in its head
+    ("0.30 → 0.50 s") and who sent it on its status line, nothing of either cut short, at 1024, 1280
+    and 1440 wide; and its height is its height at rest, its field where it was. Run in WebKit too,
+    for Safari."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Staged
+
+    jake, kim = Box("Jake Westerberg"), Box("Kim")
+    rows = _task6_rows(fix_hold={"label": "Fixation hold, before the array is shown"})
+    _offer(rig, 40, params=rows)
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+    page.wait_for_selector(_b("fix_hold"), state="visible")
+    names = ("fix_hold", "response_deadline", "set_size")
+
+    def measured():
+        return [(round(_rect(page, _b(name))["height"], 1),
+                 round(_rect(page, f'{_b(name)} input[data-param="{name}"]')["top"], 1))
+                for name in names]
+
+    rests = {}
+    for width in WIDTHS:
+        page.set_viewport_size({"width": width, "height": LAPTOP_H})
+        rests[width] = measured()
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+    page.click(f'{_b("fix_hold")} [data-apply]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+    mine = rig.dispatch.seen[-1].cid
+    _offer(rig, 41, params=rows, staged=(
+        Staged("fix_hold", 0.3, 0.5, jake, False, cid=mine),
+        Staged("response_deadline", 0.6, 0.85, kim, False, cid="other-1"),
+        Staged("set_size", 4, 12, kim, False, cid="other-2")))
+    _says(rig, page, "fix_hold", "waiting · you")
+    _says(rig, page, "response_deadline", "waiting · Kim", start=True)
+    assert page.get_attribute(f'{_b("fix_hold")} > .status > .say', "title") == (
+        "waiting for the next trial · you")
+    assert _head(page, "fix_hold") == "0.30 → 0.50 s"
+    assert _head(page, "response_deadline") == "0.60 → 0.85 s"
+    assert _head(page, "set_size") == "4 → 12 objects"
+    for width in WIDTHS:
+        page.set_viewport_size({"width": width, "height": LAPTOP_H})
+        cut = page.evaluate(_CUT, "#params .box.staged > .head .now, #params .box.staged > .status > .say")
+        assert cut == [], (width, cut)
+        assert measured() == rests[width], (width, "waiting")
+
+
+def test_a_box_keeps_its_height_as_its_status_changes(rig):
+    """The design's anti-goal ("a box whose height jumps as its status changes, moving Apply under
+    the pointer") under the ledger's density ruling for Task 8: the head says the value in force
+    only while it differs from the field, and a plain name wraps rather than being cut, so a box
+    must keep its height and its field's place as it goes from rest to *not sent* (its head now
+    saying the value in force), *sending…*, *waiting* (the head saying what waits, *withdraw*
+    offered) and *refused*. At 1280 × 800, a box with the longest plain name and one without."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Refused, Staged
+
+    jake = Box("Jake Westerberg")
+    rows = _task6_rows(fix_hold={"label": "Fixation hold, before the array is shown"})
+    _offer(rig, 40, params=rows)
+    page = rig.browser_page()
+    page.set_viewport_size({"width": 1280, "height": LAPTOP_H})
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+    page.wait_for_selector(_b("fix_hold"), state="visible")
+    rig.dispatch.delay = 0.5  # housekeeping: long enough to measure *sending…*
+
+    def measured():
+        # Each opened in the editor in turn, measured where it stands (rewritten for the summary
+        # and editor design of 2026-11-19, which shows one box at a time).
+        found = []
+        for name in ("fix_hold", "response_deadline"):
+            _open(page, name)
+            found.append((round(_rect(page, _b(name))["height"], 1),
+                          round(_rect(page, f'{_b(name)} input[data-param="{name}"]')["top"], 1)))
+        return found
+
+    rest = measured()
+    for name, value in (("fix_hold", "0.5"), ("response_deadline", "0.8")):
+        page.fill(f'{_b(name)} input[data-param="{name}"]', value)
+    assert _say(page, "fix_hold") == "not sent" and _head(page, "fix_hold") == "0.30 s"
+    assert page.is_visible(f'{_b("fix_hold")} > .head .now')
+    assert measured() == rest, "not sent"
+    page.click(f'{_b("fix_hold")} [data-apply]')
+    page.click(f'{_b("response_deadline")} [data-apply]')
+    _says(rig, page, "fix_hold", "sending…")
+    assert measured() == rest, "sending"
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    first, second = (sent.cid for sent in rig.dispatch.seen)
+    _offer(rig, 41, params=rows,
+           staged=(Staged("fix_hold", 0.3, 0.5, jake, False, cid=first),
+                   Staged("response_deadline", 0.6, 0.8, jake, False, cid=second)))
+    _says(rig, page, "fix_hold", "waiting · you")
+    assert _head(page, "fix_hold") == "0.30 → 0.50 s"
+    assert measured() == rest, "waiting"
+    applied = _task6_rows(0.5, 0.8, fix_hold={"label": "Fixation hold, before the array is shown"})
+    _offer(rig, 42, params=applied, refusals=(
+        Refused("fix_hold", jake, _LONG_WHY, cid="box-9", value=30.0),
+        Refused("response_deadline", jake, _LONG_WHY, cid="box-8", value=3.0)))
+    _says(rig, page, "fix_hold", "refused", start=True)
+    assert measured() == rest, "refused"
+
+
+#: **`localStorage` blocked**, as a private window or blocked site data leave it: reading the store
+#: itself throws. `sessionStorage`, which holds the sign-in, is left alone.
+_NO_LOCAL_STORE = ("Object.defineProperty(window, 'localStorage', { configurable: true,"
+                   " get() { throw new Error('storage is blocked'); } });")
+
+
+def _pinned(name: str) -> str:
+    """A pinned setting's box in Runtime's editor (the summary and editor build's Task 3)."""
+    return f'#pinned-editing > .box[data-pin="{name}"]'
+
+
+def test_nothing_is_pinned_at_first(rig):
+    """The design's goal 9 (the PI, 2026-11-19: "Yes, you choose only"): nothing is pinned until a
+    person pins it -- Runtime's Pinned strip hidden, holding no line and its editor no box, every
+    box's *more* offering *pin to Runtime*, and nothing kept in the store. In a real browser: run
+    with `WLX_BROWSER=webkit` too, for Safari."""
+    page = _task6_page(rig)
+    page.click('label[for="t-runtime"]')
+    assert not page.is_visible("#pinned-pane")
+    assert page.locator("#pinned .line").count() == 0
+    assert page.locator("#pinned-editing .box").count() == 0
+    toggles = page.eval_on_selector_all("#params [data-pin-toggle]", "(all) => all.map((b) => [b.textContent, b.getAttribute('aria-pressed')])")
+    assert len(toggles) == 4 and set(map(tuple, toggles)) == {("pin to Runtime", "false")}, toggles
+    assert page.evaluate("window.localStorage.getItem('wlx.pins.tasks/fixation_detection.py')") is None
+
+
+def _pin_line(name: str) -> str:
+    """A pinned setting's summary line on Runtime (the summary and editor build's Task 3)."""
+    return f'#pinned > .line[data-open="{name}"]'
+
+
+def test_a_pinned_line_opens_the_editor_on_runtime_and_survives_a_reload(rig):
+    """The summary and editor design's goal 9: "Runtime's Pinned strip is a short summary of the
+    pinned settings, and a click opens the same editor on Runtime (one editor per tab, the
+    setting's one draft shared)". A box's *pin to Runtime*, in its *more*, puts the setting's line
+    in the strip (`#pinned` holds lines, not boxes), shown whatever its tab's find box dims; a
+    click on it opens the setting's box in Runtime's own editor, as a mirror of the setting's one
+    box (the ledger's pin ruling: "one draft per setting, never two diverging copies"). A draft
+    made on Runtime shows ● on its Task parameters line too, and back; Esc, Esc returns to the
+    pinned line; −/+, Apply from Runtime sends once, *withdraw*; the pin and the setting opened on
+    Runtime are kept per task across a reload, and *unpin* takes both away. Rewrites
+    `test_a_pinned_box_works_on_runtime_and_survives_a_reload`, whose copy stood in the strip.
+    In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import SetParameter, Staged, Withdraw
+
+    jake = Box("Jake Westerberg")
+    page = _task6_page(rig)
+    assert page.text_content(f'{_b("fix_hold")} [data-pin-toggle]') == "pin to Runtime"
+    page.click(f'{_b("fix_hold")} > details.more > summary')
+    page.click(f'{_b("fix_hold")} [data-pin-toggle]')
+    assert page.text_content(f'{_b("fix_hold")} [data-pin-toggle]') == "unpin from Runtime"
+    page.click(f'{_b("fix_hold")} > details.more > summary')
+
+    page.fill("#pfind", "set_size")
+    page.click('label[for="t-runtime"]')
+    line = _pin_line("fix_hold")
+    copy = _pinned("fix_hold")
+    field = f'{copy} input[data-param="fix_hold"]'
+    assert page.locator("#pinned > *").count() == 1 and page.is_visible(line)
+    assert "nofind" not in page.get_attribute(line, "class").split(), (
+        "a pinned line is shown whatever its tab's find box dims")
+    assert page.text_content(f"{line} > .ln") == "fix_hold"
+    assert page.text_content(f"{line} > .lv") == "0.30 s"
+    assert page.locator("#pinned-editing > .box").count() == 1, "the strip holds lines, the editor one box"
+    assert page._page.is_hidden(copy), "closed until its line is clicked"
+    assert page.inner_text("#pinned-editing > .placeholder") == web.PINNED_EMPTY
+    widths = page.evaluate("""() => [getComputedStyle(document.getElementById('pinned')).columnWidth,
+        getComputedStyle(document.querySelector('#params > .summary')).columnWidth]""")
+    assert widths[0] == widths[1] and widths[0].endswith("px"), (widths, "its tab's columns")
+    page._page.click(line)
+    assert page._page.is_visible(copy) and page.is_hidden("#pinned-editing > .placeholder")
+    assert page.get_attribute(line, "aria-pressed") == "true"
+    assert page.locator('[data-card="fix_hold"]').count() == 1, "one box by the setting's name"
+
+    page.fill(field, "0.50")
+    assert page.text_content(f"{copy} > .status > .say").strip() == "not sent"
+    assert _bar(page) == "1 edit not sent: fix_hold"
+    assert _marked(page, "fix_hold", "#pinned")[:2] == ("●", "0.30 → 0.50 s"), "Runtime's line"
+    page.click('label[for="t-task"]')
+    assert _marked(page, "fix_hold")[:2] == ("●", "0.30 → 0.50 s"), "the Task parameters line too"
+    page.fill("#pfind", "")
+    original = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    assert page.input_value(original) == "0.50" and _say(page, "fix_hold") == "not sent"
+    page.fill(original, "0.55")
+    page.click('label[for="t-runtime"]')
+    assert page.input_value(field) == "0.55", "the copy follows its box's draft"
+    assert _marked(page, "fix_hold", "#pinned")[:2] == ("●", "0.30 → 0.55 s"), "and its line"
+    page.press(field, "Escape")
+    assert page.input_value(field) == "0.30"
+    assert page.text_content(f"{copy} > .status > .say").strip() == "0.10 to 1.00"
+    assert _bar(page) is None and _marked(page, "fix_hold", "#pinned")[:2] == ("", "0.30 s")
+    page.press(field, "Escape")
+    page.keyboard.press("Escape")
+    assert page.evaluate("document.activeElement.matches('#pinned > .line[data-open=\"fix_hold\"]')"), (
+        "a second Esc returns to the pinned line")
+    page.click(f'{copy} [data-dir="1"]')
+    assert page.input_value(field) == "0.35"
+    page.click(f"{copy} [data-apply]")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    page.wait_for_timeout(300)  # housekeeping: room for a second send, were there one
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.value) == (SetParameter, "fix_hold", 0.35)
+    _offer(rig, 41, params=_task6_rows(), staged=(Staged("fix_hold", 0.3, 0.35, jake, False,
+                                                         cid=sent.cid),))
+    _arrived(page, 41)
+    rig.wait_for(lambda: page.text_content(f"{copy} > .status > .say").strip() ==
+                 "waiting · you")
+    assert _marked(page, "fix_hold", "#pinned")[:2] == ("◷", "0.30 → 0.35 s")
+    page.click(f'{copy} [data-withdraw="{sent.cid}"]')
+    rig.wait_for(lambda: len(rig.dispatch.seen) == 2)
+    assert (type(rig.dispatch.seen[-1]), rig.dispatch.seen[-1].cid) == (Withdraw, sent.cid)
+
+    _offer(rig, 42, params=_task6_rows(), withdrawals=(sent.cid,))
+    # Another setting opened on the Task parameters tab: Runtime's editor keeps its own.
+    page.click('label[for="t-task"]')
+    _open(page, "set_size")
+    page.click('label[for="t-runtime"]')
+    page.reload()
+    page.wait_for_selector(SIGNED_IN, timeout=WAIT_S * 1000)
+    page._page.wait_for_selector(copy, state="visible")
+    assert page.get_attribute(line, "aria-pressed") == "true"
+    assert page.evaluate("window.localStorage.getItem('wlx.pinned-opened.tasks/"
+                         "fixation_detection.py')") == "fix_hold"
+    assert _opened(page) == ["set_size"], "the Task parameters tab's own"
+    assert page.input_value(field) == "0.30"
+    page.click(f"{copy} > details.more > summary")
+    page.click(f"{copy} [data-pin-toggle]")
+    assert not page.is_visible("#pinned-pane")
+    assert page.locator("#pinned > *").count() == 0 and page.locator("#pinned-editing .box").count() == 0
+    page.reload()
+    page.wait_for_selector("#params .box", state="attached")
+    assert page.locator("#pinned > *").count() == 0 and page.locator("#pinned-editing .box").count() == 0
+
+
+def test_a_pinned_line_says_a_refusal_and_its_editor_opens_one_at_a_time(rig):
+    """The summary and editor design's goal 9 with two pins: Runtime's editor shows one pinned
+    setting at a time, the line clicked; a draft left in one survives opening the other, its line
+    keeping ●; a refusal the rig says is on the pinned line as on its tab's (`!`); and a pin of a
+    setting no longer among the task's drops its line, its box and what Runtime had open.
+    In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Refused
+
+    page = _task6_page(rig)
+    _pin(page, "fix_hold")
+    _pin(page, "set_size")
+    page.click('label[for="t-runtime"]')
+    assert page.eval_on_selector_all("#pinned > .line", "(all) => all.map((l) => l.getAttribute('data-open'))") == [
+        "fix_hold", "set_size"], "in the order pinned"
+    page._page.click(_pin_line("fix_hold"))
+    page.fill(f'{_pinned("fix_hold")} input[data-param="fix_hold"]', "0.40")
+    page._page.click(_pin_line("set_size"))
+    assert page._page.is_visible(_pinned("set_size")) and page._page.is_hidden(_pinned("fix_hold"))
+    assert page.get_attribute(_pin_line("fix_hold"), "aria-pressed") == "false"
+    assert _marked(page, "fix_hold", "#pinned")[:2] == ("●", "0.30 → 0.40 s")
+    page.click("#drafts-discard")
+    _offer(rig, 41, params=_task6_rows(), refusals=(
+        Refused("set_size", Box("Jake Westerberg"), "'set_size' at 40 is above its 36", value=40.0),))
+    _arrived(page, 41)
+    rig.wait_for(lambda: _marked(page, "set_size", "#pinned")[0] == "!")
+    assert _marked(page, "set_size", "#pinned") == _marked(page, "set_size"), "as its tab's line"
+    _offer(rig, 42, params=tuple(row for row in _task6_rows() if row.name != "set_size"))
+    _arrived(page, 42)
+    rig.wait_for(lambda: page.locator("#pinned > .line").count() == 1)
+    assert page.locator("#pinned-editing > .box").count() == 1
+    assert page.is_visible("#pinned-editing > .placeholder"), "what Runtime had open is gone"
+    assert page.evaluate("window.localStorage.getItem('wlx.pinned-opened.tasks/"
+                         "fixation_detection.py')") is None, "and is no longer kept"
+
+
+def _pin(page, name: str) -> None:
+    page.click(f'{_b(name)} > details.more > summary')
+    page.click(f'{_b(name)} [data-pin-toggle]')
+    page.click(f'{_b(name)} > details.more > summary')
+
+
+def test_a_pinned_copys_tick_segment_and_swatch_work_as_its_box(rig):
+    """The whole-build review's I3 (the design's goal 9: a pinned copy works the same way): a tick
+    in a pinned pairings grid ticks it -- the copy and its box both, a draft on the box, its Apply
+    sending the pool's number with it -- as a segment of a pinned switch and a pinned swatch do.
+    Run in WebKit too, for Safari."""
+    from wl_xcon.link import SetParameter
+
+    page = _task6_page(rig, params=_matrix_rows(40))
+    for name in ("pairings", "wait", "distractor_appearance"):
+        _pin(page, name)
+    page.click('label[for="t-runtime"]')
+    tick = f'{_pinned("pairings")} input.tick[aria-label="green among red"]'
+    page.wait_for_selector(tick, state="visible")
+
+    page.click(tick)
+    assert page.is_checked(tick), "the copy's tick stays ticked"
+    assert page.is_checked(_tick("green among red")), "its box is ticked"
+    assert page.text_content(f'{_pinned("pairings")} > .status > .say').strip() == "not sent"
+    page.click(f'{_pinned("wait")} [data-switch="drawn"]')
+    assert page.is_visible(f'{_pinned("wait")} [data-side="drawn"]')
+    page.click(f'{_pinned("distractor_appearance")} .hue[data-color="red"]')
+    assert page.get_attribute(f'{_pinned("distractor_appearance")} .hue[data-color="red"]',
+                              "aria-pressed") == "true"
+    assert _bar(page).startswith("3 edits not sent: wait, distractor_appearance, pairings")
+    page.click(tick)
+    assert not page.is_checked(tick) and not page.is_checked(_tick("green among red"))
+    page.click(tick)
+    page.click(f'{_pinned("pairings")} [data-apply]')
+    rig.wait_for(lambda: rig.dispatch.seen)
+    (sent,) = rig.dispatch.seen
+    assert (type(sent), sent.name, sent.value) == (SetParameter, "pairings", 66 + 2048)
+
+
+def test_leaving_a_pinned_copys_field_ends_a_refused_points_fraction(rig):
+    """The fix wave's re-review, M-a: a point refused in a pinned copy of a whole box refuses the
+    digits after it, as in the box; leaving the copy's field ends that, as leaving the box's own
+    does, so the box's draft can be sent again (its note kept until the box's news or value moves).
+    Run in WebKit too, for Safari."""
+    page = _task6_page(rig)
+    _pin(page, "set_size")
+    page.click('label[for="t-runtime"]')
+    copy = _pinned("set_size")
+    field = f'{copy} input[data-param="set_size"]'
+    page.wait_for_selector(field, state="visible")
+    page.fill(field, "")
+    page.type(field, "12.5")
+    assert page.input_value(field) == "12"
+    assert page.text_content(f"{copy} > .status > .say").strip() == "cannot send · whole numbers only"
+    assert page.is_disabled(f"{copy} [data-apply]")
+    page.mouse.click(2, 2)  # a neutral spot: the copy's field loses focus
+    rig.wait_for(lambda: not page.is_disabled(f"{copy} [data-apply]"))
+    assert page.text_content(f"{copy} > .status > .say").strip() == "whole numbers only"
+    assert not page.is_disabled(f'{_b("set_size")} [data-apply]'), "the box's own Apply too"
+
+
+def test_a_pin_with_its_store_blocked_lasts_the_page_and_nothing_breaks(rig):
+    """The design's goal 9 with `localStorage` failing (a private window, blocked site data):
+    every access is inside `try`, so a pin still works for as long as the page is shown, nothing
+    is raised into the page, and after a reload nothing is pinned."""
+    page = _task6_page(rig)
+    page.add_init_script(_NO_LOCAL_STORE)
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.reload()
+    page.wait_for_selector(SIGNED_IN, timeout=WAIT_S * 1000)
+    page.click('label[for="t-task"]')
+    page.click(f'{_b("set_size")} > details.more > summary')
+    page.click(f'{_b("set_size")} [data-pin-toggle]')
+    page.click('label[for="t-runtime"]')
+    page.click(f'{_pinned("set_size")} [data-dir="1"]')
+    assert page.input_value(f'{_pinned("set_size")} input[data-param="set_size"]') == "5"
+    assert _bar(page) == "1 edit not sent: set_size"
+    page.click("#drafts-discard")
+    page.reload()
+    page.wait_for_selector("#params .box", state="attached")
+    assert page.locator("#pinned-editing .box").count() == 0 and not page.is_visible("#pinned-pane")
+    assert errors == [], errors
+
+
+def test_the_demo_keys_fold_after_the_first_visit(rig):
+    """The design's call: "the demo's key list and caveats fold to one line ("keys and demo
+    limits"), open on the first visit only" (the layout review's finding 4: 1,326 px on every
+    tab). Pages that showed no demo -- two loads of one -- do not use up the first visit; the first demo
+    screen this browser shows has them open, a reload has them folded to their one line, and a
+    click opens them. With the store blocked every visit is a first: open."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(frame())))
+    page = rig.browser_page()
+    for _ in range(2):
+        page.wait_for_selector("#head-id [data-trial]", state="attached")
+        assert not page.is_visible("#demo-pane")
+        page.reload()
+    rig.hub.offer(decode(encode(frame(demo=True, trial_index=41))))
+    page.wait_for_selector("#demo-pane", state="visible")
+    assert page.text_content("#demo-fold > summary") == "keys and demo limits"
+    assert page.evaluate("document.getElementById('demo-fold').open") is True
+    assert page.is_visible("#demo-keys .demo-limits")
+
+    page.reload()
+    page.wait_for_selector("#demo-pane", state="visible")
+    assert page.evaluate("document.getElementById('demo-fold').open") is False
+    assert not page.is_visible("#demo-keys .demo-limits")
+    fold = _rect(page, "#demo-fold")
+    assert fold["height"] < 2 * 20, "one line"
+    page.click("#demo-fold > summary")
+    assert page.is_visible("#demo-keys .demo-limits")
+
+    blocked = rig.browser_page()
+    blocked.add_init_script(_NO_LOCAL_STORE)
+    for _ in range(2):
+        blocked.reload()
+        blocked.wait_for_selector("#demo-pane", state="visible")
+        assert blocked.evaluate("document.getElementById('demo-fold').open") is True
+
+
+# **The summary and editor build's Task 2: what only the page knows, on the lines; find and the
+# keyboard.**
+
+
+def _line(name: str, root: str = "#params") -> str:
+    """A setting's summary line on a settings tab, or (`root` "#pinned") its pinned line on
+    Runtime, which stands in a summary of its own (the build's Task 3)."""
+    if root == "#pinned":
+        return _pin_line(name)
+    return f'{root} > .summary .line[data-open="{name}"]'
+
+
+def _marked(page, name: str, root: str = "#params") -> tuple:
+    """A summary line's marks, its value and its title, as the page shows them."""
+    return tuple(page.evaluate(
+        "(s) => { const l = document.querySelector(s); return [l.querySelector('.mk').textContent,"
+        " l.querySelector('.lv').textContent, l.getAttribute('title')]; }", _line(name, root)))
+
+
+def _popout_started(tmp_path, **over):
+    """`_popout_frame` with each setting that holds no value yet at its task's start (the pop-out's
+    `Param.start`), as a run shows them: the values a line says, and so how much of its width
+    they take."""
+    import importlib.util
+
+    from _demo import POPOUT, xtasks_or_skip
+
+    made = _popout_frame(tmp_path, **over)
+    spec = importlib.util.spec_from_file_location("popout_started", xtasks_or_skip() / POPOUT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    starts = {param.name: param.start for param in module.TASK.params}
+    return dataclasses.replace(made, params=tuple(
+        dataclasses.replace(row, value=starts[row.name])
+        if row.value is None and isinstance(starts.get(row.name), (int, float)) else row
+        for row in made.params))
+
+
+def test_no_popout_name_is_cut_at_1280(rig, tmp_path):
+    """The ledger's ruling for the summary and editor build's Task 2, on the Task 1 screenshot at
+    1280 × 800 ("Time to find the fixation…", "Ring distance from cen…", "Disc wind… 0.0 × disc
+    radi…"): no plain name of the pop-out's Task parameters is cut short -- at 1280 × 800 with the
+    demo screen's column shown, its settings at their start values, and every line still above
+    the fold -- nor at 1024 or 1440 wide. The columns are as wide as the longest plain name a task
+    may declare with a value beside it, and the summary says "°" and "cd/m²". Through the wire, in
+    a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(_popout_started(tmp_path, demo=True))))
+    page = rig.browser_page()
+    page.set_viewport_size({"width": 1280, "height": LAPTOP_H})
+    page.click('label[for="t-task"]')
+    page.wait_for_selector("#params .box", state="attached")
+    assert page.is_visible("#demo-pane"), "the demo screen's column is shown"
+    said = dict(page.eval_on_selector_all("#params > .summary .line[data-open]", """lines =>
+        lines.map((line) => [line.getAttribute('data-open'), line.querySelector('.lv').textContent])"""))
+    assert said["fix_hold"] == "0.5–1.25 s" and said["ring_radius"] == "8.0°", said
+    assert said["fix_luminance"] == "40 cd/m²", said
+    for width in WIDTHS:
+        page.set_viewport_size({"width": width, "height": LAPTOP_H})
+        cut = page.eval_on_selector_all("#params > .summary .line > .ln", """names => names.filter(
+            (name) => name.scrollWidth > name.clientWidth + 0.5).map((name) => name.textContent)""")
+        assert cut == [], (width, cut)
+        if width == 1280:
+            below = page.eval_on_selector_all("#params > .summary .line", """lines => lines.filter(
+                (line) => line.getBoundingClientRect().bottom + window.scrollY > 800).map(
+                (line) => line.getAttribute('data-open'))""")
+            assert below == [], below
+
+
+def test_a_draft_survives_opening_another_and_its_line_says_so(rig):
+    """The summary and editor design's goal 4 and its anti-goal ("a trainer who believes an unsent
+    edit is in force"): a value typed in one setting, then another opened, the first's box hidden
+    keeps the draft, and its line says so -- ● after the name, the value in force and then the
+    draft, "0.30 → 0.50 s", *not sent* in its title -- across a frame; the drafts bar names it, and
+    Apply all sends it, the line then saying … *sending…*. In a real browser: run with
+    `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import ApplyMany
+
+    page = _task6_page(rig)
+    rest = _marked(page, "fix_hold")
+    assert rest == ("", "0.30 s", "fix_hold · 0.30 s"), rest
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.50")
+    _open(page, "set_size")
+    assert _opened(page) == ["set_size"]
+    assert _marked(page, "fix_hold") == ("●", "0.30 → 0.50 s", "fix_hold · 0.30 → 0.50 s · not sent")
+    assert "draft" in page.get_attribute(_line("fix_hold"), "class").split()
+    _offer(rig, 41, params=_task6_rows())
+    _arrived(page, 41)
+    assert _marked(page, "fix_hold")[:2] == ("●", "0.30 → 0.50 s")
+    assert _marked(page, "set_size") == ("", "4", "set_size · 4"), "a line with no draft as drawn"
+    assert _bar(page) == "1 edit not sent: fix_hold"
+
+    page.click("#drafts-apply")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    (sent,) = rig.dispatch.seen
+    assert type(sent) is ApplyMany
+    assert [(change.name, change.value) for change in sent.changes] == [("fix_hold", 0.5)]
+    mark, value, title = _marked(page, "fix_hold")
+    assert (mark, value) == ("…", "0.30 → 0.50 s") and "sending…" in title.split(" · ")
+
+
+def test_a_draft_over_a_waiting_change_shows_both_marks(rig):
+    """The plan's Review Focus 3: a draft typed over a change already waiting for the next trial
+    shows ●◷, the arrow's value the draft's, and its title says both -- *not sent* with who is
+    changing it, and the waiting change with who sent it; discarded, the line is the rig's again,
+    word for word. In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Staged
+
+    page = _task6_page(rig, staged=(Staged("fix_hold", 0.3, 0.6, Box("Ana"), False, cid="other-1"),))
+    rig_line = _marked(page, "fix_hold")
+    assert rig_line[:2] == ("◷", "0.30 → 0.60 s"), rig_line
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.80")
+    _open(page, "set_size")
+
+    mark, value, title = _marked(page, "fix_hold")
+    assert (mark, value) == ("●◷", "0.30 → 0.80 s")
+    told = title.split(" · ")
+    assert told[:2] == ["fix_hold", "0.30 → 0.80 s"], told
+    assert "not sent · Ana (box, unverified) is changing this to 0.60" in title, title
+    assert "waiting for the next trial · Ana (box, unverified)" in title, title
+    assert {"draft", "waiting"} <= set(page.get_attribute(_line("fix_hold"), "class").split())
+
+    page.click(f'{_b("fix_hold")} [data-discard]')
+    assert _marked(page, "fix_hold") == rig_line
+
+
+def test_a_lines_draft_text_for_each_kind(rig):
+    """The plan's Global Constraints, "draft text on a line", read from the box's own fields: one
+    number field, the value in force, then the typed number with its unit once ("0.30 → 0.5 s"), a
+    percent's `%` ("80 → 85%"), a degree's "°", a whole number as typed ("4 → 6"); a draw, its two
+    ends as typed ("0.50 s → 0.5–1.25 s"); a pool, "N of 12" from its ticks; a color and a group,
+    "edited"; and a draft that cannot send, the typed text alone, marked ! as well as ●, *cannot
+    send* and its reason in the title. In a real browser: run with `WLX_BROWSER=webkit` too, for
+    Safari."""
+    from wl_xcon.link import ParamRow
+
+    extra = (
+        ParamRow.of("distractor_fraction", "fraction", 0.0, 1.0, 0.8, False, source="task",
+                    step=0.05, percent=True, section="Stimuli"),
+        ParamRow.of("fix_window", "deg", 0.0, 9.0, 2.0, False, source="task", step=0.1,
+                    section="Gaze windows"),
+        ParamRow.of("wait", "s", 0.05, 2.0, 0.5, False, source="task", step=0.05, switch="drawn",
+                    section="Timing"),
+    )
+    colors = tuple(row for row in _matrix_rows(40) if row.name in ("distractor_appearance", "pairings"))
+    page = _task6_page(rig, params=_group_rows() + extra + colors, groups=_move_up())
+
+    page.fill(f'{_b("fix_hold")} input[data-param="fix_hold"]', "0.5")
+    page.fill(f'{_b("set_size")} input[data-param="set_size"]', "6")
+    page.fill(f'{_b("distractor_fraction")} input[data-param="distractor_fraction"]', "85")
+    page.fill(f'{_b("fix_window")} input[data-param="fix_window"]', "2.5")
+    page.click(f'{_b("wait")} [data-switch="drawn"]')
+    page.fill(f'{_b("wait")} [data-fields="non_aging"] input[data-form="shortest"]', "0.5")
+    page.fill(f'{_b("wait")} [data-fields="non_aging"] input[data-form="longest"]', "1.25")
+    page.click(_tick("green among red"))
+    page.click(f'{_b("distractor_appearance")} .hue[data-color="red"]')
+    page.fill(f'{_b("Move up")} input[data-param="move_up_bar"]', "90")
+    page.fill(f'{_b("response_deadline")} input[data-param="response_deadline"]', "abc")
+
+    for name, value in (("fix_hold", "0.30 → 0.5 s"), ("set_size", "4 → 6"),
+                        ("distractor_fraction", "80 → 85%"), ("fix_window", "2.0 → 2.5°"),
+                        ("wait", "0.50 s → 0.5–1.25 s"), ("pairings", "2 of 12 → 3 of 12"),
+                        ("distractor_appearance", "green → edited"),
+                        ("Move up", "80% · 50 → edited")):
+        mark, said, title = _marked(page, name)
+        assert (mark, said) == ("●", value), (name, mark, said)
+        assert "not sent" in title.split(" · "), (name, title)
+    mark, said, title = _marked(page, "response_deadline")
+    assert (mark, said) == ("!●", "0.60 s → abc"), (mark, said)
+    assert "cannot send · response_deadline needs a number" in title, title
+    assert "refused" in page.get_attribute(_line("response_deadline"), "class").split()
+    assert rig.dispatch.seen == []
+
+
+def test_a_refusal_stays_on_its_line_while_another_is_open(rig):
+    """The plan's Review Focus 5: a draft applied and refused, then another setting opened -- the
+    refused one's line keeps ! and ● with its draft after the arrow, the refusal and *not sent* in
+    its title, across a frame; opening it again shows the refusal on its status line and the draft
+    back in its field. In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.actor import Box
+    from wl_xcon.link import Refused
+
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.90")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    refusal = Refused("fix_hold", Box("Jake Westerberg"), "'fix_hold' at 0.9 is refused: too long",
+                      cid=rig.dispatch.seen[-1].cid, value=0.9)
+    _offer(rig, 41, params=_task6_rows(), refusals=(refusal,))
+    _says(rig, page, "fix_hold", "refused 0.90", start=True)
+    _open(page, "set_size")
+
+    for trial in (None, 42):
+        if trial is not None:
+            _offer(rig, trial, params=_task6_rows(), refusals=(refusal,))
+            _arrived(page, trial)
+        mark, value, title = _marked(page, "fix_hold")
+        assert (mark, value) == ("!●", "0.30 → 0.90 s"), (trial, mark, value)
+        assert "refused 0.90 · " in title and "not sent" in title.split(" · "), title
+    assert _opened(page) == ["set_size"]
+    _open(page, "fix_hold")
+    assert _opened(page) == ["fix_hold"]
+    assert _say(page, "fix_hold").startswith("refused 0.90")
+    assert page.input_value(field) == "0.90"
+    assert len(rig.dispatch.seen) == 1
+
+
+def test_sending_and_not_confirmed_marks(rig):
+    """The plan's Global Constraints: an act sent and not yet answered by a frame marks its line …
+    (*sending…* in the title), the value the one sent after the arrow; left with no word from the
+    rig for `ANSWER_FRAMES` frames, the box lets it go (the whole-build review's I2) and the line
+    says ? with the box's words, "not confirmed by the rig", the edit a draft again (●). In a real
+    browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    page = _task6_page(rig)
+    field = f'{_b("fix_hold")} input[data-param="fix_hold"]'
+    page.fill(field, "0.5")
+    page.evaluate("document.getElementById('sent').textContent = ''")
+    page.press(field, "Enter")
+    rig.wait_for(lambda: rig.dispatch.seen)
+    rig.wait_for(lambda: page.text_content("#sent").strip().startswith("sent"))
+    page.evaluate("document.activeElement.blur()")
+    _open(page, "set_size")
+    for trial in (None, 41, 42):
+        if trial is not None:
+            _offer(rig, trial, params=_task6_rows())
+            _arrived(page, trial)
+        mark, value, title = _marked(page, "fix_hold")
+        assert (mark, value) == ("…", "0.30 → 0.5 s"), (trial, mark, value)
+        assert "sending…" in title.split(" · "), title
+    _offer(rig, 43, params=_task6_rows())
+    _says(rig, page, "fix_hold", "not confirmed by the rig · check the value in force")
+    mark, value, title = _marked(page, "fix_hold")
+    assert (mark, value) == ("●?", "0.30 → 0.5 s"), (mark, value)
+    assert "not confirmed by the rig · check the value in force" in title
+    assert "unconfirmed" in page.get_attribute(_line("fix_hold"), "class").split()
+
+
+def test_find_highlights_lines_and_enter_opens_the_first(rig):
+    """The summary and editor design's goal 8: the find box highlights the lines it finds -- by a
+    plain name, a code name, a section, a group's setting -- and dims the rest; Enter in it opens
+    the first found, in the summary's order, sending nothing; cleared, nothing is highlighted or
+    dimmed. In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import ParamRow
+
+    rows = tuple(dataclasses.replace(row, label="Fixation hold") if row.name == "fix_hold" else row
+                 for row in _group_rows()) + (
+        ParamRow.of("fix_window", "deg", 0.0, 9.0, 2.0, False, section="Gaze windows"),
+        ParamRow.of("fix_size", "deg", 0.0, 9.0, 0.5, False, section="Stimuli/fixation point"),
+    )
+    page = _task6_page(rig, params=rows, groups=_move_up())
+    every = page.locator("#params > .summary .line[data-open]").count()
+
+    def found():
+        return page.eval_on_selector_all("#params > .summary .line.found",
+                                         "lines => lines.map((line) => line.getAttribute('data-open'))")
+
+    for typed, expected in (("fixation hold", ["fix_hold"]), ("FIX_WIN", ["fix_window"]),
+                            ("stimuli", ["set_size", "fix_size"]), ("move_up_window", ["Move up"])):
+        page.fill("#pfind", typed)
+        assert found() == expected and _found(page) == expected, typed
+        assert page.locator("#params > .summary .line.nofind").count() == every - len(expected)
+        assert not page.is_visible("#pfind-none"), typed
+    page.fill("#pfind", "stimuli")
+    page.press("#pfind", "Enter")
+    assert _opened(page) == ["set_size"]
+    page.fill("#pfind", "move_up_window")
+    page.press("#pfind", "Enter")
+    assert _opened(page) == ["Move up"]
+    page.fill("#pfind", "")
+    assert found() == [] and page.locator("#params > .summary .line.nofind").count() == 0
+    assert rig.dispatch.seen == []
+
+
+def test_find_with_no_match_opens_nothing(rig):
+    """The plan's Review Focus 4: a find that matches nothing dims every line, highlights none and
+    says "no setting matches"; Enter then opens nothing -- the editor keeps its placeholder, or the
+    setting already opened -- and sends nothing; cleared, the words go. In a real browser: run with
+    `WLX_BROWSER=webkit` too, for Safari."""
+    _offer(rig, 40, params=_task6_rows())
+    page = rig.browser_page()
+    _sign_in(page)
+    page.click('label[for="t-task"]')
+    every = page.locator("#params > .summary .line[data-open]").count()
+    assert every > 0
+    for opened in (None, "fix_hold"):
+        if opened is not None:
+            page.fill("#pfind", "")
+            _open(page, opened)
+        page.fill("#pfind", "no such setting")
+        assert page.locator("#params > .summary .line.nofind").count() == every
+        assert page.locator("#params > .summary .line.found").count() == 0
+        assert page.is_visible("#pfind-none")
+        assert page.text_content("#pfind-none") == "no setting matches"
+        page.press("#pfind", "Enter")
+        # The opened setting stays opened, the editor saying find hides it (the ledger's ruling
+        # for the build's Task 3: `test_the_editor_says_when_find_hides_the_opened_setting`).
+        assert _opened(page) == (["click a setting above to change it"] if opened is None
+                                 else [web.FIND_HIDES_OPENED, opened])
+    page.fill("#pfind", "")
+    assert not page.is_visible("#pfind-none")
+    assert rig.dispatch.seen == []
+
+
+def test_the_editor_says_when_find_hides_the_opened_setting(rig):
+    """The ledger's ruling for the summary and editor build's Task 3: where the find box hides the
+    setting opened in the editor, the editor says "the opened setting is hidden by find · clear
+    find to see it" in place of going blank (Task 2's concern 3) -- across a frame, and on the
+    Training tab as on Task parameters; a find that finds it, or none, takes the words away and
+    shows its box again, still opened. In a real browser: run with `WLX_BROWSER=webkit` too, for
+    Safari."""
+    rows = _task6_rows() + _training_rows(2.0)
+    page = _task6_page(rig, params=rows)
+    note = "#params > .editing > .findhid"
+    assert page.is_hidden(note), "no find, no words"
+    _open(page, "fix_hold")
+    page.fill("#pfind", "set_size")
+    assert page.is_visible(note) and page.text_content(note) == web.FIND_HIDES_OPENED
+    assert page._page.is_hidden(_b("fix_hold")) and page.is_hidden("#params > .editing > .placeholder")
+    assert _opened(page) == [web.FIND_HIDES_OPENED, "fix_hold"]
+    _offer(rig, 41, params=rows)
+    _arrived(page, 41)
+    assert page.is_visible(note), "a frame keeps the words"
+    page.fill("#pfind", "fix")
+    assert page.is_hidden(note) and page._page.is_visible(_b("fix_hold"))
+    page.fill("#pfind", "set_size")
+    page.fill("#pfind", "")
+    assert page.is_hidden(note) and _opened(page) == ["fix_hold"]
+
+    page.click('label[for="t-training"]')
+    _open(page, "fade_in_step", "#training-params")
+    page.fill("#tfind", "gain")
+    assert page.is_visible("#training-params > .editing > .findhid")
+    assert page.is_hidden(note), "each tab's own find"
+
+
+def test_the_training_tab_is_a_summary_below_the_switch_and_ladder(rig, tmp_path):
+    """The summary and editor design's call on the Training tab: "the training switch and the stage
+    ladder stay where they are; the summary and the editor replace the boxes in its settings
+    panel, below them". On the pop-out's own Training settings (`_popout_own`): the switch and the
+    trainer's panel stand above the summary; each of the three rules is one line (the group's
+    title, its settings' values), none of their settings a line of its own, and each opens as its
+    sentence with its fields in place; its find works as Task parameters' does; its columns are as
+    wide as its own longest line (the ledger's ruling for the build's Task 3), no name cut. Through
+    the wire, in a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(_popout_own(tmp_path, **_TRAINING, shaping="on", full_task=True))))
+    page = rig.browser_page()
+    page.set_viewport_size({"width": 1280, "height": LAPTOP_H})
+    page.click('label[for="t-training"]')
+    page.wait_for_selector("#training-params > .summary .line", state="visible")
+    top = page.evaluate("document.querySelector('#training-params > .summary').getBoundingClientRect().top")
+    for above in ("#shaping", "#rt-train"):
+        assert page.is_visible(above), above
+        bottom = page.evaluate(f"document.querySelector('{above}').getBoundingClientRect().bottom")
+        assert bottom <= top, (above, bottom, top)
+    assert page.locator("#shaping [data-cmd=shaping]").count() == 3, "the switch"
+
+    lines = dict(page.eval_on_selector_all("#training-params > .summary .line[data-open]", """all =>
+        all.map((line) => [line.getAttribute('data-open'), [line.querySelector('.ln').textContent,
+        line.querySelector('.lv').textContent, line.getBoundingClientRect().height]])"""))
+    sentences = {"Move up": "Move up when at least ", "Move back": "Move back when fewer than ",
+                 "Staircase": "One level harder after "}
+    for rule, starts in sentences.items():
+        label, value, height = lines[rule]
+        assert label == rule and 18 <= height <= 22, (rule, lines[rule])
+        assert " · " in value, (rule, value, "its settings' values")
+        page._page.click(_line(rule, "#training-params"))
+        assert _opened(page, "#training-params") == [rule]
+        said = page.text_content(f'{_b(rule, "#training-params")} .editor .sentence > .gs')
+        assert said == starts, (rule, said)
+    members = {"move_up_bar", "move_up_window", "move_back_bar", "move_back_window",
+               "staircase_down", "staircase_up"}
+    assert not members & set(lines), "a rule's settings are its one line"
+
+    page.fill("#tfind", "staircase")
+    assert "Staircase" in _found(page, "#training-params")
+    page.fill("#tfind", "")
+    width = page.get_attribute("#training-params > .summary", "style")
+    assert width is not None and re.fullmatch(r"column-width: [0-9.]+ch", width), width
+    assert page.get_attribute("#params > .summary", "style") != width, "each tab its own"
+    cut = page.eval_on_selector_all("#training-params > .summary .line > .ln, "
+                                    "#training-params > .summary .line > .lv", """parts =>
+        parts.filter((part) => part.scrollWidth > part.clientWidth + 0.5).map((part) =>
+        part.textContent)""")
+    assert cut == [], cut
+
+
+def test_the_real_popout_summary_has_three_columns_or_more_at_1280(rig, tmp_path):
+    """The ledger's ruling for the summary and editor build's Task 3: "size the summary's columns
+    from the tab's own longest line ... so the real pop-out gets 3-4 columns at 1280 while a
+    40-character label still fits uncut" (`test_no_popout_name_is_cut_at_1280`, beside it). On the
+    wl-xtasks pop-out's own rows at their start values, at 1280 × 800 with the demo screen's
+    column shown: three columns or more on Task parameters and on Training, no name and no value
+    cut, every Task parameters line above the fold; and at 1024 and 1440 nothing cut. Through the
+    wire, in a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    from wl_xcon.link import decode, encode
+
+    rig.hub.offer(decode(encode(_popout_own(tmp_path, demo=True))))
+    page = rig.browser_page()
+    page.set_viewport_size({"width": 1280, "height": LAPTOP_H})
+    page.click('label[for="t-task"]')
+    page.wait_for_selector("#params > .summary .line", state="visible")
+    assert page.is_visible("#demo-pane"), "the demo screen's column is shown"
+    columns = """(root) => new Set(Array.from(document.querySelectorAll(root + ' > .summary .line'))
+        .filter((line) => line.getClientRects().length).map((line) =>
+        Math.round(line.getBoundingClientRect().left))).size"""
+    cuts = """(root) => Array.from(document.querySelectorAll(root + ' > .summary .line > .ln, ' + root +
+        ' > .summary .line > .lv')).filter((part) => part.getClientRects().length &&
+        part.scrollWidth > part.clientWidth + 0.5).map((part) => part.textContent)"""
+    assert page.evaluate(columns, "#params") >= 3
+    below = page.eval_on_selector_all("#params > .summary .line", """lines => lines.filter(
+        (line) => line.getBoundingClientRect().bottom + window.scrollY > 800).map(
+        (line) => line.getAttribute('data-open'))""")
+    assert below == [], below
+    for width in WIDTHS:
+        page.set_viewport_size({"width": width, "height": LAPTOP_H})
+        assert page.evaluate(cuts, "#params") == [], width
+    page.set_viewport_size({"width": 1280, "height": LAPTOP_H})
+    page.click('label[for="t-training"]')
+    page.wait_for_selector("#training-params > .summary .line", state="visible")
+    # Its eight lines are fewer than three columns' worth, so the engine balances them into what
+    # it needs (WebKit two): its columns' width leaves room for three.
+    room = page.evaluate("""() => { const summary = document.querySelector('#training-params > .summary');
+        const style = getComputedStyle(summary);
+        return [parseFloat(style.columnWidth), parseFloat(style.columnGap), summary.clientWidth]; }""")
+    assert 3 * room[0] + 2 * room[1] <= room[2], room
+    assert page.evaluate(columns, "#training-params") >= 2, "its one section breaks between its subsections"
+    for width in WIDTHS:
+        page.set_viewport_size({"width": width, "height": LAPTOP_H})
+        assert page.evaluate(cuts, "#training-params") == [], width
+
+
+def test_a_frame_that_lengthens_a_name_widens_its_columns_in_place(rig):
+    """The ledger's ruling for the summary and editor build's Task 3, across frames: a frame whose
+    longest line is longer -- a plain name the rig now gives -- widens the summary's columns, the
+    summary and its lines patched in place (the nodes kept, a focused line keeping its focus), and
+    one that shortens it again narrows them. In a real browser: run with `WLX_BROWSER=webkit` too,
+    for Safari."""
+    page = _task6_page(rig)
+    narrow = page.get_attribute("#params > .summary", "style")
+    page.evaluate("document.querySelector('#params > .summary').wlxKept = 1")
+    page._page.focus(_line("set_size"))
+    long = _task6_rows(fix_hold={"label": "Fixation hold, before the array is shown"})
+    _offer(rig, 41, params=long)
+    _arrived(page, 41)
+    _until(page, "document.querySelector('#params > .summary').getAttribute('style') !== " + json.dumps(narrow))
+    wide = page.get_attribute("#params > .summary", "style")
+    assert float(wide.split()[-1][:-2]) > float(narrow.split()[-1][:-2]), (narrow, wide)
+    assert page.evaluate("document.querySelector('#params > .summary').wlxKept === 1"), "patched in place"
+    assert page.evaluate(f"document.activeElement === document.querySelector('{_line('set_size')}')")
+    _offer(rig, 42, params=_task6_rows())
+    _arrived(page, 42)
+    _until(page, "document.querySelector('#params > .summary').getAttribute('style') === " + json.dumps(narrow))
+
+
+def test_the_summary_steps_with_the_arrow_keys(rig):
+    """The summary and editor design's goal 7: on a summary line, ↓ and ↑ move to the next and the
+    previous line in the summary's order, past the lines the find box dims, and stop at the ends;
+    Enter opens the setting and puts its editor's first field in focus; Esc in that field, with no
+    draft, leaves it, and a second Esc returns focus to its line (the design's call). Nothing is
+    sent. In a real browser: run with `WLX_BROWSER=webkit` too, for Safari."""
+    page = _task6_page(rig)
+    order = page.eval_on_selector_all("#params > .summary .line[data-open]",
+                                      "lines => lines.map((line) => line.getAttribute('data-open'))")
+    assert order[:3] == ["fix_hold", "response_deadline", "set_size"], order
+
+    def focused():
+        return page.evaluate("document.activeElement.getAttribute('data-open') || "
+                             "document.activeElement.getAttribute('data-param') || "
+                             "document.activeElement.tagName")
+
+    page.focus(_line("fix_hold"))
+    for key, expected in (("ArrowDown", "response_deadline"), ("ArrowDown", "set_size"),
+                          ("ArrowUp", "response_deadline"), ("ArrowUp", "fix_hold"),
+                          ("ArrowUp", "fix_hold")):
+        page.keyboard.press(key)
+        assert focused() == expected, (key, expected)
+    page.focus(_line(order[-1]))
+    page.keyboard.press("ArrowDown")
+    assert focused() == order[-1]
+    page.fill("#pfind", "set_size")
+    page.focus(_line("fix_hold"))
+    page.keyboard.press("ArrowDown")
+    assert focused() == "set_size", "past the lines the find box dims"
+    page.fill("#pfind", "")
+
+    page.focus(_line("response_deadline"))
+    page.keyboard.press("Enter")
+    assert _opened(page) == ["response_deadline"]
+    assert focused() == "response_deadline" and page.evaluate(
+        "document.activeElement.tagName") == "INPUT", "the editor's first field"
+    page.keyboard.press("Escape")
+    assert focused() == "BODY", "Esc with no draft leaves the field"
+    page.keyboard.press("Escape")
+    assert page.evaluate("document.activeElement.matches('.summary .line[data-open=\"response_deadline\"]')")
+    assert rig.dispatch.seen == []
+
+
+def test_a_frame_during_a_press_on_a_line_opens_it_once(rig):
+    """The plan's Review Focus 1: a frame lands while a summary line is pressed -- one changing that
+    line's value and its neighbors' -- and the press opens the setting once, the line's node kept
+    and its value the frame's after; then, a field of the opened box being typed in, another frame
+    changes the setting's value in force: the field keeps its focus and its draft, and the line
+    says the draft over the new value in force. In a real browser: run with `WLX_BROWSER=webkit`
+    too, for Safari."""
+    page = _task6_page(rig, params=_matrix_rows(40))
+    line = _line("set_size")
+    page.evaluate("""(line) => {
+        window.__opens = 0;
+        document.querySelector(line).wlxSame = true;
+        document.addEventListener('click', (e) => {
+            if (e.target.closest && e.target.closest(line)) { window.__opens += 1; } }, true);
+    }""", line)
+    page.hover(line)
+    page.mouse.down()
+    _offer(rig, 41, params=_matrix_rows(41))
+    _arrived(page, 41)
+    assert page.text_content(f"{line} > .lv") == "4", "held while the line is pressed"
+    page.mouse.up()
+    rig.wait_for(lambda: page.text_content(f"{line} > .lv") == "6")
+    assert _opened(page) == ["set_size"]
+    assert page.evaluate("window.__opens") == 1
+    assert page.evaluate("(line) => document.querySelector(line).wlxSame === true", line)
+
+    field = f'{_b("set_size")} input[data-param="set_size"]'
+    page.fill(field, "8")
+    rows = tuple(dataclasses.replace(row, value=7) if row.name == "set_size" else row
+                 for row in _matrix_rows(41))
+    _offer(rig, 42, params=rows)
+    _arrived(page, 42)
+    rig.wait_for(lambda: page.text_content(f"{line} > .lv") == "7 → 8")
+    assert page.evaluate("document.activeElement.getAttribute('data-param')") == "set_size"
+    assert page.input_value(field) == "8" and _marked(page, "set_size")[0] == "●"
+    assert page.evaluate("(line) => document.querySelector(line).wlxSame === true", line)
+    assert rig.dispatch.seen == []

@@ -412,6 +412,34 @@ def test_a_still_pointers_report_during_its_flick_leaves_the_flick_one_saccade(m
         assert len(flicks) == 1 and confirmed[-1] is flicks[0], (seed, confirmed)
 
 
+def test_a_flick_reported_the_frame_after_a_still_pointers_report_is_still_a_saccade(monkeypatch):
+    """**A flick a frame behind a still pointer's report** (2026-11-19): the page reports a still
+    pointer every 100 ms, and a hand moves when it moves, so a flick's report can reach the rig the
+    frame after a still one's, or after two that came a frame apart (`tests/test_page_browser.py`'s
+    pop-out played with the mouse, an abort in about one suite run in several; pitfall P29). Taken
+    in that one frame, as a report in a stream of one a frame is, the flick was a jump the detector
+    never confirms -- under its six samples outside the threshold -- so the look landed nowhere,
+    and the pop-out ended it astray on its landing bound with the eye in the target's window.
+    **Only a report continuing a stream of one a frame is taken exactly**; this one is eased over
+    its gap and `pointer.EASE_SLACK_S`: one saccade, landing in the window there."""
+    confirmed = _count_saccades(monkeypatch)
+    for bunched in (1, 2):
+        for seed in range(10):
+            confirmed.clear()
+            clock, page, source, pace = _rig(seed=seed)
+            _still(page, 0.0, 0.0, range(1, 121))
+            for frame in range(141 - bunched, 141):
+                page.pointer(frame_at(T0, frame), 0.0, 0.0)
+            page.pointer(frame_at(T0, 141), 8.0, 0.0)
+            for frame in range(165, 480, 24):
+                page.pointer(frame_at(T0, frame), 8.0, 0.0)
+            world, result = _play(_LOOK, source, pace)
+            flicks = [found for found in confirmed if found.amplitude_deg > 1.0]
+            assert result.outcome is Outcome.CORRECT, (bunched, seed, result)
+            assert len(flicks) == 1 and confirmed[-1] is flicks[0], (bunched, seed, confirmed)
+            assert world.in_window("flick", result.frames)
+
+
 # --- Keys, touch and the light sensor ---------------------------------------------------------
 
 
@@ -1179,14 +1207,17 @@ def test_the_drawn_windows_are_those_tracked_scores_with_the_target_flagged():
     drawn = _drawing().drawn(world, visible, values, trial, 0, 1)
 
     names = [window.name for window in drawn.windows]
-    assert names == ["fix", "center", *(f"search.{i}" for i in range(12))]
+    # The fixation point's own window scores it throughout since the pop-out's revision (its
+    # design's §2: the point stays on), no remembered `center` beside it.
+    assert names == ["fix", *(f"search.{i}" for i in range(12))]
     for window in drawn.windows:
         assert (window.x_deg, window.y_deg, window.radius_deg) == world._judged[window.name]
         assert window.eye == "both"
     (target,) = [window for window in drawn.windows if window.target]
     placed = array.looks.positions(values, (0.0, 0.0))
     assert target.name == "search.0" and (target.x_deg, target.y_deg) == placed[0]
-    assert target.radius_deg == values["object_window"]
+    # A multiple of the disc's radius since the console settings plan's Task 11: 3.0 about 1°.
+    assert target.radius_deg == values["object_window"] * values["disc_size"] / 2
     # On the ring's true circle, the ring turned 33° (`task.Array.positions`).
     assert polar_of_deg(*placed[0]) == pytest.approx((values["ring_radius"], 33.0))
     odd_disc = next(item for item in drawn.screen.items if item.name == "search.0")

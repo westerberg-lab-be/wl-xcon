@@ -1551,7 +1551,7 @@ def test_a_direct_view_task_runs_in_the_stereoscope_once_its_setup_warning_is_ac
     service = _service(tmp_path)
     text = Path("tasks/fixation_detection.py").read_text()
     for axis, start in (("x", "10.0"), ("y", "0.0")):
-        wide = f'Param("target_{axis}", unit="deg", low=-16.0, high=16.0, start={start})'
+        wide = f'Param("target_{axis}", unit="deg", start={start})'
         assert text.count(wide) == 1
         text = text.replace(wide, f'Param("target_{axis}", unit="deg", low=-10.0, high=10.0, start={start})')
     (service.tasks / "narrow.py").write_text(text)
@@ -1588,14 +1588,17 @@ def test_the_search_task_runs_on_the_default_and_records_the_light_the_panel_sho
     # (the warnings-over-refusals review's M8): the search task's red and green.
     (clipped,) = [r["detail"] for r in rows if r["code"] == "unrealizable-color"]
     assert clipped.count(" ask for DKL(") == 2 and clipped.count("so the panel shows x=") == 2
-    assert len(items["warnings"].said) < 3_000, "5,392 with one per light and per isoluminant color"
+    # No limit with no reason is said any more (`unexplained-limit`; the console settings plan's
+    # Task 5 gave each bound its reason or took it away).
+    assert len(items["warnings"].said) < 3_000, (
+        "5,392 with one per light and per isoluminant color")
 
 
 def _narrow(service) -> str:
     """`fixation_detection`, its target held to ±10° so the stereoscope's ±12° mask shows it."""
     text = Path("tasks/fixation_detection.py").read_text()
     for axis, start in (("x", "10.0"), ("y", "0.0")):
-        wide = f'Param("target_{axis}", unit="deg", low=-16.0, high=16.0, start={start})'
+        wide = f'Param("target_{axis}", unit="deg", start={start})'
         assert text.count(wide) == 1
         text = text.replace(wide, f'Param("target_{axis}", unit="deg", low=-10.0, high=10.0, start={start})')
     (service.tasks / "narrow.py").write_text(text)
@@ -1640,25 +1643,31 @@ def test_a_stereoscope_session_runs_on_its_settings_warnings_once_they_are_accep
 def test_a_starting_value_outside_its_range_starts_with_a_warning_unless_it_breaks_the_run(tmp_path):
     """XC-352's D2 (the PI, 2026-10-11: "re-run the load-time checks with the range widened to the
     new value; accept with a warning that the task was not designed for it if nothing breaks;
-    refuse only what would break the run"): a fixation window of 7° (declared 0.5-5°) asks for its
-    warning and starts once accepted, `warnings.jsonl` recording it; a target at 40° (declared
-    ±16°) is off direct view's screen, and the start is refused, saying so."""
+    refuse only what would break the run"). **Since the console settings plan's Task 4 every
+    declared bound is hard** (the PI, 2026-11-16, "Hard limits only where impossible"), and since
+    its Task 5 the reference task declares only the bounds that stand: a luminance of 90, past the
+    PI's 80 cd/m2 (COL-29), fails the starting values as past the limit, saying why, and a target
+    at 40°, which no declared range holds now, fails as laid out off direct view's screen
+    (`preflight.laid_out`); neither run starts. A fixation window of 7°, which the builder's 5°
+    refused, starts, its layout judged at the run's values."""
     service = _service(tmp_path)
     _step(service, _open())
 
     off = _step(service, _start(values={**VALUES, "target_x": 40.0}))
-    wide = _step(service, CheckRun(by=BY, task=TASK, values={**VALUES, "fix_window": 7.0}))
+    wide = _step(service, CheckRun(by=BY, task=TASK, values={**VALUES, "fix_luminance": 90.0}))
+    refused = _step(service, _start(values={**VALUES, "fix_luminance": 90.0}))
     started = _step(service, _start(values={**VALUES, "fix_window": 7.0}))
 
-    assert off.run_index is None
-    assert ("starting values: stimulus-off-screen: with 'target_x' at 40, outside its declared "
-            "range: ") in _refused(off)[-1]
+    assert off.run_index is None and refused.run_index is None
+    assert "starting values: stimulus-off-screen: " in _refused(off)[-1]
     items = {i.name: i for i in wide.preflight.items}
-    assert items["starting values"].result == "pass" and items["warnings"].result == "unknown"
-    assert "outside-range: 'fix_window' is 7 deg, outside the [0.5, 5.0]" in items["warnings"].said
+    assert items["starting values"].result == "fail"
+    assert items["starting values"].said.startswith(
+        "past-limit: 'fix_luminance' at 90 cd/m2 is above its 80: white on the default "
+        "calibration, the published sRGB 80 cd/m² (COL-29)")
     assert started.run_index == 0
     rows = _jsonl(service.root / "2027-01-14_01" / "xcon" / "warnings.jsonl")
-    assert [r["how"] for r in rows if r["code"] == "outside-range"] == ["start"]
+    assert not [r for r in rows if r["code"] in ("outside-range", "past-limit")]
 
 
 def test_a_task_whose_declarations_are_malformed_fails_its_preflight_and_the_service_goes_on(
@@ -2104,12 +2113,14 @@ def test_every_warning_a_start_accepts_is_named_in_the_item_it_accepted(tmp_path
     accepted = service._starting[3]
     assert [e.code for e in accepted] == [
         "default calibration", "color-on-default", "contrast-on-default", "pump calibration", "eye tracker"]
-    owed = accepted[:3]
-    before = f"{len(owed)} not yet accepted this session: {warnlist.sentence(owed)}"
+    first = accepted[:3]
+    before = f"{len(first)} not yet accepted this session: {warnlist.sentence(first)}"
     assert before.index("contrast-on-default:") > NOTE_LIMIT, "past the cut before this fix"
+    owed = [e for e in accepted if e.code not in ("pump calibration", "eye tracker")]
     assert item.said == (
-        "3 not yet accepted this session (default calibration, color-on-default, "
-        f"contrast-on-default): {warnlist.sentence(owed)}"
+        f"{len(owed)} not yet accepted this session (default calibration, color-on-default, "
+        f"contrast-on-default): "
+        f"{warnlist.sentence(owed)}"
     ), "each shown whole (XC-353)"
 
 

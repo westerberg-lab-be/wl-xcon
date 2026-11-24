@@ -304,9 +304,9 @@ def _direction_task(folder: Path) -> Path:
          '"target", at=Polar(8.0, P("target_dir")), looks=P("target_appearance")'),
         ('            at=(P("target_x"), P("target_y")),\n            radius=P("target_window"),',
          '            at=Polar(8.0, P("target_dir")),\n            radius=P("target_window"),'),
-        ('        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),',
+        ('        Param("target_x", unit="deg", start=10.0),',
          '        Param("target_dir", unit="deg", low=-180.0, high=180.0, start=90.0),\n'
-         '        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),'),
+         '        Param("target_x", unit="deg", start=10.0),'),
         ("from wl_xcon.task import (", "from wl_xcon.task import (\n    Polar,"),
     ):
         assert text.count(old) == 1, old
@@ -347,8 +347,8 @@ def test_a_change_row_its_readers_would_refuse_is_never_written(tmp_path):
     (wl-preproc leaves one out), and a change id that is not a whole number from 1 are each
     refused before the file is opened."""
     assert record.KINDS == ("set", "hand_back", "range", "revert", "clear", "drum", "training",
-                            "suggested", "declined")
-    assert record.STROBED == ("set", "hand_back", "range", "revert")
+                            "suggested", "declined", "form", "shaping", "withdrawn")
+    assert record.STROBED == ("set", "hand_back", "range", "revert", "form")
     log = SessionRecord.open(tmp_path, "2027-01-14_01", "A")
     good = dict(change=1, kind="set", name="fix_hold", was=0.3, now=0.5, by=Box("jake"),
                 at=WALL_NOW, trial_number=1, run=0, meaning=None, event_code=4130, sequence=1)

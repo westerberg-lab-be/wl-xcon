@@ -602,10 +602,10 @@ def directed(path):
         ('            at=(P("target_x"), P("target_y")),\n            radius=P("target_window"),',
          '            at=Polar(P("target_ecc"), P("target_dir")),\n'
          '            radius=P("target_window"),'),
-        ('        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),',
+        ('        Param("target_x", unit="deg", start=10.0),',
          '        Param("target_ecc", unit="deg", low=0.0, high=16.0, start=8.0),\n'
          '        Param("target_dir", unit="deg", low=-180.0, high=180.0, start=0.0),\n'
-         '        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),'),
+         '        Param("target_x", unit="deg", start=10.0),'),
     ):
         assert text.count(old) == 1, old
         text = text.replace(old, new)
@@ -1697,7 +1697,7 @@ def apply_control(control):
                 self._acts[len(self._staged) - 1] = self._act
         T.Session._revert = _revert
     elif control == "impossible":
-        T.Session._impossible = lambda self, name, value: None
+        T.Session._impossible = lambda self, name, value, by=None: None
         T.Session._possible = lambda self, changed=None, **kw: None
     elif control == "sequence":
         orig_pending = T.Session._apply_pending

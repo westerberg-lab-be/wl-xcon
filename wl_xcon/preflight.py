@@ -37,9 +37,10 @@ from wl_xcon import pointer, warnlist
 from wl_xcon.actor import Actor, Box, Member
 from wl_xcon.bounds import Exceeded
 from wl_xcon.check import (
-    IMPOSSIBLE, _outside, beyond_range, check_task, impossible, parameters_used, undrawable,
-    unplaced, unpooled, unshowable, unstarted,
+    IMPOSSIBLE, _outside, _staircase_levels, beyond_range, check_task, impossible,
+    in_reach, parameters_used, undrawable, unplaced, unpooled, unstarted,
 )
+from wl_xcon.check import laid_out as check_laid_out
 from wl_xcon.cli import _load_bounds, _load_subject_settings, _load_task, _setup_words
 from wl_xcon.findings import Finding
 from wl_xcon.link import Preflight, PreflightItem
@@ -60,6 +61,14 @@ PUMP_CALIBRATION = "pump calibration"
 EYE_TRACKER = "eye tracker"
 #: A demo's alone (demo mode §3.4): whether each input the task waits on has a number key.
 DEMO_INPUTS = "demo inputs"
+
+#: **A layout the pre-flight could not judge** (`laid_out`): a check that raised, refused under a
+#: code of its own so the starting values item and the warnings record name no cause nobody found
+#: (the console settings build's whole-build review, m2).
+LAYOUT_UNJUDGED = "layout-unjudged"
+#: **What the starting-values item says of a value given for a setting the run draws** (`values`;
+#: the pop-out revision's whole-build review, M5): a warning in words, never a refusal.
+DRAWN_GIVEN = "a starting value given for a setting the run draws is not used"
 
 
 def _said(refused: SystemExit, path: Path) -> str:
@@ -241,6 +250,64 @@ def beyond(task: Task | None, given: dict, allocation, geometry, calibration, de
     return found
 
 
+def laid_out(task: Task | None, given: dict, plan: str | None, allocation, geometry, calibration,
+             deployment) -> list:
+    """**The layout at the run's values** (the console settings design's §4: "warnings come from
+    the layout actually set"; `check.laid_out`): at its starting values (`starting`), for each
+    block and condition it plays, the condition's values over them, and each setting a draw gives
+    -- the task's, the block's own, the condition's own range -- and each staircase's setting
+    judged over its two ends (`variation.extremes`, `check._staircase_levels`), as a `(least,
+    most)` span the checks reason over whole. **A finding that blocks fails the starting values
+    item** (`values`'s `refused`; a stimulus off the field), and **each warning is offered for
+    acceptance at the start** with the run's others (`Service._preflight`), each naming the plan,
+    block and condition where the run first meets it, and one met at several said once. A check
+    that raises is a blocking finding saying it could not be run (`LAYOUT_UNJUDGED`). Returns the
+    findings, as
+    `beyond` does. Between runs, never in a frame."""
+    if task is None:
+        return []
+    try:
+        start = starting(task, given)
+        declared = {param.name: param for param in task.params}
+        turned = directions(task)
+        asked: dict[tuple, list] = {}
+        found: list = []
+        said: list = []
+        for block in _played(task, plan):
+            drawn = in_force(task, block)
+            for condition in block.conditions:
+                values = {**start, **condition.values}
+                for name, (draw, _) in {**drawn, **own_ranges(condition)}.items():
+                    ends = extremes(draw, declared.get(name), direction=name in turned)
+                    if ends:
+                        values[name] = (min(ends), max(ends)) if len(ends) > 1 else ends[0]
+                staircase = block.staircase
+                if staircase is not None:
+                    levels = [level for level in _staircase_levels(staircase, declared)
+                              if isinstance(level, (int, float)) and not isinstance(level, bool)
+                              and math.isfinite(level)]
+                    if levels:
+                        values[staircase.setting] = (min(levels), max(levels))
+                key = tuple(sorted((name, repr(value)) for name, value in values.items()))
+                if key not in asked:
+                    asked[key] = check_laid_out(task, values, allocation=allocation,
+                                                geometry=geometry, calibration=calibration,
+                                                deployment=deployment)
+                where = ("the plain run" if plan is None else
+                         f"plan {plan!r}, block {block.name!r}, condition {condition.name!r}")
+                for finding in asked[key]:
+                    if finding in said:
+                        continue
+                    said.append(finding)
+                    found.append(dataclasses.replace(finding, detail=f"in {where}: "
+                                                                     f"{finding.detail}"))
+        return found
+    except Exception as broken:  # noqa: BLE001 -- the checks run on code; their fault refuses
+        return [Finding(LAYOUT_UNJUDGED, (
+            f"the layout at the run's values could not be judged ({type(broken).__name__}: "
+            f"{broken}), so whether a stimulus leaves the field is unknown"))]
+
+
 def _played(task: Task, plan: str | None) -> list[Block]:
     """The blocks a run plays, as `Session._plan` plays them: a plan's, each with its factorial
     expanded (`variation.expanded`), or the plain run's one block, under the task's draws (engine
@@ -362,8 +429,9 @@ def values(task: Task | None, given: dict, refused=(), plan: str | None = None,
     a categorical parameter that places a window, a stimulus, an update or an array's objects,
     or sizes a window, that nothing gives a value** (`check.unplaced`; XC-415; the PI,
     2026-10-30: "Refuse to start", "A stimulus that cannot be drawn is a case where the run cannot
-    proceed"), naming it and where: a whole position is given by a plan's condition or not at
-    all, since no starting value and nothing over the wire is one. **And for a task's pool naming
+    proceed"), naming it and where: a whole position is given by a plan's condition, or by its
+    setting's start where that is one of its choices (`Param.start`; XC-517), since nothing over
+    the wire is one. **And for a task's pool naming
     no pairing** (`check.unpooled`; the pop-out search build's Task 5). A stimulus's appearance left
     unset is not refused: nothing in this build draws a trial's screen before the display process
     (engine build E), and the record writes `drawn` null for it (`record._stimuli`). Checked as
@@ -410,6 +478,16 @@ def values(task: Task | None, given: dict, refused=(), plan: str | None = None,
         merged = {**starts, **given}
         # Each place nothing gives a value, by its setting's name (XC-415).
         unset = dict(unplaced(task, merged, blocks))
+        # **A starting value given for a setting the run draws** (the pop-out revision's
+        # whole-build review, M5: `wlx demo --set fix_hold=...` was silently beaten by the draw):
+        # every trial takes its own drawn value, so the one given does nothing; said, never
+        # refused ("warnings over refusals"). A plain run's draws are the task's; a plan's, those
+        # in force in every block it plays.
+        if blocks is None:
+            overdrawn = sorted(name for name in given if name in task.draws)
+        else:
+            overdrawn = sorted(name for name in given
+                               if blocks and all(name in in_force(task, block) for block in blocks))
     except Exception as broken:  # noqa: BLE001 -- a task's declarations are code's output
         return PreflightItem(
             STARTING_VALUES,
@@ -434,6 +512,11 @@ def values(task: Task | None, given: dict, refused=(), plan: str | None = None,
                 wrong.append(f"{name!r} takes a number ({param.unit}), and {value!r} is not one")
             elif not math.isfinite(value):
                 wrong.append(f"{name!r} is {value!r}, which is not a real number")
+            elif param.whole and not float(value).is_integer():
+                # **A whole setting's starting value that is a fraction** (`Param.whole`; the
+                # console interface plan's Task 4, the controller's ruling: a run's starting values
+                # judged whole, as a live value is in `Session._value_faults`), ahead of its bounds.
+                wrong.append(f"{name!r} is a whole number of {param.unit}, and {value:g} is not one")
             elif (param.low is not None and value < param.low) or (
                 param.high is not None and value > param.high
             ):
@@ -464,23 +547,33 @@ def values(task: Task | None, given: dict, refused=(), plan: str | None = None,
     except Exception as broken:  # noqa: BLE001 -- a task's declarations are code's output
         wrong.append(f"the task's pool could not be checked: {type(broken).__name__}: {broken}")
     # **A luminance the session's panel (`calibration`) cannot show a color set at, not even its
-    # apex** (`check.unshowable`; XC-494): the load only warns of the range's unreachable part,
-    # and a run starting at such a value is refused here, naming the reachable top.
+    # apex, at any value its setting allows** (`check.in_reach`; XC-494): no trial could be
+    # drawn, so the run is refused here. One some lower value it allows shows starts at the
+    # panel's reachable top instead, with a warning the warnings item asks a person to accept
+    # (the PI, 2026-11-20, "Start at the brightest it can, warn"; `Service._preflight`), so it
+    # is never refused here.
     try:
-        wrong += [said for _, said in unshowable(task, merged, calibration)]
+        # Each named by its setting (the re-review's N4: two settings at one value said one
+        # sentence twice, naming neither).
+        wrong += [f"{name!r}: {said}" for name, said in in_reach(task, merged, calibration)[2]]
     except Exception as broken:  # noqa: BLE001 -- as above
         wrong.append(f"the task's color sets could not be checked: {type(broken).__name__}: "
                      f"{broken}")
     wrong += [f"{f.code}: {f.detail}" for f in refused]
+    unused = "" if not overdrawn else (
+        f"; {DRAWN_GIVEN} ({', '.join(repr(name) for name in overdrawn)}): the run draws "
+        f"{'it' if len(overdrawn) == 1 else 'each'} every trial, so the value given does nothing; "
+        f"set a value live, or change the draw, to hold one")
     if wrong:
-        return PreflightItem(STARTING_VALUES, FAIL, "; ".join(wrong))
+        return PreflightItem(STARTING_VALUES, FAIL, "; ".join(wrong) + unused)
     if outside:
         return PreflightItem(STARTING_VALUES, PASS, (
             f"{len(merged)} starting value(s), each declared; {len(outside)} outside its declared "
             f"range ({', '.join(repr(name) for name in outside)}), a warning the warnings item "
-            f"asks to accept"))
+            f"asks to accept{unused}"))
     return PreflightItem(
-        STARTING_VALUES, PASS, f"{len(merged)} starting value(s), each declared and in range"
+        STARTING_VALUES, PASS,
+        f"{len(merged)} starting value(s), each declared and in range{unused}"
     )
 
 

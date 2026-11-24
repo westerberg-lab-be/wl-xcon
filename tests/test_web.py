@@ -56,11 +56,12 @@ from wl_xcon.task import Polar
 from wl_xcon.warnlist import HEAD_FREE, UNLISTED
 from wl_xcon.web import (
     _CSS,
+    COLOR_APPROXIMATE,
     _SCRIPT,
     _clock_time,
     CONTROLS_AT_THE_BOX,
     CONTROLS_ELSEWHERE,
-    DEBOUNCE_MS,
+    APPLY_ALL_LIMIT,
     END_CONFIRM,
     FONTS,
     FRAGMENT_IDS,
@@ -665,8 +666,8 @@ def test_parameters_show_value_range_ceiling_and_what_is_staged():
         view(),
     )["params"]
 
-    assert params.count('<div class="param') == 5
-    assert '<div class="param staged">' in params
+    assert params.count('<div class="box') == 5
+    assert '<div class="box staged" data-card="fix_hold" ' in params
     assert f"staged → 0.40 by {_who(Box('jake'))}" in params
     assert '<span class="ceil">ceiling</span>' in params
     # Review fix round 1: the ceiling keeps its own decimals (`_significant`), unlike
@@ -674,7 +675,7 @@ def test_parameters_show_value_range_ceiling_and_what_is_staged():
     assert "welfare ceiling 0.4 mL" in params
     assert "0.10 to 1.00 s" in params
     assert "open to 5.00 deg" in params
-    assert "no declared range" in params
+    assert "no limit" in params  # "no declared range" until the console settings plan's Task 4
     assert "unset" in params
     assert "penguin" in params
 
@@ -1062,7 +1063,7 @@ def test_the_nonce_is_escaped_into_its_attribute():
 def test_the_page_tells_its_script_when_a_stream_is_stale():
     document = page(fragments(frame(), view()), stale_after_s=45.0, nonce="n0nce")
 
-    assert ('<body data-stale-after="45" data-can-write="0" data-debounce-ms="600" '
+    assert ('<body data-stale-after="45" data-can-write="0" data-apply-all-limit="50" '
             'data-can-gaze="0" data-gaze-every-ms="100">') in document
 
 
@@ -1084,14 +1085,18 @@ def test_the_page_writes_only_by_posting_json_to_commands():
     one goes through the script's one command `fetch` (`deliver`) -- a JSON `POST` to
     `/commands`; the other four are the sign-in's -- and never a form (the Content-Security-Policy's `form-action 'none'` refuses one
     anyway). Its radio inputs still only choose a tab. **And a demo's pointer** (demo mode §4.5,
-    its plan's Task 9): one more `fetch`, a JSON `POST` to `/gaze`, the demo's eye, no command."""
+    its plan's Task 9): one more `fetch`, a JSON `POST` to `/gaze`, the demo's eye, no command. **And
+    a new color's preview** (the console settings build's Task 8): a `GET` of `/color-preview`, which
+    writes nothing; its *save* is a command, through `/commands`."""
     document = _document()
 
     assert "<form" not in document and "<textarea" not in document
     # b2b spec §4: four are the sign-in's (the token endpoint, `/whoami`, `/signout`) and the
     # page's recheck, `POST /whoami` with no token (b2b-ready §4.6); one a demo's pointer
-    # reports and its release (`/gaze`); only `/commands` carries a command.
-    assert _SCRIPT.count("fetch(") == 6
+    # reports and its release (`/gaze`); one a new color's preview, a `GET` that writes nothing
+    # (`/color-preview`); only `/commands` carries a command.
+    assert _SCRIPT.count("fetch(") == 7
+    assert _SCRIPT.count('fetch("/color-preview?" + query.toString(), { cache: "no-store" })') == 1
     assert _SCRIPT.count('fetch("/whoami", {') == 2
     assert _SCRIPT.count('fetch("/commands", {') == 1
     assert _SCRIPT.count('fetch("/gaze", {') == 1
@@ -1100,7 +1105,8 @@ def test_the_page_writes_only_by_posting_json_to_commands():
     assert 'method: "POST"' in _SCRIPT
     assert "var headers = { \"Content-Type\": \"application/json\" };" in _SCRIPT
     radios = re.findall(r'<input type="radio"[^>]*>', document)
-    assert len(radios) == 5
+    # Six tabs since the console settings build's Task 10 added Training (its design's §8).
+    assert len(radios) == 6
 
 
 def test_the_script_does_only_what_spec_4_3_and_5_2_ask():
@@ -1129,9 +1135,14 @@ def test_the_script_does_only_what_spec_4_3_and_5_2_ask():
     # would have slipped past a pin that only read the trailing word -- and allow
     # only the fragment renderer's own two forms. No other way to write markup -- but a demo's
     # drawing and its key list (demo mode's Task 9), each rendered by `wlx serve` too
-    # (`demoscreen.render`, `web.demo_keys`) and sent as its own event, `drawn`.
+    # (`demoscreen.render`, `web.demo_keys`) and sent as its own event, `drawn`. The boxes' own
+    # fragment is parsed into a `<template>` and patched in box by box (the console interface
+    # rework's Task 6, `patchCards`): the first `html`.
     assert re.findall(r"\.innerHTML\s*\+?=\s*([^;]+);", _SCRIPT) == [
-        "html", "heldParams", "heldMoments", "payload.keys", "payload.svg"]
+        "html", "html", "heldMoments", "payload.keys", "payload.svg"]
+    patch = _SCRIPT.split("  function patchCards(id, html) {", 1)[1].split("\n  }\n", 1)[0]
+    assert 'var made = document.createElement("template");' in patch
+    assert "made.innerHTML = html;" in patch
     assert "outerHTML" not in _SCRIPT
     assert "insertAdjacentHTML" not in _SCRIPT
     assert "document.write" not in _SCRIPT
@@ -1253,15 +1264,17 @@ def test_a_console_without_the_mark_endpoint_greys_mark_alone():
 
 
 def test_each_parameter_card_has_arrows_and_an_input_with_its_step_and_range():
-    """Spec §5.2: up/down arrows and an input on each card. The step is the mockup's
-    rule by unit (mL 0.01, s 0.05, deg 0.1, else 0.01), and the input shows the value
-    at the step's decimals; a categorical card takes a word and has no arrows."""
+    """Spec §5.2: − and + and an input on each box (the console interface rework's Task 5: two
+    buttons beside the field, where two 8 px arrows were). The step is the rig's
+    (`ParamRow.step`, `task.step_of`: by unit, s 0.05, deg 0.1, mL 0.01, else 0.01), and the
+    input shows the value at the step's decimals, or more where the value holds more; a
+    categorical box takes a word and has neither."""
     params = fragments(
         frame(
             params=(
-                ParamRow("fix_hold", "s", 0.1, 1.0, 0.3, False),
-                ParamRow("reward_correct", "mL", 0.0, 0.4, 0.15, True),
-                ParamRow("fix_window", "deg", None, 5.0, 2.0, False),
+                ParamRow.of("fix_hold", "s", 0.1, 1.0, 0.3, False, step=0.05),
+                ParamRow.of("reward_correct", "mL", 0.0, 0.4, 0.15, True, step=0.01),
+                ParamRow.of("fix_window", "deg", None, 5.0, 2.0, False, step=0.1),
                 ParamRow("target_appearance", "", None, None, None, False),
                 ParamRow("shape", "", None, None, "penguin", False),
             )
@@ -1270,9 +1283,13 @@ def test_each_parameter_card_has_arrows_and_an_input_with_its_step_and_range():
     )["params"]
 
     assert (
+        '<button type="button" class="stp" data-dir="-1" tabindex="-1" '
+        'aria-label="decrease fix_hold">−</button>'
         '<input class="field mono" data-param="fix_hold" data-step="0.05" '
         'data-min="0.1" data-max="1.0" inputmode="decimal" value="0.30" '
         'aria-label="fix_hold">'
+        '<button type="button" class="stp" data-dir="1" tabindex="-1" '
+        'aria-label="increase fix_hold">+</button></span><span class="unit">s</span>'
     ) in params
     assert 'data-param="reward_correct" data-step="0.01" data-min="0.0" data-max="0.4"' in params
     assert 'data-param="fix_window" data-step="0.1" data-max="5.0" inputmode="decimal" value="2.0"' in params
@@ -1297,7 +1314,7 @@ def test_a_setting_holding_a_position_shows_it_polar_first_and_offers_no_input()
         )),
         view(),
     )["params"]
-    target = params.partition('<div class="param">')[2].partition('<div class="param">')[0]
+    target = _cards(params)["target_pos"]
 
     assert '<span class="pv">27.236° at 45° · (x, y) (20, 20)</span>' in target
     assert "<input" not in target and 'data-dir="1"' not in target and "unset" not in target
@@ -1316,7 +1333,7 @@ def test_a_value_that_is_no_number_or_word_is_shown_as_written_with_no_input():
         ParamRow("flag", "", None, None, True, False),
         ParamRow("fix_hold", "s", 0.1, 1.0, 0.3, False),
     )), view())["params"]
-    span, odd, flag, hold = params.split('<div class="param">')[1:]
+    span, odd, flag, hold = (_cards(params)[name] for name in ("span", "odd", "flag", "fix_hold"))
 
     assert '<span class="pv">[0.3, 0.6] <span class="unit">deg</span></span>' in span
     assert "[&#x27;&lt;b&gt;&#x27;, 1]" in odd and "<b>" not in odd
@@ -1425,19 +1442,24 @@ def test_every_control_string_is_escaped():
     assert EVIL not in text
 
 
-def test_the_page_tells_its_script_whether_it_may_write_and_the_debounce():
+def test_the_page_tells_its_script_whether_it_may_write_and_apply_alls_limit():
     """The page is rendered per request, so the box's own page says it may write and
     a LAN viewer's says it may not; the script reads both from `<body>`. The 600 ms
-    debounce is the mockup's, housekeeping and not a measurement."""
+    debounce that rode there went with the arrows' sends (the console interface rework's Task
+    6: nothing is sent until Apply); Apply all's limit rides there now, 50, below the rig's 64
+    (`link.APPLY_LIMIT`), so a refused act's every refusal fits in a frame's last 50."""
     box = page(fragments(frame(), view()), stale_after_s=30.0, nonce="n0nce", can_write=True)
     lan = page(
         fragments(frame(), view(can_write=False)), stale_after_s=30.0, nonce="n0nce"
     )
 
-    assert DEBOUNCE_MS == 600
-    assert ('<body data-stale-after="30" data-can-write="1" data-debounce-ms="600" '
+    from wl_xcon.link import APPLY_LIMIT, REFUSAL_HISTORY
+
+    assert APPLY_ALL_LIMIT == 50 == REFUSAL_HISTORY < APPLY_LIMIT
+    assert "data-debounce-ms" not in box
+    assert ('<body data-stale-after="30" data-can-write="1" data-apply-all-limit="50" '
             'data-can-gaze="0" data-gaze-every-ms="100">') in box
-    assert ('<body data-stale-after="30" data-can-write="0" data-debounce-ms="600" '
+    assert ('<body data-stale-after="30" data-can-write="0" data-apply-all-limit="50" '
             'data-can-gaze="0" data-gaze-every-ms="100">') in lan
     for control in ('id="sched-kind"', 'id="sched-value"', 'id="sched-set"'):
         assert re.search(control + r"[^>]* disabled", lan), control
@@ -1456,11 +1478,13 @@ def test_the_page_holds_the_stop_confirm_and_the_mark_note_hidden():
     assert 'id="mark-note" maxlength="500"' in document
 
 
-def test_the_script_debounces_the_arrows_and_keeps_p_and_m_out_of_text_boxes():
-    """Spec §5.2: a change is sent once the arrows stop being clicked, and the keys do
-    nothing while a text box has focus, or when held (a held key does not repeat)."""
-    assert "setTimeout(function () { delete timers[key]; send(input); }, debounceMs)" in _SCRIPT
-    assert "clearTimeout(timers[key]);" in _SCRIPT
+def test_the_script_sends_nothing_from_the_arrows_and_keeps_p_and_m_out_of_text_boxes():
+    """Spec §5.2, as the console interface rework's Task 6 left it: the arrows send nothing (they
+    make a draft, sent by the box's Apply; the 600 ms debounce and its timers are gone), and the
+    keys do nothing while a text box has focus, or when held (a held key does not repeat)."""
+    assert "debounce" not in _SCRIPT and "timers[" not in _SCRIPT
+    step = _SCRIPT.split("  function stepInput(input, dir) {", 1)[1].split("\n  }\n", 1)[0]
+    assert "post(" not in step and "refresh(box);" in step
     assert "if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) { return; }" in _SCRIPT
     assert '/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable' in _SCRIPT
 
@@ -1475,11 +1499,19 @@ def test_the_script_asks_for_the_name_once_and_keeps_it_where_it_may():
     assert '"not sent: give your name first -- every command records who sent it"' in _SCRIPT
 
 
-def test_the_script_holds_a_parameter_card_it_is_being_typed_into():
-    """A frame that re-renders the parameter cards while a person types into one, or
-    while an arrow's debounce is pending, would replace the input under them; the
-    script holds the newest cards and swaps them in once the person is done."""
-    assert 'if (id === "params" && busy()) { heldParams = html; return; }' in _SCRIPT
+def test_the_script_keeps_the_editor_of_a_box_it_is_being_typed_into():
+    """A frame that re-renders the parameter cards while a person types into one would replace
+    the input under them. Since the console interface rework's Task 6 the script patches box by
+    box: a box with a draft, its act out or a field focused keeps its editor's nodes
+    (`patchDirty`), and only a pointer down holds a tab's frame whole (`heldCards`). The browser
+    tests drive it (`test_page_browser.py`'s `test_a_press_during_frames_acts_once`)."""
+    swap = _SCRIPT.split("  function swap(id, html) {", 1)[1].split("\n  }\n", 1)[0]
+    assert 'if (id === "params" || id === "training-params") {' in swap
+    assert "patchCards(id, html);" in swap
+    patch = _SCRIPT.split("  function patchCards(id, html) {", 1)[1].split("\n  }\n", 1)[0]
+    assert "if (pressing()) { heldCards[id] = html; return; }" in patch
+    assert "} else if (dirty(box)) { held[name] = true; }" in patch
+    assert "patchDirty(box, given[name], before[name]);" in patch
 
 
 # --- Task 10 review, fix round 1 ----------------------------------------------------
@@ -1640,6 +1672,20 @@ def test_while_paused_the_controls_show_the_fluid_total_and_what_the_last_press_
     assert "fluid session" not in _controls(), "said beside the live button alone"
 
 
+def test_the_scripts_top_level_names_are_each_declared_once():
+    """The page's script is one closure, so a second `function NAME` or `var NAME` at its top level
+    silently replaces the first wherever either is called -- the fix wave's round 2 found two
+    (`UNCONFIRMED`, the sign-in's word taken by a box's; `letGo`, the demo's taking a box's gate),
+    each passing every test of its own part. Each top-level name is declared once."""
+    import collections
+
+    declared = [function or variable for function, variable in re.findall(
+        r"^  (?:function (\w+)\(|var (\w+)\b)", _SCRIPT, re.M)]
+    assert len(declared) > 200, "the script's top level is read"
+    twice = sorted(name for name, count in collections.Counter(declared).items() if count > 1)
+    assert twice == [], twice
+
+
 def test_the_script_sends_one_reward_per_click_and_holds_the_button_until_its_answer():
     """No accidental doubles (PI, 2026-09-28). Python cannot run the script, so its text
     is pinned where it is load-bearing: a click while a reward is on its way does
@@ -1653,7 +1699,10 @@ def test_the_script_sends_one_reward_per_click_and_holds_the_button_until_its_an
     assert 'if (id === "controls") { holdReward(); }' in _SCRIPT
     assert "if (rewarding && button && !button.disabled) {" in _SCRIPT
     assert """el("controls").querySelector('[data-cmd="reward"][data-held]')""" in _SCRIPT
-    assert "}).then(done);" in _SCRIPT
+    # `done` runs on the answer and on the failure alike, outside the answer's handler (the
+    # console interface rework's whole-build review, M4).
+    assert "} finally { done(); }" in _SCRIPT
+    assert "}, function (fault) { done(); throw fault; });" in _SCRIPT
     assert _SCRIPT.count('fetch("/commands"') == 1
     assert (
         "unknown: this page lost wlx serve's answer, so whether the reward was given is "
@@ -2039,7 +2088,9 @@ def test_away_from_the_box_the_run_controls_are_greyed_with_the_sentence():
 def test_the_control_bar_offers_the_task_the_trials_and_the_preflight_as_the_mockup_draws_them():
     """The mockup's toolbar (`task-sel`, `pf-pill`), with the run's trial count beside the
     task (the b3a-2 plan, decision 6): the select's options are a fragment, the count is
-    static, and it starts at `wlx run --trials`'s default."""
+    static, and it starts at `wlx run --trials`'s default. Since the console interface rework's
+    Task 8 the run's buttons (`controls`) stand in the one bar that stays in view, before the
+    session's details behind *session*, where the next run's task, plan and pre-flight are."""
     document = page(fragments(_between(), view()), stale_after_s=30.0, nonce="n0nce", can_write=True)
 
     assert '<label class="tsel" for="task-sel"><span class="k">Task</span><select id="task-sel" aria-label="task">' in document
@@ -2048,7 +2099,8 @@ def test_the_control_bar_offers_the_task_the_trials_and_the_preflight_as_the_moc
         f'autocomplete="off" aria-label="trials">'
     ) in document
     assert RUN_TRIALS == 1000
-    assert document.index('id="task-sel"') < document.index('id="pf-pill"') < document.index('id="controls"')
+    assert document.index('id="controls"') < document.index('id="session"') < document.index(
+        'id="task-sel"') < document.index('id="pf-pill"')
     assert "<h2>Pre-flight</h2>" in document and "<h2>Session</h2>" in document
     assert document.index('id="pf-panel"') < document.index('id="setup"')
 
@@ -2783,8 +2835,11 @@ def test_the_sign_in_script_uses_pkce_and_keeps_its_tokens_in_session_storage_on
     assert '"offline_access"' in _SCRIPT and '"S256"' in _SCRIPT
     assert 'credentials: "omit"' in _SCRIPT
     assert "sessionStorage" in _SCRIPT and "Authorization" in _SCRIPT
-    # The box's name keeps its `localStorage`; the sign-in never touches it.
-    assert _SCRIPT.count("localStorage") == 2
+    # The box's name keeps its `localStorage` (two uses), and so do the setting opened in each
+    # settings tab's editor (three: read, kept, dropped; the summary and editor design's goal 5,
+    # which retired the sections' last-left state), the pins and the demo keys' first visit (two
+    # each, the console interface rework's Task 8); the sign-in never touches it.
+    assert _SCRIPT.count("localStorage") == 9
     assert "console.log" not in _SCRIPT
     # The authorization code leaves the address bar before anything else is done with it.
     assert _SCRIPT.index("history.replaceState") < _SCRIPT.index("tokenRequest({")
@@ -2819,7 +2874,9 @@ def test_a_held_reward_stays_held_through_a_sign_in_state_change():
     # The held button is released through `applySignIn`, which disables it if signed out.
     released = _script_between("  function reward() {", "  // P4d-2b b3a-2 (spec §6.2): a run")
     assert released.index("held.disabled = false;") < released.index("applySignIn();")
-    assert "applySignIn();" in _script_between("  function release() {", "  function choose(")
+    # A press's end makes every box current through `settle`, which ends with the sign-in's gray.
+    assert "settle();" in _script_between("  function release() {", "  // The boxes as the page")
+    assert "applySignIn();" in _script_between("  function settle() {", "  // **The drafts bar**")
 
 
 def test_a_lapsed_tab_renews_on_load_and_whoami_reads_the_reason_word():
@@ -3273,10 +3330,11 @@ _SINCE = 1_700_000_000.0
 
 
 def _cards(params: str) -> dict[str, str]:
-    """Each card of the parameters pane, by its setting's name."""
+    """Each box of the parameters pane, by its setting's name (`data-card`; the console interface
+    rework's Task 5)."""
     cards = {}
-    for card in params.split('<div class="param')[1:]:
-        cards[re.search(r'<div class="pn"><span>(.*?)</span>', card).group(1)] = card
+    for card in params.split('<div class="box')[1:]:
+        cards[html.unescape(re.search(r'data-card="(.*?)"', card).group(1))] = card
     return cards
 
 
@@ -3356,8 +3414,9 @@ def test_a_setting_its_conditions_set_shows_no_spinner():
 def test_a_setting_without_live_numbers_shows_no_range_editor():
     """Review M-4 and Call 22: a card whose draw has numbers a person may change live
     (`ParamRow.numbers`: a uniform's ends, a normal's mean, spread and cut, a wait's three) has a
-    field for each, holding it as the wire carried it, and *change the range*; no other card has
-    either -- not one declared not live, a direction (XC-445), a weighted set or a list (XC-443),
+    field for each, holding it as the wire carried it, sent by its box's Apply (the console
+    interface rework's Task 6: *change the range* is gone); no other card has
+    any -- not one declared not live, a direction (XC-445), a weighted set or a list (XC-443),
     each sent with `numbers` `None`, nor one with no draw. Greyed away from the box."""
     rows = (
         ParamRow("wait", "s", 0.5, 2.0, None, False, None, "draw", (),
@@ -3373,17 +3432,18 @@ def test_a_setting_without_live_numbers_shows_no_range_editor():
     lan = fragments(frame(params=rows), view(can_write=False))["params"]
     cards = _cards(params)
 
-    assert params.count('data-cmd="range"') == 2
+    assert 'data-cmd="range"' not in params and "change the range" not in params
     assert ('<div class="rng"><label class="rn">low<input class="field mono" data-number="low" '
-            'inputmode="decimal" value="0.75" aria-label="wait: low"></label>') in cards["wait"]
+            'inputmode="decimal" value="0.75" aria-label="wait: low"><span class="unit">s</span>'
+            '</label>') in cards["wait"]
     assert 'data-number="high" inputmode="decimal" value="1.25"' in cards["wait"]
-    assert ('<button type="button" class="btn small" data-cmd="range" data-name="wait">'
-            "change the range</button></div>") in cards["wait"]
+    assert ('<label class="rn">high<input class="field mono" data-number="high" inputmode="decimal" '
+            'value="1.25" aria-label="wait: high"><span class="unit">s</span></label></div>'
+            ) in cards["wait"]
     assert 'data-number="mean" inputmode="decimal" value="1"' in cards["gap"]
     assert 'data-number="sd" inputmode="decimal" value="0.1"' in cards["gap"]
     for name in ("angle", "fix_hold"):
-        assert "data-number" not in cards[name] and 'data-cmd="range"' not in cards[name], name
-    assert lan.count(f'data-name="wait" disabled title="{CONTROLS_AT_THE_BOX}">') == 1
+        assert "data-number" not in cards[name], name
     assert lan.count(f'aria-label="wait: low" disabled title="{CONTROLS_AT_THE_BOX}">') == 1
 
 
@@ -3572,9 +3632,13 @@ def test_where_a_value_comes_from_its_draw_its_numbers_and_the_moments_are_escap
     assert "<script" not in text
     assert EVIL not in text
     # Five on the held card (its condition, its draw, a number's name thrice), the other card's
-    # conditions and its staged hand-back, seven in the feed (a range's block among them), the
-    # moment's words and what a revert to it changes, and the setting the eased line names.
-    assert text.count(html.escape(EVIL, quote=True)) == 16
+    # conditions and its staged hand-back -- in its *more*, and in its head after the arrow and
+    # that head's `title` (the console interface rework's Task 5), and in who is changing it under
+    # a draft, `data-under` (its Task 6), and on its summary line after the arrow and in the
+    # line's `title` (the summary and editor design's goal 3) -- seven in the feed (a range's
+    # block among them), the moment's words and what a revert to it changes, and the setting the
+    # eased line names.
+    assert text.count(html.escape(EVIL, quote=True)) == 21
 
 
 def test_the_page_says_while_a_persons_change_keeps_trials_out_of_moving_up():
@@ -4261,3 +4325,1343 @@ def test_an_open_carries_demo_and_a_non_boolean_is_refused():
             parse_command({**_OPEN, "demo": bad})
         with pytest.raises(link.CommandRefused, match="an open's demo is true or false"):
             link._command_from({**_OPEN, "by": {"kind": "box", "name": "jake"}, "demo": bad})
+
+
+def test_a_timing_card_offers_fixed_and_drawn_with_each_shapes_fields():
+    """The timing switch (the console settings design's §3; the PI, 2026-11-16): a card whose
+    `switch` is `drawn` -- a live setting in seconds -- offers *fixed* and *drawn*. Fixed is today's
+    number field, `set`; drawn is a shape select of the five shapes (no scaling: a size's) and each
+    shape's fields, with *apply*, which sends `form`. The side open is drawn where a draw is in
+    force (`shape`), its shape selected and its numbers filled; fixed otherwise. A card the
+    person's draw gives says so, names what it overrides -- its draw, its conditions or its
+    staircase -- and offers *hand back*. A card with no switch shows neither. Greyed away from the
+    box."""
+    person = {"shape": "non_aging", "numbers": {"shortest": 0.75, "longest": 1.25},
+              "values": [], "weights": [], "by": "person"}
+    block = {"shape": "uniform", "numbers": {"low": 0.2, "high": 0.4}, "values": [],
+             "weights": [], "by": "block"}
+    listed = {"shape": "weights", "numbers": {}, "values": [0.3, 0.5], "weights": [3.0, 1.0],
+              "by": "task"}
+    rows = (
+        ParamRow.of("fix_hold", "s", 0.05, 2.0, 0.3, False, (), "task", (), None, None, "drawn"),
+        ParamRow.of("wait", "s", 0.05, 2.0, 0.3, False, (), "form", (),
+                    "uniform from 0.2 s to 0.4 s", None, "drawn", person),
+        ParamRow.of("gap", "s", 0.05, 2.0, 0.3, False, (), "draw", (),
+                    "uniform from 0.2 s to 0.4 s", {"low": 0.2, "high": 0.4}, "drawn", block),
+        ParamRow.of("hold", "s", 0.05, 2.0, 0.3, False, (), "draw", (),
+                    "one of 0.3 s, 0.5 s, weighted 3.0:1.0", None, "drawn", listed),
+        ParamRow.of("fix_window", "deg", 0.5, 5.0, 2.0, False),
+    )
+    params = fragments(frame(params=rows), view())["params"]
+    lan = fragments(frame(params=rows), view(can_write=False))["params"]
+    cards = _cards(params)
+
+    fixed = cards["fix_hold"]
+    assert ('<div class="sw" role="group" aria-label="fix_hold: fixed or drawn">'
+            '<button type="button" class="btn small seg on" data-switch="fixed" '
+            'data-name="fix_hold" aria-pressed="true">fixed</button>'
+            '<button type="button" class="btn small seg" data-switch="drawn" data-name="fix_hold" '
+            'aria-pressed="false">drawn</button></div>') in fixed
+    assert '<div class="side fixed" data-side="fixed">' in fixed
+    assert '<div class="side drawn" data-side="drawn" hidden>' in fixed
+    assert 'data-param="fix_hold"' in fixed.split('data-side="fixed"')[1].split("data-side")[0]
+    assert ('<select class="field" data-shape="fix_hold" aria-label="fix_hold: shape">'
+            '<option value="non_aging" selected>non-aging</option>'
+            '<option value="uniform">uniform</option>'
+            '<option value="normal">normal, cut</option>'
+            '<option value="list">a list, in shuffled passes</option>'
+            '<option value="weights">a list, weighted</option></select>') in fixed
+    assert "scaled" not in fixed
+    for shape, numbers in (("non_aging", ("shortest", "longest")), ("uniform", ("low", "high")),
+                           ("normal", ("mean", "sd", "low", "high")), ("list", ("values",)),
+                           ("weights", ("values", "weights"))):
+        fields = fixed.split(f'data-fields="{shape}"')[1].split("</div>")[0]
+        for number in numbers:
+            assert (f'<label class="rn">{number}<input class="field mono" data-form="{number}" '
+                    f'inputmode="decimal" value=""') in fields, (shape, number)
+    assert fixed.count('data-fields="non_aging">') == 1
+    assert 'data-fields="uniform" hidden>' in fixed
+    # The box's Apply sends the drawn side (the console interface rework's Task 6): no *apply* of
+    # its own.
+    assert 'data-cmd="form"' not in fixed and 'data-apply="fix_hold"' in fixed
+
+    drawn = cards["wait"]
+    assert '<div class="side drawn" data-side="drawn">' in drawn
+    assert '<div class="side fixed" data-side="fixed" hidden>' in drawn
+    assert 'data-switch="drawn" data-name="wait" aria-pressed="true"' in drawn
+    assert 'data-form="shortest" inputmode="decimal" value="0.75"' in drawn
+    assert 'data-form="longest" inputmode="decimal" value="1.25"' in drawn
+    assert "drawn each trial, from a person&#x27;s draw" in drawn
+    assert "a person&#x27;s draw, over its draw" in drawn
+    assert 'data-cmd="hand_back" data-name="wait"' in drawn
+    assert '<option value="uniform" selected>uniform</option>' in cards["gap"]
+    assert 'data-form="low" inputmode="decimal" value="0.2"' in cards["gap"]
+    assert 'data-number="low"' in cards["gap"], "the block's range still changes"
+    assert 'data-form="values" inputmode="decimal" value="0.3, 0.5"' in cards["hold"]
+    assert 'data-form="weights" inputmode="decimal" value="3.0, 1.0"' in cards["hold"]
+    assert "data-switch" not in cards["fix_window"] and 'data-form' not in cards["fix_window"]
+    assert lan.count(f'data-apply="fix_hold" tabindex="0" disabled title="{CONTROLS_AT_THE_BOX}"'
+                     ) == 1
+
+
+def test_a_form_card_names_the_staircase_it_holds_and_a_staged_form_says_drawn():
+    """A person's draw over the open block's staircase says so on its card (`Telemetry.staircase`
+    names the setting), and a staged form is led *drawn* with its draw in the rig's words."""
+    person = {"shape": "uniform", "numbers": {"low": 0.2, "high": 0.4}, "values": [],
+              "weights": [], "by": "person"}
+    rows = (ParamRow.of("fix_hold", "s", 0.05, 2.0, 0.3, False, (), "form", (), None, None,
+                        "drawn", person),)
+    stair = link.StaircaseRow("fix_hold", (0.2, 0.3, 0.4), 0, True, 3, 1)
+    staged = (Staged("fix_hold", None, "uniform from 0.2 s to 0.4 s", Box("jake"), False,
+                     kind="form", overrides=("c",)),)
+    shown = fragments(frame(params=rows, staircase=stair, staged=staged), view())
+
+    card = _cards(shown["params"])["fix_hold"]
+    assert "a person&#x27;s draw, over its staircase" in card
+    assert "staged drawn → uniform from 0.2 s to 0.4 s" in card
+    assert "drawn: fix_hold unset → uniform from 0.2 s to 0.4 s" in shown["rt-changes"]
+
+
+def _foreperiod_row(name: str = "wait", **over) -> ParamRow:
+    """A card drawn from the PI's foreperiod, its profile as the rig sends it."""
+    from wl_xcon import variation
+    from wl_xcon.task import NonAging
+
+    wait = NonAging.between(0.75, 1.25)
+    shape = {**variation.shaped(wait), "by": "person"}
+    return ParamRow.of(name, "s", 0.05, 2.0, 0.3, False, (), "form", (), None, None, "drawn",
+                       shape, variation.profile(wait).as_dict(), **over)
+
+
+def _svg(card: str) -> str:
+    return card[card.index("<svg"):card.index("</svg>") + len("</svg>")]
+
+
+def test_a_drawn_card_draws_its_histogram_and_hazard_against_flat():
+    """§3: a drawn card carries an inline SVG, a bar for each bin of the density and a line for the
+    hazard against a dashed line at 1, *flat*. The hazard's first point is 1 by construction, so
+    its line starts on the flat one; the bars follow the density (the first tallest, the last
+    shortest, for a wait that ends at a constant rate), and a fixed card draws none."""
+    rows = (_foreperiod_row(),
+            ParamRow.of("fix_hold", "s", 0.05, 2.0, 0.3, False, (), "task", (), None, None,
+                        "drawn"),
+            ParamRow.of("fix_window", "deg", 0.5, 5.0, 2.0, False))
+    cards = _cards(fragments(frame(params=rows), view())["params"])
+
+    assert "<svg" not in cards["fix_hold"] and "<svg" not in cards["fix_window"]
+    drawn = cards["wait"]
+    assert drawn.count("<svg") == 1
+    assert drawn.index('data-form="shortest"') < drawn.index("<svg"), "the drawn side first"
+    svg = _svg(drawn)
+    bars = re.findall(r'<rect class="bar" x="[\d.]+" y="[\d.]+" width="[\d.]+" height="([\d.]+)"',
+                      svg)
+    assert len(bars) == 20
+    heights = [float(height) for height in bars]
+    assert heights[0] == max(heights) and heights[-1] == min(heights) > 0
+    flat = re.search(r'<line class="flat" x1="[\d.]+" y1="([\d.]+)" x2="[\d.]+" y2="([\d.]+)"'
+                     r'[^>]*stroke-dasharray', svg)
+    assert flat and flat.group(1) == flat.group(2)
+    line = re.search(r'<polyline class="haz" points="([^"]+)"', svg)
+    points = [tuple(map(float, point.split(","))) for point in line.group(1).split()]
+    assert len(points) == 20
+    assert points[0][1] == float(flat.group(1)), "the hazard starts on the flat line"
+    assert all(later[1] < earlier[1] for earlier, later in zip(points, points[1:])), (
+        "a rising hazard climbs the page (a smaller y)")
+    assert ">flat</text>" in svg
+    assert "0.75 s" in svg and "1.25 s" in svg
+
+
+def test_the_profile_says_it_is_the_declared_distribution():
+    """§3: the figure is arithmetic of what was declared, and says so in words on the card -- never
+    a measurement of the rig -- and it is plain inline SVG: no external reference, no font file."""
+    card = _cards(fragments(frame(params=(_foreperiod_row(),)), view())["params"])["wait"]
+    svg = _svg(card)
+
+    assert "the declared distribution, not a measurement" in svg
+    assert 'role="img"' in svg and "aria-label=" in svg
+    for forbidden in ("http", "url(", "@import", "@font-face", "<image", "<foreignObject",
+                      "xlink:href", "<style"):
+        assert forbidden not in svg, forbidden
+
+
+def test_a_lists_profile_is_drawn_one_bar_a_value():
+    """A list's card draws a bar for each value, the hazard a mark on each."""
+    from wl_xcon import variation
+    from wl_xcon.task import Listed
+
+    listed = Listed((0.3, 0.5, 0.9))
+    row = ParamRow.of("hold", "s", 0.05, 2.0, 0.3, False, (), "form", (), None, None, "drawn",
+                      {**variation.shaped(listed), "by": "person"},
+                      variation.profile(listed).as_dict())
+    svg = _svg(_cards(fragments(frame(params=(row,)), view())["params"])["hold"])
+
+    assert svg.count('<rect class="bar"') == 3
+    assert len(re.search(r'<polyline class="haz" points="([^"]+)"', svg).group(1).split()) == 3
+    assert "0.3 s" in svg and "0.9 s" in svg
+
+
+def test_a_size_card_offers_fixed_and_scaled_and_says_what_each_object_gets():
+    """The console settings design's §5: a size card (`switch` `scaled`) offers *fixed* and
+    *scaled*: fixed is today's number field, `set`; scaled is a factor field with *apply*, which
+    sends `form`, the side open scaled where a person's scaling is in force, its factor filled. The
+    card says what it gives each object in degrees, as the rig wrote it (`ParamRow.gives`), and a
+    window ratio's card says the radius each object gets. A staged scaling is led "scaled". Greyed
+    away from the box."""
+    scaled = {"shape": "scaled", "numbers": {"factor": 0.3}, "values": [], "weights": [],
+              "by": "person"}
+    rows = (
+        ParamRow.of("disc_size", "deg", 0.0, None, 1.0, False, (), "task", (), None, None,
+                    "scaled"),
+        ParamRow.of("fix_size", "deg", 0.0, None, 0.3, False, (), "form", (), None, None,
+                    "scaled", scaled, gives="0° at 0° out"),
+        ParamRow.of("object_window", "ratio", 0.0, None, 3.0, False, (), "task",
+                    gives="radius 1.5° at 8° out, every object"),
+    )
+    staged = (Staged("disc_size", 1.0, "scaled, 0.3 times its eccentricity", Box("jake"), False,
+                     kind="form"),)
+    params = fragments(frame(params=rows, staged=staged), view())["params"]
+    lan = fragments(frame(params=rows), view(can_write=False))["params"]
+    cards = _cards(params)
+
+    fixed = cards["disc_size"]
+    assert ('<div class="sw" role="group" aria-label="disc_size: fixed or scaled">'
+            '<button type="button" class="btn small seg on" data-switch="fixed" '
+            'data-name="disc_size" aria-pressed="true">fixed</button>'
+            '<button type="button" class="btn small seg" data-switch="scaled" '
+            'data-name="disc_size" aria-pressed="false">scaled</button></div>') in fixed
+    assert '<div class="side fixed" data-side="fixed">' in fixed
+    assert '<div class="side scaled" data-side="scaled" hidden>' in fixed
+    assert ('<label class="rn">factor<input class="field mono" data-form="factor" '
+            'inputmode="decimal" value="" aria-label="disc_size: factor">'
+            '<span class="unit">× each object&#x27;s eccentricity</span></label>') in fixed
+    assert 'data-cmd="form"' not in fixed and 'data-apply="disc_size"' in fixed
+    assert "select" not in fixed.split('data-side="scaled"')[1]
+    assert "staged scaled → scaled, 0.3 times its eccentricity by" in fixed
+    assert "gives" not in fixed
+
+    on = cards["fix_size"]
+    assert '<div class="side fixed" data-side="fixed" hidden>' in on
+    assert '<div class="side scaled" data-side="scaled">' in on
+    assert 'data-form="factor" inputmode="decimal" value="0.3"' in on
+    assert "scaled by eccentricity, by a person" in on
+    assert "a person&#x27;s scaling, over the run&#x27;s value" in on
+    assert '<span class="src gives">gives 0° at 0° out</span>' in on
+
+    window = cards["object_window"]
+    assert '<span class="src gives">gives radius 1.5° at 8° out, every object</span>' in window
+    assert "data-switch" not in window
+    assert 'data-switch="scaled" data-name="disc_size" aria-pressed="false" disabled' in lan
+
+
+#: A color card as the rig makes it (`ParamRow.color`; the console settings design's §6), its
+#: distractors' card: a saturation setting and the distractors' fraction, each with its cd/m².
+_COLOR = {
+    "sets": {"isohue": {"apex": [0.31272, 0.329], "luminance_cd_m2": 15.0, "design": None,
+                        "hues": {"green": {"xy": [0.31324, 0.50711], "srgb": "#4A9A3E"},
+                                 "red": {"xy": [0.45955, 0.32918],
+                                         "srgb": "red;background:url(x)"}}}},
+    "set": "isohue", "hue": "green", "approximate": True,
+    "saturation": {"setting": "distractor_saturation", "value": 0.25, "cd_m2": 7.5},
+    "luminance": {"setting": "distractor_fraction", "value": 0.5, "cd_m2": 7.5,
+                  "set_wide": False},
+}
+
+
+def test_the_color_card_offers_set_hue_and_two_levels_and_says_approximate():
+    """The design's §6 (the PI, 2026-11-16: "you select a set, and then you have hue options from
+    the set, then you have salience options for each hue"): the set, a select; its hues, a swatch
+    with its name each, the run's pressed, each sending `color` with its set and hue; then the
+    saturation and the luminance, each typed in its own setting's unit with the light's cd/m²
+    beside it -- the set's luminance setting saying it moves every light of the set, a level the
+    task file writes as a number shown fixed there -- and the caption. A swatch's color is written
+    only where the rig sent a `#rrggbb`. The look is shown in the rig's words, with no field.
+    Greyed away from the box."""
+    target = {**_COLOR, "hue": None, "set": None,
+              "saturation": {"setting": None, "value": 1.0, "cd_m2": 15.0},
+              "luminance": {"setting": "color_luminance", "value": 15.0, "cd_m2": 15.0,
+                            "set_wide": True}}
+    rows = (
+        replace(ParamRow.of("distractor_appearance", "appearance", None, None, None, False,
+                            source="run", color=_COLOR),
+                words="Disc: color isohue green at saturation distractor_saturation"),
+        ParamRow.of("target_appearance", "appearance", None, None, None, False, source="pool",
+                    color=target),
+        ParamRow.of("distractor_saturation", "fraction", 0.0, 1.0, 0.25, False),
+        ParamRow.of("distractor_fraction", "fraction", 0.0, 1.0, 0.5, False),
+        ParamRow.of("color_luminance", "cd/m2", 1.0, 30.0, 15.0, False),
+    )
+    cards = _cards(fragments(frame(params=rows), view())["params"])
+    lan = _cards(fragments(frame(params=rows), view(can_write=False))["params"])
+
+    among = cards["distractor_appearance"]
+    assert '<span class="pv">Disc: color isohue green at saturation distractor_saturation</span>' in among
+    assert 'data-param="distractor_appearance"' not in among
+    assert ('<select class="field" data-colorset="distractor_appearance" '
+            'aria-label="distractor_appearance: color set"><option value="isohue" selected>'
+            'isohue</option></select>') in among
+    assert ('<button type="button" class="btn small hue on" '
+            'data-name="distractor_appearance" data-colorset="isohue" data-color="green" '
+            'aria-pressed="true"><span class="chip" style="background:#4a9a3e"></span>green'
+            '</button>') in among
+    assert ('data-color="red" aria-pressed="false"><span class="chip none"></span>red</button>'
+            in among)
+    assert "url(x)" not in among
+    assert ('saturation <span class="mono">distractor_saturation</span><input class="field mono" '
+            'data-param="distractor_saturation" inputmode="decimal" value="0.25" '
+            'aria-label="distractor_saturation: saturation"><span class="unit">fraction</span>'
+            ' <span class="unit">· 7.50 cd/m²</span>') in among
+    assert ('luminance <span class="mono">distractor_fraction</span><input class="field mono" '
+            'data-param="distractor_fraction" inputmode="decimal" value="0.5"') in among
+    assert "moves every light of the set" not in among
+    assert COLOR_APPROXIMATE in html.unescape(among)
+    assert COLOR_APPROXIMATE == ("approximate: this screen is not measured; the rig's measured "
+                                 "panel decides what is drawn")
+
+    odd = cards["target_appearance"]
+    assert 'aria-pressed="true"' not in odd
+    assert ('saturation <span class="mono">1.00</span>, fixed in the task file'
+            ' <span class="unit">· 15.00 cd/m²</span>') in odd
+    assert 'data-param="color_luminance"' in odd and "moves every light of the set" in odd
+    assert all(card.count(" disabled") >= 4 for name, card in lan.items()
+               if name in ("distractor_appearance", "target_appearance"))
+    assert "data-colorset" not in cards["distractor_saturation"]
+
+
+# --- the Training tab (the console settings design's §8; the build's Task 10) -----------------
+
+
+def _tab(document: str, tab: str) -> str:
+    """The inner HTML of tab panel `tab`, up to the next tab panel or the end of the panels."""
+    start = document.index(f'<div class="tabpanel" id="{tab}">')
+    end = document.find('<div class="tabpanel"', start + 1)
+    return document[start:end if end != -1 else len(document)]
+
+
+def test_the_training_tab_holds_the_switch_the_panel_and_the_training_sections():
+    """**A Training tab of its own** (§8; the PI, 2026-11-16: "the training parameters should be in
+    a whole different tab ... and easily toggleable"): its label beside the others, its panel
+    holding the switch -- *on · frozen · full task*, the position in force pressed, each sending
+    `shaping` with its position, *full task* grayed with why where the plan declares none -- the
+    trainer's panel (`rt-train`), moved from the Runtime tab, and the cards of every section under
+    `Training`, which the Task parameters tab no longer holds."""
+    rows = (ParamRow.of("fix_hold", "s", 0.0, 10.0, 0.3, False, section="Timing"),
+            ParamRow.of("fade_step", "cd/m2", 0.0, 10.0, 2.0, False, section="Training/stages"),
+            ParamRow.of("bar", "answers", 1.0, 50.0, 40.0, False, section="Training"))
+    shown = frame(params=rows, phase="running", shaping="frozen", full_task=False,
+                  plan="train", block="Crowd", next_block=None,
+                  staircase=StaircaseRow("set_size", (4, 6, 8), 1, False, 3, 1))
+    parts = fragments(shown, view(can_write=True))
+    document = page(parts, stale_after_s=30.0, nonce="n0nce", can_write=True)
+
+    assert '<label class="tab" for="t-training">Training</label>' in document
+    assert '<input type="radio" name="tab" id="t-training">' in document
+    training = _tab(document, "tp-training")
+    assert 'id="rt-train"' in training and 'id="rt-train"' not in _tab(document, "tp-runtime")
+    assert 'id="shaping"' in training and 'id="training-params"' in training
+    switch = parts["shaping"]
+    assert re.findall(r'data-cmd="shaping" data-position="(\w+)" aria-pressed="(\w+)"', switch) == [
+        ("on", "false"), ("frozen", "true"), ("full", "false")]
+    full = re.search(r'<button[^>]*data-position="full"[^>]*>', switch).group(0)
+    assert " disabled" in full and html.escape(web.NO_FULL_TASK, quote=True) in full
+    assert f"full task: {html.escape(web.NO_FULL_TASK, quote=True)}" in switch
+    assert ">on</button>" in switch and ">full task</button>" in switch
+    assert "fade_step" in parts["training-params"] and "bar" in parts["training-params"]
+    assert "fade_step" not in parts["params"] and "fix_hold" in parts["params"]
+    assert "Training" not in re.findall(r'data-sec="([^"]+)"', parts["params"])
+    assert "fix_hold" not in parts["training-params"]
+    declared = fragments(replace(shown, full_task=True), view(can_write=True))["shaping"]
+    assert " disabled" not in re.search(r'<button[^>]*data-position="full"[^>]*>',
+                                        declared).group(0)
+    assert "full task:" not in declared
+    # A run with no switch, and between runs, each says why there is none.
+    assert "no training to switch" in fragments(replace(shown, shaping=""), view())["shaping"]
+    assert "no run in progress" in fragments(replace(shown, phase="between_runs"), view())["shaping"]
+    # And the page's script sends the switch's position.
+    assert 'kind: "shaping", position: button.getAttribute("data-position")' in _SCRIPT
+
+
+def test_runtime_says_the_switch_in_one_line():
+    """**The Runtime tab keeps one line** (`rt-shaping`; §8), so nothing the Training tab holds is
+    hidden: `training frozen · stage Crowd · Training tab`, the last a link to the tab; `full
+    task` while it plays; none for a run with no switch, nor between runs. A card the switch holds
+    says what it holds it at."""
+    shown = frame(phase="running", shaping="frozen", block="Crowd")
+    line = fragments(shown, view())["rt-shaping"]
+    text = re.sub(r"<[^>]+>", "", line)
+
+    assert text == "training frozen · stage Crowd · Training tab"
+    assert '<label for="t-training"' in line
+    assert re.sub(r"<[^>]+>", "", fragments(replace(shown, shaping="full"), view())[
+        "rt-shaping"]) == "full task · stage Crowd · Training tab"
+    assert fragments(replace(shown, shaping=""), view())["rt-shaping"] == ""
+    assert fragments(replace(shown, phase="between_runs"), view())["rt-shaping"] == ""
+    document = page(fragments(shown, view()), stale_after_s=30.0, nonce="n0nce")
+    assert 'id="rt-shaping"' in _tab(document, "tp-runtime")
+    cards = fragments(replace(shown, params=(
+        ParamRow.of("set_size", "objects", 1.0, 12.0, 6, False, source="frozen"),
+        ParamRow.of("fix_luminance", "cd/m2", 0.0, 80.0, 40.0, False, source="full"))),
+        view())["params"]
+    assert "frozen at 6.00 " in cards and "training frozen" in cards
+    assert "full task at 40.00 " in cards and "given by the full task" in cards
+
+
+# --- the console interface rework's Task 5: the box, drawn (the design of 2026-11-19) ----------
+#
+# A setting is a small box of three zones -- head, editor, status -- and a *more* that opens in
+# place (the PI, 2026-11-19: "Small boxes"; the controls review's §2). The markup Tasks 6 to 8
+# script against: `<div class="box" data-card="<name>">` holding `.head`, `.editor`, `.status`
+# and `<details class="more">`.
+
+from html.parser import HTMLParser  # noqa: E402
+
+_VOID = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+                   "param", "source", "track", "wbr"})
+
+
+class _Node:
+    def __init__(self, tag: str, attrs: dict, parent: "_Node | None") -> None:
+        self.tag, self.attrs, self.parent, self.children = tag, attrs, parent, []
+
+    def classes(self) -> set:
+        return set((self.attrs.get("class") or "").split())
+
+    def text(self) -> str:
+        return "".join(child if isinstance(child, str) else child.text()
+                       for child in self.children)
+
+    def walk(self):
+        for child in self.children:
+            if isinstance(child, _Node):
+                yield child
+                yield from child.walk()
+
+    def find(self, cls: str) -> "list[_Node]":
+        return [node for node in self.walk() if cls in node.classes()]
+
+    def zone(self, cls: str) -> "_Node":
+        (found,) = [child for child in self.children
+                    if isinstance(child, _Node) and cls in child.classes()]
+        return found
+
+
+class _Tree(HTMLParser):
+    """The fragment as a tree of elements: enough to say which zone of a box a text is in."""
+
+    def __init__(self, markup: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root = self.at = _Node("root", {}, None)
+        self.feed(markup)
+
+    def handle_starttag(self, tag, attrs):
+        node = _Node(tag, dict(attrs), self.at)
+        self.at.children.append(node)
+        if tag not in _VOID:
+            self.at = node
+
+    def handle_startendtag(self, tag, attrs):
+        self.at.children.append(_Node(tag, dict(attrs), self.at))
+
+    def handle_endtag(self, tag):
+        node = self.at
+        while node is not None and node.tag != tag:
+            node = node.parent
+        if node is not None and node.parent is not None:
+            self.at = node.parent
+
+    def handle_data(self, data):
+        self.at.children.append(data)
+
+
+def _box(params: str, name: str) -> _Node:
+    """The box of the setting `name` in a parameters pane, as a tree."""
+    (box,) = [node for node in _Tree(params).root.walk()
+              if node.attrs.get("data-card") == name]
+    assert "box" in box.classes() and box.tag == "div", box.attrs
+    return box
+
+
+def _said(node: _Node) -> str:
+    return " ".join(node.text().split())
+
+
+def test_a_box_shows_its_plain_name_and_code_name():
+    """The design's goal 5 (the PI, 2026-11-19: "Plain name, code name small"): a box's head leads
+    with the plain name its task declares (`ParamRow.label`) and the code name small beneath it;
+    a setting with no plain name shows its code name alone, as the name. Each is whole in its
+    `title`, so a name cut short at a narrow box is still read; the head ends with the value in
+    force. The box is the markup Tasks 6 to 8 script: `div.box[data-card]` with `.head`,
+    `.editor`, `.status` and `details.more`, in that order."""
+    rows = (ParamRow.of("fix_hold", "s", 0.0, None, 0.5, False, label="Fixation hold",
+                        help="How long gaze must stay on the fixation point."),
+            ParamRow.of("timeout", "s", 0.0, None, 2.0, False))
+    params = fragments(frame(params=rows), view())["params"]
+
+    named = _box(params, "fix_hold")
+    zones = [child for child in named.children if isinstance(child, _Node)]
+    assert [(z.tag, sorted(z.classes())) for z in zones] == [
+        ("div", ["head"]), ("div", ["editor"]), ("div", ["status"]), ("details", ["more"])]
+    head = named.zone("head")
+    (label,) = head.find("lbl")
+    (code,) = head.find("code")
+    assert (_said(label), label.attrs["title"]) == ("Fixation hold", "Fixation hold")
+    assert (_said(code), code.attrs["title"]) == ("fix_hold", "fix_hold")
+    assert "only" not in code.classes()
+    assert _said(head.find("now")[0]) == "0.50 s"
+    assert "How long gaze must stay" in _said(named.zone("more"))
+
+    # At rest the status line says the limits in short (the layout review's finding 2).
+    assert _said(_box(params, "timeout").zone("status").find("say")[0]) == "0.00 or more"
+    bare = _box(params, "timeout").zone("head")
+    assert bare.find("lbl") == []
+    (alone,) = bare.find("code")
+    assert _said(alone) == "timeout" and "only" in alone.classes()
+    # The small code name and the plain name are styled apart.
+    assert ".box .code {" in _CSS and ".box .lbl {" in _CSS and ".box .code.only {" in _CSS
+
+
+def test_a_whole_box_shows_no_decimals_and_steps_by_one():
+    """The design's goal 6 (the PI: "for necessary whole numbers (set size), there should not be a
+    decimal option for entry"): a setting its task declares whole (`ParamRow.whole`) shows `4`,
+    never `4.00` -- in its head, its field, its limits and what is staged for it -- and its field
+    steps by 1 with a numeric keyboard. A setting that is not whole keeps its step's decimals and
+    never loses a digit its value holds."""
+    # Whole whatever step a row says (a hand-made row's 0.01 here): the page steps it by 1.
+    rows = (ParamRow.of("set_size", "objects", 1.0, 36.0, 4.0, False, whole=True),
+            ParamRow.of("fix_window", "deg", 0.0, 9.0, 2.35, False, step=0.1))
+    params = fragments(frame(params=rows, staged=(
+        Staged("set_size", 4.0, 6.0, Box("jake"), False),)), view())["params"]
+
+    box = _box(params, "set_size")
+    whole = _said(box)
+    assert not re.search(r"\d\.\d", whole), whole
+    # The head: the value in force, then what waits for the next trial.
+    assert _said(box.zone("head").find("now")[0]) == "4 → 6 objects"
+    # The unit is said once, after what waits (the whole-build review's I4).
+    assert _said(box.zone("head").find("pv")[0]) == "4"
+    (field,) = [n for n in box.zone("editor").walk() if n.tag == "input"]
+    assert (field.attrs["value"], field.attrs["data-step"], field.attrs["inputmode"]) == (
+        "4", "1", "numeric")
+    assert "1 to 36 objects" in _said(box.zone("more"))
+    assert "staged → 6 by" in _said(box.zone("more"))
+
+    other = _box(params, "fix_window")
+    (field,) = [n for n in other.zone("editor").walk() if n.tag == "input"]
+    assert (field.attrs["value"], field.attrs["data-step"], field.attrs["inputmode"]) == (
+        "2.35", "0.1", "decimal")
+
+
+def test_a_box_keeps_its_reasons_behind_more():
+    """The design's goal 1 and the layout review's finding 2 (the PI: "descriptions are too
+    long"): the limits with their reasons, where the value comes from, the conditions and the
+    draw, *hand back*, the whole of what is staged and the whole refusal sit inside the box's
+    *more*, a `<details>` that opens in place, and nowhere else on the box. The status line is one
+    line: one span, never wrapped (cut short with its whole text in its `title`), the refusal's
+    gist in it, its whole sentence in *more*."""
+    why = ("'fix_hold' at 30 is refused, and the previous value stands: the trial ends "
+           "NO_FIXATION after 10 s, while the hold can take up to 30 s, so some trials could "
+           "never be answered; shorten the hold or lengthen the timeout (XC-343)")
+    row = ParamRow.of("fix_hold", "s", 0.0, None, 0.5, False, source="person",
+                      conditions=("near", "far"), draw="uniform from 0.4 to 0.6 s",
+                      why={"low": "below 0 cannot be"})
+    params = fragments(frame(params=(row,), refusals=(
+        Refused("fix_hold", Box("jake"), why, cid="box-1", value=30.0),)), view())["params"]
+
+    box = _box(params, "fix_hold")
+    more = box.zone("more")
+    assert more.tag == "details" and "open" not in more.attrs
+    # A ⋯ in the box's head since the console interface rework's Task 8, its word its label.
+    summary = more.children[0]
+    assert (summary.tag, _said(summary), summary.attrs["aria-label"]) == (
+        "summary", "⋯", web.MORE_SAID)
+    inside = _said(more)
+    outside = " ".join(_said(box.zone(z)) for z in ("head", "editor", "status"))
+    for said in (_said(_Tree(web._range(row)).root), "held by a person",
+                 "set or drawn by conditions near, far", "its draw: uniform from 0.4 to 0.6 s",
+                 " ".join(html.unescape(why).split()), "hand back"):
+        assert said in inside, said
+        assert said not in outside, said
+    assert [n for n in more.walk() if n.attrs.get("data-cmd") == "hand_back"]
+
+    status = box.zone("status")
+    (say,) = status.find("say")
+    assert "\n" not in say.text() and not [n for n in say.walk() if n.tag in ("br", "div", "p")]
+    assert _said(say).startswith("refused 30.00 · the trial ends NO_FIXATION")
+    assert len(_said(say)) < len(why) and say.attrs["title"] == _said(say)
+    assert "refused" in box.classes()
+    rule = re.search(r"\.box \.status \.say \{([^}]*)\}", _CSS).group(1)
+    assert "white-space: nowrap" in rule and "text-overflow: ellipsis" in rule
+    # Apply and Discard sit at the status line's right, hidden by `visibility` until a draft, so
+    # the box's height never jumps (the design's anti-goals).
+    acts = status.find("acts")[0]
+    assert [(n.attrs.get("data-discard"), n.attrs.get("data-apply")) for n in acts.walk()
+            if n.tag == "button"] == [("fix_hold", None), (None, "fix_hold")]
+    assert re.search(r"\.box \.status \.acts \{[^}]*visibility: hidden", _CSS)
+    assert re.search(r"\.box\.draft \.status \.acts[^{]*\{[^}]*visibility: visible", _CSS)
+
+
+def test_every_field_says_its_unit_the_drawn_side_too():
+    """The design's call (the PI's units, "Seconds stay seconds, the unit beside every field, the
+    drawn side's fields included"; the controls review's F9: "no unit on any of them"): every
+    field a box types a number in -- its value, a value over its draw, the drawn side's shapes,
+    a size's factor, its draw's live numbers -- has its unit beside it; a list's weights are
+    relative, and say so."""
+    shape = {"shape": "non_aging", "numbers": {"shortest": 0.5, "longest": 1.25},
+             "values": [], "weights": [], "by": "person"}
+    rows = (
+        ParamRow.of("fix_hold", "s", 0.0, None, 0.5, False, source="form", switch="drawn",
+                    shape=shape),
+        ParamRow.of("fix_acquisition", "s", 0.0, None, 2.0, False, source="draw",
+                    draw="uniform from 1 to 3 s", numbers={"low": 1.0, "high": 3.0}),
+        ParamRow.of("disc_size", "deg", 0.0, None, 1.0, False, source="task", switch="scaled"),
+        ParamRow.of("set_size", "objects", 1.0, 36.0, 4.0, False, whole=True, step=1.0),
+    )
+    params = fragments(frame(params=rows), view())["params"]
+
+    fields = 0
+    for name, unit in (("fix_hold", "s"), ("fix_acquisition", "s"), ("disc_size", "deg"),
+                       ("set_size", "objects")):
+        box = _box(params, name)
+        for node in box.walk():
+            if node.tag != "input" or not ({"data-param", "data-form", "data-number"}
+                                           & set(node.attrs)):
+                continue
+            fields += 1
+            said, at = None, node.parent
+            while said is None and at is not box:
+                units = [c for c in at.children if isinstance(c, _Node)
+                         and "unit" in c.classes() and c.tag == "span"]
+                said = _said(units[0]) if units else None
+                at = at.parent
+            assert said, (name, node.attrs)
+            form = node.attrs.get("data-form")
+            expected = ("relative" if form == "weights" else "× each object's eccentricity"
+                        if form == "factor" else unit)
+            assert said == expected, (name, node.attrs, said)
+    # fix_hold: each shape's fields on its drawn side (11, a list's values and a weighted list's
+    # values and weights among them) and the value over its draw; fix_acquisition: the value over
+    # its draw and its two live numbers; disc_size: its field and its factor; set_size: its field.
+    assert fields == 11 + 1 + 3 + 2 + 1, fields
+
+
+def test_runtime_still_needed_reads_as_words():
+    """The workflow review's F12 (Runtime, "Still needed": `this block has no percentage rule, so
+    this changes nothing here` drawn one letter per line down 950 px): a row of the pane that holds
+    a sentence and a button wraps, the button going under the sentence where both do not fit,
+    never squeezing the sentence to a letter's width (`.kv.wrap`; a browser test measures it)."""
+    need = fragments(frame(rule=None, owed={"ecc 10": 18}), view())["rt-need"]
+    tree = _Tree(need).root
+    rows = [node for node in tree.walk() if "kv" in node.classes()
+            and [c for c in node.children if isinstance(c, _Node) and c.tag == "button"]
+            and [c for c in node.children if isinstance(c, _Node) and "nm" in c.classes()]]
+    assert len(rows) >= 3, need  # drumming, clear, and the percentage's
+    assert all("wrap" in row.classes() for row in rows), [row.attrs for row in rows]
+    assert any("this block has no percentage rule" in _said(row) for row in rows)
+    rule = re.search(r"\.kv\.wrap \{([^}]*)\}", _CSS).group(1)
+    assert "flex-wrap: wrap" in rule
+    assert re.search(r"\.kv\.wrap > span \{[^}]*flex: 1 1 \d+em", _CSS)
+
+
+# --- the console interface rework's Task 6: what the script reads off a box ---------------------
+
+
+def test_a_box_carries_what_the_script_reads_of_its_verdicts():
+    """The page's script ties each verdict to the press it answers and says who changed a box
+    under a draft (the console interface rework's Task 6), from marks the box carries: the staged
+    change's command id, the refusal's key and id, the trial the change in force took effect at,
+    who changed it (`data-under`), and on a refusal's line what it says once a later change is
+    accepted. A change waiting under an id offers *withdraw*, saying first how many it takes back;
+    a reward size never does. A refused withdrawal rides in `.wdrs`, by the act's id; the run
+    in progress on the sections (`data-run`, "" between runs); a whole field says so
+    (`data-whole`); Apply and Discard are in the Tab order."""
+    from wl_xcon.link import Applied, Refused, Staged
+
+    jake, ana = Box("jake"), Box("Ana")
+    rows = (ParamRow.of("fix_hold", "s", 0.1, 1.0, 0.3, False, step=0.05),
+            ParamRow.of("response_deadline", "s", 0.2, 2.0, 0.6, False, step=0.05),
+            ParamRow.of("set_size", "objects", 1.0, 36.0, 4, False, whole=True, step=1.0,
+                        applied=Applied(39, "Ana (box, unverified)")),
+            ParamRow.of("reward_correct", "mL", 0.0, 0.4, 0.15, True))
+    staged = (Staged("fix_hold", 0.3, 0.5, jake, False, cid="p-1"),
+              Staged("response_deadline", 0.6, 0.8, jake, False, cid="p-1"),
+              Staged("reward_correct", 0.15, 0.2, jake, True, cid="p-2"))
+    refusals = (Refused("set_size", ana, "'set_size' at 40 is refused, and the previous value "
+                        "stands: it is past 36", cid="p-0", value=40),
+                Refused("withdraw", jake, "the change sent as 'p-9' is not withdrawn: it is "
+                        "already in force from trial 41, so nothing of it waits", cid="p-9"))
+    params = fragments(frame(params=rows, staged=staged, refusals=refusals), view())["params"]
+    cards = _cards(params)
+
+    hold, size, reward = cards["fix_hold"], cards["set_size"], cards["reward_correct"]
+    assert 'data-staged-cid="p-1"' in hold and 'data-under="jake (box, unverified) is changing this to 0.50"' in hold
+    assert ('<span class="wd" title="withdraws the 2 applied together: fix_hold, '
+            'response_deadline"><button type="button" class="btn small" data-withdraw="p-1" '
+            'tabindex="0">withdraw all 2</button></span>') in hold
+    assert 'data-staged-cid="p-2"' in reward and "data-withdraw" not in reward
+    assert ('data-refusal="p-0" data-refusal-cid="p-0" data-applied="39" '
+            'data-under="Ana (box, unverified) changed this from trial 39"') in size
+    assert ('data-rest="in force from trial 39" data-rest-state="applied">refused 40 · it is past 36'
+            ) in size
+    assert 'data-param="set_size" data-step="1" data-min="1.0" data-max="36.0" data-whole="1"' in size
+    assert 'data-whole' not in hold
+    for card in cards.values():
+        assert ' data-discard="' in card and 'tabindex="0">Discard' in card
+        assert 'tabindex="0">Apply</button>' in card
+    assert params.endswith('<div class="wdrs" hidden><span class="wdr" data-cid="p-9">it is '
+                           'already in force from trial 41, so nothing of it waits</span></div>')
+    assert 'data-run="2027-01-14_01/0"' in params
+    between = fragments(frame(params=rows, phase="between_runs"), view())["params"]
+    assert 'data-run=""' in between
+    lone = fragments(frame(params=rows, staged=staged[:1]), view())["params"]
+    assert 'title="takes this change back before the next trial"' in lone
+    assert 'tabindex="0">withdraw</button>' in lone
+
+
+# --- the console interface rework's Task 7: the pairings grid, group boxes, percents, New color -
+
+#: The pop-out's four colors in its pool's order, each with a swatch as the rig sends one.
+_POOL_COLORS = {"blue": "#2476c8", "purple": "#8a5cc2", "red": "#bf5c5c", "green": "#3f9a4a"}
+
+
+def _pool_row(value=66, **fields):
+    """A pool's setting's row as the rig makes it (`taskd.pool_members`): its twelve pairs in the
+    pool's order, each odd color among each other, bits 1 to 2048, `on` as `value` holds them."""
+    from wl_xcon.link import PoolMember
+
+    members = tuple(
+        PoolMember(bit=1 << at, odd=odd, among=among, odd_hex=_POOL_COLORS[odd],
+                   among_hex=_POOL_COLORS[among], on=bool(value >> at & 1))
+        for at, (odd, among) in enumerate(
+            (odd, among) for odd in _POOL_COLORS for among in _POOL_COLORS if among != odd))
+    return ParamRow.of("pairings", "pairings", 1.0, 4095.0, value, False, source="run",
+                       whole=True, step=1.0, section="Colors", members=members, **fields)
+
+
+def test_a_pool_box_draws_its_pairs_as_a_grid():
+    """The design's goal 7 (the PI, 2026-11-19: "4 × 4 grid, add or remove"): the pool's box draws
+    its pairs as a grid -- the odd one's color down, the distractors' across, each with the rig's
+    swatch, the diagonal empty -- a tick for each pair the row lists, ticked as its `on` says,
+    named for a screen reader and carrying its bit, never worked out on the page; two columns wide,
+    its head saying how many pairs the pool holds, and no number field. A staged change says what
+    it leaves the pool with in pairs."""
+    from wl_xcon.link import Staged
+
+    jake = Box("jake")
+    params = fragments(frame(params=(_pool_row(),), staged=(
+        Staged("pairings", 66.0, 2114.0, jake, False, cid="p-1"),)), view())["params"]
+    box = _cards(params)["pairings"]
+
+    assert box.startswith(' staged wide" data-card="pairings"')
+    grid = re.search(r'<table class="pairs" data-pool="pairings".*?</table>', box).group(0)
+    heads = re.findall(r'<th scope="(col|row)"[^>]*>(.*?)</th>', grid)
+    assert [re.sub(r"<[^>]+>", "", said) for scope, said in heads if scope == "col"] == [
+        "odd ↓among →", "blue", "purple", "red", "green"]
+    assert [re.sub(r"<[^>]+>", "", said) for scope, said in heads if scope == "row"] == [
+        "blue", "purple", "red", "green"]
+    for color, hex_ in _POOL_COLORS.items():
+        assert grid.count(f'<span class="chip" style="background:{hex_}"></span>{color}') == 2
+    rows = re.findall(r"<tr><th scope=\"row\">.*?</tr>", grid)
+    assert len(rows) == 4
+    for at, line in enumerate(rows):
+        cells = re.findall(r"<td[^>]*>.*?</td>", line)
+        assert len(cells) == 4 and cells[at] == '<td class="diag"></td>', line
+    ticks = re.findall(r'<input type="checkbox" class="tick" data-bit="(\d+)"( checked)? '
+                       r'aria-label="(\w+ among \w+)"', grid)
+    assert [int(bit) for bit, _, _ in ticks] == [1 << n for n in range(12)]
+    assert [said for _, on, said in ticks if on] == ["blue among red", "red among blue"]
+    assert 'data-param="pairings"' not in box
+    assert '<span class="pv">2 of 12 pairs</span> <span class="to">→ 3 of 12 pairs</span>' in box
+    assert 'data-under="jake (box, unverified) is changing this to 3 of 12 pairs"' in box
+    rest = fragments(frame(params=(_pool_row(),)), view())["params"]
+    assert web.POOL_REST in rest
+
+
+def _group_rows(bar=0.8, window=50):
+    return (
+        ParamRow.of("move_up_bar", "fraction", 0.0, 1.0, bar, False, source="task", step=0.05,
+                    percent=True, label="Bar to move up", group="Move up", section="Rules",
+                    why={"low": "below 0 cannot be", "high": "a fraction is at most 1"}),
+        ParamRow.of("fix_hold", "s", 0.1, 1.0, 0.3, False, source="task", step=0.05,
+                    section="Rules"),
+        ParamRow.of("move_up_window", "answers", 1.0, 200.0, window, False, source="task",
+                    whole=True, step=1.0, label="Answers judged", group="Move up",
+                    section="Rules"),
+    )
+
+
+_MOVE_UP = "Move up when at least {move_up_bar} of the last {move_up_window} answers are right"
+
+
+def test_a_groups_sentence_reads_with_its_fields_in_place():
+    """The design's goal 8 (the PI, 2026-11-19: "One box after Timing"; "Move up when at least
+    [80]% of the last [50] answers are right"): a group's settings share one box, titled by the
+    group, standing where its first setting would, its settings drawing no box of their own; its
+    editor is its sentence with each setting's field in its place -- the percent's with its `%`,
+    the count's with no unit, the sentence naming what it counts -- and one Apply; its head shows
+    each value in force; its *more* each setting's plain name, limits and reasons; the section
+    counts the group's settings. A group with no sentence lists each field under its plain name;
+    one naming a ceiling never takes it in (a reward size is sent alone)."""
+    from wl_xcon.link import GroupRow
+
+    group = GroupRow("Move up", ("move_up_bar", "move_up_window"), _MOVE_UP, "Rules")
+    params = fragments(frame(params=_group_rows(), groups=(group,)), view())["params"]
+    cards = _cards(params)
+
+    assert list(cards) == ["Move up", "fix_hold"]
+    box = cards["Move up"]
+    # `data-echo`: its fields show what its head would, so its head says it only while it differs
+    # (the console interface rework's Task 8); `hidden` until it is opened in the editor (the
+    # summary and editor design's goal 2).
+    assert box.startswith(' group wide" data-card="Move up" data-echo hidden>')
+    assert ('<span class="lbl" title="Move up">Move up</span><span class="code" '
+            'title="move_up_bar, move_up_window">move_up_bar, move_up_window</span>') in box
+    sentence = re.search(r'<div class="sentence">(.*?)</div><div class="status">', box).group(1)
+    pieces = re.findall(r'<span class="gs">(.*?)</span>|data-param="(\w+)"[^>]*value="([^"]*)"'
+                        r'|<span class="unit">(.*?)</span>', sentence)
+    assert [part for piece in pieces for part in piece if part] == [
+        "Move up when at least ", "move_up_bar", "80", "%", " of the last ", "move_up_window",
+        "50", " answers are right"]
+    assert 'data-step="5" data-min="0" data-max="100" data-percent="1"' in sentence
+    assert 'data-step="1" data-min="1.0" data-max="200.0" data-whole="1"' in sentence
+    assert ('<span class="now" title="80 % · 50 answers"><span class="pv">80 <span class="unit">%'
+            '</span></span> · <span class="pv">50 <span class="unit">answers</span></span></span>'
+            ) in box
+    assert box.count('data-apply="Move up"') == 1 and "data-apply=\"move_up" not in params
+    assert web.GROUP_REST in box
+    assert '<span class="gn">Bar to move up</span>' in box and '0 to 100 % · a fraction is at most 100%' in box
+    # The summary's header (the summary and editor design of 2026-11-19), the whole in its title.
+    assert '<h4 title="Rules · 3 settings · 0 changed">Rules · 3 settings</h4>' in params
+
+    listed = fragments(frame(params=_group_rows(), groups=(replace(group, sentence=None),)),
+                       view())["params"]
+    plain = _cards(listed)["Move up"]
+    assert re.findall(r'<div class="gm"><span class="gl">(.*?)</span>.*?data-param="(\w+)"', plain) == [
+        ("Bar to move up", "move_up_bar"), ("Answers judged", "move_up_window")]
+    assert '<span class="unit">answers</span></span></div>' in plain
+
+    reward = ParamRow.of("reward_correct", "mL", 0.0, 0.4, 0.15, True)
+    paid = fragments(frame(params=_group_rows() + (reward,), groups=(
+        GroupRow("Pay", ("fix_hold", "reward_correct"), None, "Rules"),)), view())["params"]
+    assert list(_cards(paid))[-1] == "reward_correct" and "Pay" in _cards(paid)
+    assert "reward_correct" not in _cards(paid)["Pay"]
+
+
+def test_a_percent_box_says_the_rigs_numbers_in_percent():
+    """The design's call: "a fraction may be shown as a percent ... its steps, limits and the rig's
+    sentences are converted on the page, and the setting, the command and the record keep the
+    fraction": a percent's field, head and limits ×100 with `%`, a float's noise never shown (0.07
+    reads 7, 0.575 reads 57.5, a step of 0.07 steps by 7); a refusal's value and the rig's sentence about it in percent, the
+    fraction's own numbers only; a setting that is no percent left as the rig wrote it."""
+    from wl_xcon.link import Refused
+
+    bar = ParamRow.of("move_up_bar", "fraction", 0.0, 1.0, 0.07, False, step=0.05, percent=True,
+                      why={"low": "below 0 cannot be", "high": "a fraction is at most 1"})
+    why = ("'move_up_bar' at 1.2 is refused, and the previous value stands: past-limit: "
+           "'move_up_bar' at 1.2 fraction is above its 1: a fraction is at most 1 (block 2)")
+    refused = (Refused("move_up_bar", Box("jake"), why, cid="p-3", value=1.2),)
+    box = _cards(fragments(frame(params=(bar,), refusals=refused), view())["params"])["move_up_bar"]
+
+    assert 'data-step="5" data-min="0" data-max="100" data-percent="1" inputmode="decimal" value="7"' in box
+    assert '<span class="pv">7 <span class="unit">%</span></span>' in box
+    assert "refused 120% · past-limit: &#x27;move_up_bar&#x27; at 120% is above its 100%: a fraction is at most 100%" in box
+    assert "(block 2)" in box and "7.000000000000001" not in box
+    assert "last refused: &#x27;move_up_bar&#x27; at 120% is refused" in box
+    noisy = _cards(fragments(frame(params=(replace(bar, value=0.575),)), view())["params"])
+    assert 'value="57.5"' in noisy["move_up_bar"] and "57.49" not in noisy["move_up_bar"]
+    # A step of 0.07 is 7.000000000000001 × 100: its decimals would be fifteen.
+    sevens = _cards(fragments(frame(params=(replace(bar, value=0.14, step=0.07),)),
+                              view())["params"])["move_up_bar"]
+    assert 'data-step="7" ' in sevens and 'value="14"' in sevens and "14.0" not in sevens
+    plain = replace(bar, percent=False, name="hit")
+    said = _cards(fragments(frame(params=(plain,), refusals=(replace(refused[0], name="hit"),)),
+                            view())["params"])["hit"]
+    assert "refused 1.20 · past-limit: &#x27;move_up_bar&#x27; at 1.2 fraction is above its 1" in said
+
+
+def test_a_percent_is_said_in_percent_only_where_the_sentence_ties_the_number_to_it():
+    """The whole-build review's I7: a number in the rig's sentence is converted only where the
+    sentence ties it to a percent setting -- after its quoted name ("'move_up_bar' at 1.2"), after
+    "its", given in its unit ("1.2 fraction"), or the standard limit's "a fraction is at most 1" --
+    so "block 1" and "the last 1 answers" stay as written, whatever the setting's limits; and a
+    peer bar's number is converted where the sentence gives it as that bar's, in either bar's box."""
+    from wl_xcon.link import Refused
+
+    up = ParamRow.of("move_up_bar", "fraction", 0.0, 1.0, 0.8, False, step=0.05, percent=True,
+                     why={"low": "below 0 cannot be", "high": "a fraction is at most 1"})
+    back = ParamRow.of("move_back_bar", "fraction", 0.0, 1.0, 0.5, False, step=0.05, percent=True)
+    late = ("'move_up_bar' at 1.2 is refused: past-limit: 'move_up_bar' at 1.2 fraction is above "
+            "its 1: a fraction is at most 1 (block 1), judged over the last 1 answers")
+    order = "'move_back_bar' at 0.9 must be below 'move_up_bar' at 0.8, so it is refused"
+    refused = (Refused("move_up_bar", Box("jake"), late, cid="p-1", value=1.2),
+               Refused("move_back_bar", Box("jake"), order, cid="p-2", value=0.9))
+    cards = _cards(fragments(frame(params=(up, back), refusals=refused), view())["params"])
+
+    assert ("last refused: &#x27;move_up_bar&#x27; at 120% is refused: past-limit: "
+            "&#x27;move_up_bar&#x27; at 120% is above its 100%: a fraction is at most 100% "
+            "(block 1), judged over the last 1 answers") in cards["move_up_bar"]
+    assert ("last refused: &#x27;move_back_bar&#x27; at 90% must be below &#x27;move_up_bar&#x27; "
+            "at 80%, so it is refused") in cards["move_back_bar"]
+    assert "100% answers" not in cards["move_up_bar"] and "block 100%" not in cards["move_up_bar"]
+
+
+def test_one_new_color_panel_per_colors_section():
+    """The design's call: "the new-color panel moves out of each color's box into one *New
+    color…* panel for the Colors section": no color box holds one; each section holding a color
+    box has one, after its boxes, keyed by the section, offering every set its boxes show, the
+    first box's set chosen; a section with none has none. Rewritten for the summary and editor
+    design (2026-11-19): the panel stands in the editor after its section's boxes, `hidden` until
+    the *New color…* line its section's summary ends with opens it (`new-color:SECTION`; the
+    design's "Colors" call)."""
+    def color(sets, chosen):
+        return {"sets": {named: {"apex": [0.31, 0.33], "luminance_cd_m2": 15.0, "design": None,
+                                 "hues": {"red": {"xy": [0.46, 0.33], "srgb": "#c76f6a"}}}
+                         for named in sets},
+                "set": chosen, "hue": "red", "approximate": True,
+                "saturation": {"setting": None, "value": 1.0, "cd_m2": 15.0},
+                "luminance": {"setting": None, "value": 15.0, "cd_m2": 15.0, "set_wide": False}}
+
+    rows = (
+        ParamRow.of("odd_color", "appearance", None, None, None, False, source="run",
+                    color=color(("isohue",), "isohue"), section="Colors"),
+        ParamRow.of("distractor_color", "appearance", None, None, None, False, source="run",
+                    color=color(("isohue", "bright"), "bright"), section="Colors"),
+        _pool_row(),
+        ParamRow.of("fix_hold", "s", 0.1, 1.0, 0.3, False, section="Timing"),
+        ParamRow.of("cue_color", "appearance", None, None, None, False, source="run",
+                    color=color(("dim",), "dim"), section="Cues"),
+    )
+    params = fragments(frame(params=rows), view())["params"]
+
+    assert params.count("<details class=\"newc\"") == 2
+    assert re.findall(r'data-newc="([^"]+)"', params) == ["Colors", "Cues"]
+    for card in _cards(params).values():
+        card = card.partition('<details class="newc"')[0]
+        assert "data-newc" not in card and "New color" not in card
+    editor = params.partition('<div class="editing">')[2]
+    colors = editor.partition('data-card="pairings"')[2].partition('data-card="fix_hold"')[0]
+    # After the section's last box, in the editor, hidden until it is opened.
+    assert ('</details></div><details class="newc" data-newc="Colors" hidden><summary>New color…'
+            '</summary>') in colors
+    into = re.search(r'data-newc-into[^>]*>(.*?)</select>', colors).group(1)
+    assert re.findall(r'<option value="([^"]*)"( selected)?', into) == [
+        ("isohue", " selected"), ("bright", ""), ("", "")]
+    summary = params.partition('<div class="legend">')[0]
+    opens = re.findall(r'<div class="ssec" data-section="([^"]+)">|data-open="([^"]+)"', summary)
+    assert [one for pair in opens for one in pair if one] == [
+        "Colors", "odd_color", "distractor_color", "pairings", "new-color:Colors",
+        "Timing", "fix_hold", "Cues", "cue_color", "new-color:Cues"]
+    assert ('<button type="button" class="line newcolor" data-open="new-color:Colors" '
+            'title="New color… Colors: define a color and save it as a proposal">') in summary
+
+
+
+# --- the console interface rework's Task 8: the page around the boxes ---------------------------
+
+
+def test_the_bar_holds_the_runs_numbers_and_buttons_and_the_session_is_behind_a_button():
+    """The design's call: "the top of the page becomes one bar that stays in view: state, trial,
+    correct, fluid, cage time and the run's buttons; the session's details behind a *session*
+    button". The bar's numbers are the strip's own (`_level`, `_back_to_cage`), its title the cage
+    time's note; before any frame it holds none; the session's details -- who, the strip, the next
+    run's task, plan and pre-flight, a scheduled stop -- stand behind *session*; the stop's confirm
+    and the mark's note open in the bar; the Training tab has a find box of its own; the demo's
+    keys fold to one line."""
+    parts = fragments(frame(), view())
+    nums = parts["bar-nums"]
+    words = _said(_Tree(nums).root)
+    assert words == "trial 40 correct 30 / 40 75% fluid today 61.25 mL cage by " + words.split(
+        "cage by ")[1]
+    cage = re.search(r'<span class="bn"( title="[^"]*")?><span class="k">cage</span>', nums)
+    assert cage and "out ·" in cage.group(1)
+    assert fragments(None, view())["bar-nums"] == ""
+    assert "unknown" in fragments(frame(fluid_today_ml=None), view())["bar-nums"]
+
+    document = page(parts, stale_after_s=30.0, nonce="n0nce", can_write=True)
+    bar = document[document.index('<header class="topbar glass" id="bar"'):document.index("</header>")]
+    for inside in ('id="state"', 'id="bar-nums"', 'id="controls"', 'id="sent"', 'id="session-btn"',
+                   'id="stop-confirm"', 'id="mark-form"', 'id="stream"'):
+        assert inside in bar, inside
+    session = document[document.index('<section class="session" id="session"'):]
+    session = session[:session.index("</section>")]
+    for inside in ('id="head-id"', 'id="presence"', 'id="strip"', 'id="task-sel"', 'id="plan-sel"',
+                   'id="run-trials"', 'id="pf-pill"', 'id="sched-form"'):
+        assert inside in session, inside
+    assert ".topbar { position: sticky; top: 0;" in _CSS
+    assert ("body:has(#t-task:checked) .session, body:has(#t-training:checked) .session "
+            "{ display: none; }") in _CSS
+    training = _tab(document, "tp-training")
+    assert 'id="tfind"' in training and 'id="pfind"' in _tab(document, "tp-task")
+    assert ('<details class="demo-fold" id="demo-fold"><summary>keys and demo limits</summary>'
+            '<div class="demo-keys" id="demo-keys">') in document
+    assert ('<section class="panel glass pins" id="pinned-pane" aria-label="pinned settings" hidden>'
+            in _tab(document, "tp-runtime"))
+
+
+def test_a_section_counts_its_unsent_drafts():
+    """The console interface rework's Task 8: a section's header counts what in it is not sent,
+    after the rig's counts. What the rig counts is the header's one text -- `N settings`, the
+    whole `N settings · M changed` in its title, a group's settings each once, a parent's taking
+    in its subsections' -- so the page's
+    script puts "· K not sent" after it in a slot of its own (`countDrafts`, from `showBar`, the
+    one place drafts are summed), counting a group's draft by the settings it changes (`unsent`),
+    and after a frame's new counts `settle` says it again. The browser test
+    `test_a_section_and_its_tab_count_the_edits_not_sent` drives it."""
+    from wl_xcon.link import GroupRow
+
+    rows = (ParamRow.of("fix_hold", "s", 0.0, 1.0, 0.3, False, section="Timing", changed=True),
+            ParamRow.of("move_up_bar", "fraction", 0.0, 1.0, 0.8, False, section="Rules",
+                        changed=True),
+            ParamRow.of("move_up_window", "answers", 1.0, 200.0, 50.0, False, section="Rules",
+                        whole=True),
+            ParamRow.of("fix_size", "deg", 0.0, 9.0, 0.5, False, section="Timing/points"))
+    group = GroupRow("Move up", ("move_up_bar", "move_up_window"), None, "Rules")
+    params = fragments(frame(params=rows, groups=(group,)), view())["params"]
+
+    summaries = re.findall(r'<div class="ssec" data-section="([^"]+)"><h4 title="([^"]*)">([^<]*)</h4>',
+                           params)
+    # Rewritten for the summary and editor design (2026-11-19): the summary's section headers
+    # (`.ssec > h4`) say the settings on one line, the whole with what changed in their title.
+    assert summaries == [("Timing", "Timing · 2 settings · 1 changed", "Timing · 2 settings"),
+                         ("Timing/points", "points · 1 setting · 0 changed", "points · 1 setting"),
+                         ("Rules", "Rules · 2 settings · 1 changed", "Rules · 2 settings")]
+    counting = _script_between("function unsent(box)", "  // **Pins**")
+    assert 'box.classList.contains("group") ? Math.max(1, draft.changes.length) : 1' in counting
+    assert 'sayIn(slotIn(header, "ns"), count)' in counting
+    assert 'sayIn(slotIn(tab, "tns"), total)' in counting
+    assert '" · " + count + " not sent"' in counting
+    assert _script_between("function showBar() {", "var bar = ").strip() == "countDrafts();"
+
+
+def test_a_box_says_its_value_in_its_head_only_where_its_field_does_not():
+    """The ledger's density ruling for the console interface rework's Task 8: "the head shows the
+    value in force only when it differs from the field (a draft or a waiting change), not twice".
+    A box whose field shows its value in force carries `data-echo`, and the page's CSS hides its
+    head's value while it has no draft, no act out and nothing waiting; a box whose head is the
+    only place its value is said -- drawn each trial, held by the training switch, a position, an
+    appearance, a color, a pool, a scaling -- carries none, and its head always says it."""
+    rows = (
+        ParamRow.of("fix_hold", "s", 0.0, 1.0, 0.3, False, source="task"),
+        ParamRow.of("rule", "word", None, None, "hollow", False, source="task"),
+        ParamRow.of("wait", "s", 0.0, 1.0, 0.3, False, source="draw", draw="uniform 0.2 to 0.4"),
+        ParamRow.of("bar", "fraction", 0.0, 1.0, 0.8, False, source="frozen"),
+        replace(ParamRow.of("place", "deg", None, None, None, False), position="10° at 45°"),
+        replace(ParamRow.of("look", "appearance", None, None, None, False), words="hollow ring"),
+        _pool_row(),
+        ParamRow.of("disc_size", "deg", 0.0, 5.0, 1.0, False, source="form", switch="scaled",
+                    shape={"shape": "scaled", "numbers": {"factor": 0.1}, "values": [],
+                           "weights": [], "by": "person"}),
+    )
+    params = fragments(frame(params=rows), view())["params"]
+    cards = _cards(params)
+    echoed = {name for name, card in cards.items()
+              if re.match(r'[^>]*data-card="[^"]*"[^>]*\bdata-echo\b[^>]*>', card)}
+    assert echoed == {"fix_hold", "rule"}
+    assert ('.box[data-echo]:not(.draft):not(.staged):not(.sending) > .head > .now '
+            '{ display: none; }') in _CSS
+    # The head's value is still made for every box: the script and a draft read it.
+    assert all('<span class="now"' in card for card in cards.values())
+
+
+def test_every_box_has_a_pin_and_a_mark_for_more_in_its_head():
+    """The design's goal 9 and the ledger's density ruling for Task 8: every box, a group's too,
+    holds *pin to Runtime* first in its *more* (nothing pinned as served: the page's script keeps
+    the pins), and its *more* opens from a ⋯ in its head's corner, not a line of its own; the pin
+    sends nothing, so no gate grays it."""
+    from wl_xcon.link import GroupRow
+
+    rows = (ParamRow.of("fix_hold", "s", 0.0, 1.0, 0.3, False, section="Rules"),
+            ParamRow.of("move_up_bar", "fraction", 0.0, 1.0, 0.8, False, section="Rules"),
+            ParamRow.of("move_up_window", "answers", 1.0, 200.0, 50.0, False, section="Rules"))
+    group = GroupRow("Move up", ("move_up_bar", "move_up_window"), None, "Rules")
+    params = fragments(frame(params=rows, groups=(group,)), view(can_write=False))["params"]
+
+    for name in ("fix_hold", "Move up"):
+        more = _box(params, name).zone("more")
+        detail = more.children[1]
+        first = detail.children[0]
+        assert (first.tag, first.attrs["data-pin-toggle"], first.attrs["aria-pressed"],
+                _said(first)) == ("button", name, "false", "pin to Runtime"), name
+        assert "disabled" not in first.attrs, name
+    assert ".box > .more > summary { position: absolute; top: 1px; right: 2px;" in _CSS
+
+
+# --- the settings tabs as a summary and one editor (the design of 2026-11-19, Task 1) -----------
+
+
+def _summary_rows():
+    """A task's settings of every kind a summary line says (the plan's Task 1): a plain number, a
+    whole number, a percent and a person's draw in Timing and Stimuli, a group of two in Rules, a
+    color and a pool in Colors, and the reward size, a ceiling, declared first but shown last."""
+    from wl_xcon.link import GroupRow
+
+    color = {"sets": {"isohue": {"apex": [0.31, 0.33], "luminance_cd_m2": 15.0, "design": None,
+                                 "hues": {"red": {"xy": [0.46, 0.33], "srgb": "#c76f6a"}}}},
+             "set": "isohue", "hue": "red", "approximate": True,
+             "saturation": {"setting": None, "value": 1.0, "cd_m2": 15.0},
+             "luminance": {"setting": None, "value": 15.0, "cd_m2": 15.0, "set_wide": False}}
+    shape = {"shape": "non_aging", "numbers": {"shortest": 0.5, "longest": 1.25},
+             "values": [], "weights": [], "by": "person"}
+    rows = (
+        ParamRow.of("reward_correct", "mL", 0.0, 0.4, 0.15, True, step=0.01, section="Ceilings"),
+        ParamRow.of("iti", "s", 0.2, 5.0, 1.0, False, source="task", step=0.05, section="Timing",
+                    label="Time between trials"),
+        ParamRow.of("fix_hold", "s", 0.1, 2.0, 0.5, False, source="form", step=0.05,
+                    section="Timing", label="Fixation hold", switch="drawn", shape=shape),
+        ParamRow.of("set_size", "objects", 1.0, 36.0, 4, False, source="task", whole=True,
+                    step=1.0, section="Stimuli", label="Number of discs"),
+        ParamRow.of("distractor_fraction", "fraction", 0.0, 1.0, 0.8, False, source="task",
+                    step=0.05, percent=True, section="Stimuli", label="Distractor brightness"),
+        ParamRow.of("odd_color", "appearance", None, None, None, False, source="run",
+                    color=color, section="Colors", label="Odd disc color"),
+        _pool_row(),
+    ) + tuple(replace(row, section="Rules") for row in _group_rows() if row.name != "fix_hold")
+    group = GroupRow("Move up", ("move_up_bar", "move_up_window"), _MOVE_UP, "Rules")
+    return rows, (group,)
+
+
+def _lines(params: str) -> list:
+    """Each summary line, in page order: `(section, data-open, classes, mk, ln, lv)`."""
+    summary = params.partition('<div class="legend">')[0]
+    found = []
+    for piece in re.split(r'(?=<div class="ssec")', summary)[1:]:
+        section = html.unescape(re.search(r'data-section="([^"]*)"', piece).group(1))
+        for classes, name, mark, label, value in re.findall(
+                r'<button type="button" class="([^"]*)" data-open="([^"]*)"[^>]* title="[^"]*">'
+                r'<span class="mk">([^<]*)</span><span class="ln">([^<]*)</span>'
+                r'<span class="lv"[^>]*>([^<]*)</span></button>', piece):
+            found.append((section, html.unescape(name), classes, mark, html.unescape(label),
+                          html.unescape(value)))
+    return found
+
+
+def test_the_summary_has_a_line_for_every_box_in_section_order():
+    """The summary and editor design's goal 1 (the PI, 2026-11-19: "perhaps some way to visualize
+    all params at top and clicking opens the ability to change it below"; mock-up A): above the
+    editor, one line per box, by section in the task's order with Ceilings last, each opening its
+    box (`data-open` is its `data-card`), its value the rig's as the box shows it -- "1.00 s", a
+    whole number's "4", a percent's "80%", a person's draw "0.5–1.25 s", a pool's "2 of 12", a
+    color's hue, a group's settings' values joined -- and a Colors section ending in its New
+    color… line; then the legend, then the editor holding every box hidden and its placeholder."""
+    rows, groups = _summary_rows()
+    params = fragments(frame(params=rows, groups=groups), view())["params"]
+    lines = _lines(params)
+
+    assert [(section, name, label, value) for section, name, _, _, label, value in lines] == [
+        ("Timing", "iti", "Time between trials", "1.00 s"),
+        ("Timing", "fix_hold", "Fixation hold", "0.5–1.25 s"),
+        ("Stimuli", "set_size", "Number of discs", "4"),
+        ("Stimuli", "distractor_fraction", "Distractor brightness", "80%"),
+        ("Colors", "odd_color", "Odd disc color", "red"),
+        ("Colors", "pairings", "pairings", "2 of 12"),
+        ("Colors", "new-color:Colors", "New color…", ""),
+        ("Rules", "Move up", "Move up", "80% · 50"),
+        ("Ceilings", "reward_correct", "reward_correct", "0.15 mL"),
+    ]
+    boxes = list(_cards(params))
+    assert [name for _, name, *_ in lines if not name.startswith("new-color:")] == boxes
+    summary, _, rest = params.partition('<div class="legend">')
+    assert "<details" not in summary and summary.count('<div class="ssec"') == 5
+    assert rest.startswith(html.escape(web.SUMMARY_LEGEND, quote=True) + "</div>"
+                           '<div class="editing"><div class="placeholder">'
+                           "click a setting above to change it</div>")
+    editor = rest.partition('<div class="editing">')[2]
+    assert len(re.findall(r'<div class="box[^"]*" data-card="[^"]*"[^>]* hidden>', editor)) == len(boxes)
+    assert '<details class="newc" data-newc="Colors" hidden>' in editor
+    assert ('<h4 title="Timing · 2 settings · 0 changed">Timing · 2 settings</h4>' in summary
+            and '<h4 title="Rules · 2 settings · 0 changed">Rules · 2 settings</h4>' in summary)
+    assert 'data-task="tasks/fixation_detection.py" data-run="2027-01-14_01/0"' in summary
+    assert web._summary_value(rows[0]) == "0.15 mL"
+    # A value each trial gives its own, in short; a position and an appearance in the rig's words.
+    for fields, said in (({"source": "conditions"}, "from conditions"),
+                         ({"source": "pool"}, "from pairings"),
+                         ({"source": "draw"}, "drawn each trial"),
+                         ({"source": "range", "numbers": {"low": 1.0, "high": 3.5}}, "1–3.5 s"),
+                         ({"source": "frozen"}, "frozen at 1.00 s"),
+                         ({"position": "10° at 45°"}, "10° at 45°"),
+                         ({"words": "hollow ring"}, "hollow ring")):
+        assert web._summary_value(replace(rows[1], **fields)) == said, fields
+
+
+def test_a_line_marks_what_the_rig_knows():
+    """The summary and editor design's goal 3 and its call on combined states: a line marks what
+    the rig's frame says, never color alone -- ◆ a value drawn each trial (`drawn`), ◷ a change
+    waiting for the next trial with the value in force first and what waits after an arrow
+    (`waiting`), ! the box's refusal as its status line ranks it (`refused`), ⚠ a warning
+    (`warned`) -- and its classes say a value changed from the task's start (`changed`) and a
+    reward size (`ceiling`); its `title` says each state in words."""
+    from wl_xcon.link import Applied
+
+    rows, groups = _summary_rows()
+    rows = tuple(replace(row, changed=True) if row.name == "set_size" else
+                 replace(row, applied=Applied(39, "jake"), warned=("crowded",))
+                 if row.name == "distractor_fraction" else row for row in rows)
+    jake = Box("jake")
+    params = fragments(frame(
+        params=rows, groups=groups,
+        staged=(Staged("iti", 1.0, 1.5, jake, False, cid="p-1"),
+                Staged("move_up_window", 50.0, 60.0, jake, False, cid="p-2")),
+        refusals=(Refused("set_size", jake, "set-size: 40 objects do not fit", cid="p-3",
+                          value=40.0),)), view())["params"]
+    marked = {name: (classes.split(), mark, value) for _, name, classes, mark, _, value in _lines(params)}
+    assert set(marked) >= {"iti", "fix_hold", "set_size", "Move up", "reward_correct"}, marked
+
+    assert marked["iti"] == (["line", "waiting"], "◷", "1.00 → 1.50 s")
+    assert marked["fix_hold"] == (["line", "drawn"], "◆", "0.5–1.25 s")
+    assert marked["set_size"] == (["line", "refused", "changed"], "!", "4")
+    assert marked["distractor_fraction"] == (["line", "warned"], "⚠", "80%")
+    assert marked["Move up"] == (["line", "waiting"], "◷", "80% · 50 → 60")
+    assert marked["reward_correct"] == (["line", "ceiling"], "", "0.15 mL")
+    assert marked["odd_color"][:2] == (["line"], "")
+    titles = dict((html.unescape(name), html.unescape(title)) for name, title in re.findall(
+        r'class="line[^"]*" data-open="([^"]*)"[^>]* title="([^"]*)"', params))
+    assert titles["iti"] == ("Time between trials (iti) · 1.00 → 1.50 s · waiting for the next "
+                             "trial · jake (box, unverified)")
+    assert titles["fix_hold"] == ("Fixation hold (fix_hold) · 0.5–1.25 s · drawn each trial, from a "
+                                  "person's draw")
+    assert titles["set_size"].startswith("Number of discs (set_size) · 4 · refused 40 · ")
+    assert titles["set_size"].endswith(" · changed from the task's start")
+    assert "in force, with a warning · from trial 39" in titles["distractor_fraction"]
+    assert titles["reward_correct"].endswith("a welfare ceiling: sent alone, by its own Apply")
+    assert 'data-open="iti" data-said="waiting for the next trial · jake (box, unverified)" ' \
+        'data-unit=" s" title="' in params and '<span class="lv" data-now="1.00 s">' in params
+
+
+def test_a_line_says_short_units_and_carries_what_the_page_reads():
+    """The ledger's ruling for the summary and editor build's Task 2 ("the summary's short units
+    ('°', 'cd/m²')"): a line says degrees as the sign against the number and cd/m² with its
+    square, in force, waiting and drawn alike, while the box keeps the setting's own unit; and it
+    carries what the page reads to say a draft as the rig's value is said (`markLine`):
+    `data-unit`, what the line writes after a number ("°", " cd/m²", " s", "%", nothing for a whole
+    number; none on a line whose value is no number), and `data-said`, the status its title says,
+    where there is one."""
+    from wl_xcon.link import Applied
+
+    rows, groups = _summary_rows()
+    shape = {"shape": "uniform", "numbers": {"low": 1.0, "high": 2.5},
+             "values": [], "weights": [], "by": "person"}
+    rows = rows + (
+        ParamRow.of("fix_window", "deg", 0.0, 9.0, 2.0, False, source="task", step=0.1,
+                    section="Gaze windows", label="Fixation window"),
+        ParamRow.of("fix_luminance", "cd/m2", 0.0, 80.0, 40.0, False, source="task", step=1.0,
+                    section="Stimuli", label="Fixation point brightness",
+                    applied=Applied(12, "jake")),
+        ParamRow.of("ring_radius", "deg", 0.0, 20.0, 8.0, False, source="form", step=0.1,
+                    section="Stimuli", switch="drawn", shape=shape),
+    )
+    params = fragments(frame(params=rows, groups=groups, staged=(
+        Staged("fix_window", 2.0, 1.5, Box("jake"), False, cid="p-1"),)), view())["params"]
+    said = {name: value for _, name, _, _, _, value in _lines(params)}
+    assert (said["fix_window"], said["fix_luminance"], said["ring_radius"]) == (
+        "2.0 → 1.5°", "40 cd/m²", "1–2.5°")
+    assert web._number_said(rows[-3], 2.0) == "2.0°"
+    assert '<span class="unit">deg</span>' in _cards(params)["fix_window"]
+    assert '<span class="unit">cd/m2</span>' in _cards(params)["fix_luminance"]
+    units = {html.unescape(name): html.unescape(unit) for name, unit in re.findall(
+        r'class="line[^"]*" data-open="([^"]*)"[^>]* data-unit="([^"]*)"', params)}
+    assert units == {"iti": " s", "fix_hold": " s", "set_size": "", "distractor_fraction": "%",
+                     "reward_correct": " mL", "fix_window": "°", "fix_luminance": " cd/m²",
+                     "ring_radius": "°"}, units
+    told = {html.unescape(name): html.unescape(status) for name, status in re.findall(
+        r'class="line[^"]*" data-open="([^"]*)" data-said="([^"]*)"', params)}
+    assert told == {"fix_window": "waiting for the next trial · jake (box, unverified)",
+                    "fix_luminance": "in force from trial 12"}, told
+
+
+def test_a_summary_is_as_wide_as_its_own_longest_line():
+    """The ledger's ruling for the summary and editor build's Task 3: "size the summary's columns
+    from the tab's own longest line (Python sets a width in `ch` from the longest label and value
+    it renders, with a floor)". A tab of short names takes the floor (`SUMMARY_FLOOR_CH`); a long
+    plain name widens its own tab's columns, not the other tab's; the longest plain name a task may
+    declare, with its draw, is given at least the 332 px (39.5 ch of 8.4 px) Task 2 measured it
+    needs (layout, not timing); a capital or a wide letter is taken as wider than a narrow one; and
+    a change waiting, which the line says after an arrow, moves no column (the design's anti-goal:
+    "the page jumping under the pointer")."""
+    from wl_xcon.task import LABEL_LIMIT
+
+    import math
+
+    def width(html_text: str) -> float:
+        found = re.search(r'<div class="summary" [^>]*style="column-width: ([0-9.]+)ch"', html_text)
+        assert found, html_text[:200]
+        return float(found.group(1))
+
+    short = (ParamRow.of("hold", "s", 0.0, 2.0, 0.3, False, source="task", section="Timing"),
+             ParamRow.of("step", "", 0.0, 1.0, 0.1, False, source="task", section="Training"))
+    parts = fragments(frame(params=short), view())
+    assert width(parts["params"]) == web.SUMMARY_FLOOR_CH
+    assert width(parts["training-params"]) == web.SUMMARY_FLOOR_CH
+    long_name = "Fixation hold, before the array is shown"[:LABEL_LIMIT]
+    long = (replace(short[0], label=long_name),) + short[1:]
+    parts = fragments(frame(params=long), view())
+    assert width(parts["params"]) == math.ceil(web._line_width(long_name, "0.30 s") * 10) / 10
+    assert width(parts["training-params"]) == web.SUMMARY_FLOOR_CH, "each tab its own"
+    assert web._line_width(long_name, "0.5–1.25 s") >= 332 / 8.4
+    assert (web._line_width("mmmm", "") > web._line_width("AAAA", "") > web._line_width("aaaa", "")
+            > web._line_width("iiii", "")), "wide, a capital, any other, narrow"
+    waiting = fragments(frame(params=long, staged=(
+        Staged("hold", 0.3, 0.45, Box("jake"), False, cid="w-1"),)), view())["params"]
+    assert "0.30 → 0.45 s" in waiting
+    assert width(waiting) == width(parts["params"]), "a change waiting moves no column"
+
+
+def test_the_editor_has_words_for_a_setting_find_hides_and_runtime_has_its_own_editor():
+    """The ledger's rulings for the summary and editor build's Task 3: each settings tab's editor
+    holds, hidden, the words it says where the find box hides the setting opened
+    (`FIND_HIDES_OPENED`), after its placeholder; and Runtime's Pinned strip is a summary of lines
+    (`#pinned`, empty until a person pins one; the page's script fills it) above an editor of its
+    own (`#pinned-editing`), which says `PINNED_EMPTY` while no pinned setting is opened (the
+    design's goal 9)."""
+    parts = fragments(frame(), view())
+    for key in ("params", "training-params"):
+        if 'class="editing"' not in parts[key]:
+            continue
+        editor = parts[key].partition('<div class="editing">')[2]
+        assert editor.startswith(f'<div class="placeholder">{web.EDITOR_EMPTY}</div>'
+                                 f'<div class="findhid" hidden>{html.escape(web.FIND_HIDES_OPENED)}</div>'), key
+    assert web.FIND_HIDES_OPENED == "the opened setting is hidden by find · clear find to see it"
+    document = page(parts, stale_after_s=30.0, nonce="n0nce", can_write=True)
+    pane = document[document.index('<section class="panel glass pins" id="pinned-pane"'):]
+    pane = pane[:pane.index("</section>")]
+    assert ('<div class="params" id="pinned-params"><div class="summary" id="pinned"></div>'
+            f'<div class="editing" id="pinned-editing"><div class="placeholder">{web.PINNED_EMPTY}'
+            '</div></div></div>') in pane
+    assert '<div class="cards" id="pinned">' not in document, "the strip holds lines, not boxes"
+
+
+def test_a_looks_line_says_its_segment_and_its_words_in_its_title():
+    """The pop-out revision's plan, Amendments, item 6 ("check the real looks' line widths too: a
+    look's words can be long"): a setting whose choices are looks, picked among segments (Task 5b),
+    says on its summary line what its segment says -- "Ring" for "Ring: inner fix_act_hole,
+    outer fix_act_size, color ..." -- its words whole in the line's title, and the line's width is
+    taken from the short label, so the pop-out's two looks leave its summary's columns as they
+    were; a change waiting says the segment it goes to, "Ring → Square" (the PI, 2026-11-20: "ring"
+    everywhere, not "Annulus"). A choice short enough
+    to stand whole says it whole."""
+    from wl_xcon.link import ParamRow, Staged
+    from wl_xcon.photometry import Gray
+    from wl_xcon.task import Annulus, Disc, P, Square
+
+    gray = Gray(P("fix_act_luminance"))
+    looks = (Disc(size=P("fix_act_size"), color=gray),
+             Annulus(inner=P("fix_act_hole"), outer=P("fix_act_size"), color=gray),
+             Square(size=P("fix_act_size"), color=gray))
+    row = ParamRow.of("fix_act_look", "appearance", None, None, looks[1], False, choices=looks,
+                      source="task", section="Stimuli/fixation point",
+                      label="Fixation shape at go")
+    disc, ring, square = row.choices
+    assert len(ring) > web.CHOICE_LABEL_LIMIT and row.words == ring
+    assert web._summary_value(row) == "Ring" and ring.startswith("Ring: ")
+    summary = web._summary(frame(params=(row,)), view(), False)
+    (line,) = re.findall(r'<button type="button" class="line[^"]*" data-open="fix_act_look".*?'
+                         r"</button>", summary)
+    assert '<span class="lv" data-now="Ring">Ring</span>' in line and "Annulus" not in line
+    assert html.escape(ring, quote=True) in line, "the words whole in its title"
+    assert web._line_width(row.label, "Ring") < web._line_width(row.label, ring)
+
+    # A pick is staged by its words, as the rig sends a look's change (Task 5b).
+    staged = Staged("fix_act_look", ring, square, Box("jake"), False, cid="c-1")
+    waiting = web._summary(frame(params=(row,), staged=(staged,)), view(), False)
+    assert ">Ring → Square</span>" in waiting, waiting
+
+    short = ParamRow.of("side", "word", None, None, "left", False, choices=("left", "right"),
+                        source="task")
+    assert web._summary_value(short) == "left"

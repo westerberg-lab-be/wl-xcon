@@ -85,16 +85,17 @@ def typed(seconds_before: float) -> str:
 def whole_point_task(folder: Path) -> Path:
     """A task whose target window is placed by a whole-point setting, written into `folder` as
     `whole_point.py`: the reference task with its target window at a whole-point parameter (a legal
-    form) and a fixation break its target could overlap. Until XC-156 was fixed `check()` raised
+    form, its points 4° from the center, inside the 5° its windows reach at their starting 2° and 3°
+    -- the layout at the values, since the reference task declares no window range) and a fixation break its target could overlap. Until XC-156 was fixed `check()` raised
     `TypeError` on it (the overlap test unpacked the window's place as a pair); now it loads, is
     checked to the end, and warns that the two windows can overlap."""
     text = Path("tasks/fixation_detection.py").read_text()
     for old, new in (
         ('            "target",\n            at=(P("target_x"), P("target_y")),',
          '            "target",\n            at=P("target_point"),'),
-        ('        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),',
-         '        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),\n'
-         '        Param("target_point", unit="deg", choices=((10.0, 0.0), (-10.0, 0.0))),'),
+        ('        Param("target_x", unit="deg", start=10.0),',
+         '        Param("target_x", unit="deg", start=10.0),\n'
+         '        Param("target_point", unit="deg", choices=((4.0, 0.0), (-4.0, 0.0))),'),
         ('                On(SaccadeTo("target"), "verify", do=[Mark(4098)]),',
          '                On(SaccadeTo("target"), "verify", do=[Mark(4098)]),\n'
          '                On(Exited("fix"), Outcome.FIXATION_BREAK),'),
@@ -110,6 +111,27 @@ def whole_point_task(folder: Path) -> Path:
     return path
 
 
+def grouped_task(folder: Path) -> Path:
+    """**A task with a group and a percent setting** (the console interface rework's Task 7),
+    written into `folder` as `grouped.py`: the reference detection task with its two holds in one
+    group, `Holds`, read as a sentence, and a fraction `hit_bar` its box shows as a percent, with a
+    plain name. Engine test material, run only in the simulator: the pop-out search's own groups
+    and percents are declared with the PI in wl-xtasks."""
+    text = Path("tasks/fixation_detection.py").read_text()
+    old = '        Param("fix_hold", unit="s", low=0.0, high=10.0, start=0.3, why=HOLD_WHY_10),'
+    assert text.count(old) == 1, old
+    text = text.replace(old, old + (
+        '\n        Param("hit_bar", unit="fraction", low=0.0, high=1.0, start=0.8, percent=True,'
+        ' label="Bar to pass"),'))
+    text += ("\n\nimport dataclasses as _dataclasses\nfrom wl_xcon.task import Group\n"
+             "TASK = _dataclasses.replace(TASK, groups=(Group(\"Holds\", (\"fix_hold\", "
+             "\"target_hold\"), \"Hold {fix_hold} on the cross, then {target_hold} on the "
+             "target\"),))\n")
+    path = Path(folder) / "grouped.py"
+    path.write_text(text)
+    return path
+
+
 def malformed_task(folder: Path) -> Path:
     """A task whose declaration `values` could not compare against, written into `folder`
     as `malformed.py`: the reference task with `fix_hold`'s lower bound typed as text.
@@ -117,10 +139,10 @@ def malformed_task(folder: Path) -> Path:
     and passes its checks -- and a starting value held against that bound raised
     `TypeError` out of the pre-flight (the b3a-1 final review, Important 1)."""
     text = Path("tasks/fixation_detection.py").read_text()
-    old = 'Param("fix_hold", unit="s", low=0.05, high=2.0, start=0.3),'
+    old = 'Param("fix_hold", unit="s", low=0.0, high=10.0, start=0.3, why=HOLD_WHY_10),'
     assert text.count(old) == 1, old
     path = Path(folder) / "malformed.py"
-    path.write_text(text.replace(old, 'Param("fix_hold", unit="s", low="0.05", high=2.0, start=0.3),'))
+    path.write_text(text.replace(old, 'Param("fix_hold", unit="s", low="0.0", high=10.0, start=0.3, why=HOLD_WHY_10),'))
     return path
 
 
@@ -152,9 +174,9 @@ def polar_task(folder: Path, *, name: str = "polar") -> Path:
          '"target", at=P("target_pos"), looks=P("target_appearance")'),
         ('            at=(P("target_x"), P("target_y")),\n            radius=P("target_window"),',
          '            at=P("target_pos"),\n            radius=P("target_window"),'),
-        ('        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),',
+        ('        Param("target_x", unit="deg", start=10.0),',
          '        Param("target_pos", unit="deg", choices=(Polar(8.0, 0.0), Polar(8.0, 45.0))),\n'
-         '        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),'),
+         '        Param("target_x", unit="deg", start=10.0),'),
         ("from wl_xcon.task import (", "from wl_xcon.task import (\n    Polar,"),
     ):
         assert text.count(old) == 1, old
@@ -268,9 +290,9 @@ def cue_task(folder: Path, *, name: str = "cue") -> Path:
          "\ndetection = Trial(\n"),
         ("            enter=[Show(FIX), Mark(4096)],",
          "            enter=[Show(FIX), Show(CUE), Mark(4096)],"),
-        ('        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),',
+        ('        Param("target_x", unit="deg", start=10.0),',
          '        Param("cue_pos", unit="deg", choices=(Polar(8.0, 0.0), Polar(8.0, 180.0))),\n'
-         '        Param("target_x", unit="deg", low=-16.0, high=16.0, start=10.0),'),
+         '        Param("target_x", unit="deg", start=10.0),'),
     ):
         assert text.count(old) == 1, old
         text = text.replace(old, new)
@@ -332,9 +354,9 @@ def search_by_choices(folder: Path, setting: str) -> Path:
     `search.py` (the review of XC-415's fix, M2, its input). Engine test material, run only in the
     simulator."""
     old, new = {
-        "set_size": ('Param("set_size", unit="objects", low=2, high=12)',
+        "set_size": ('Param("set_size", unit="objects", low=1, high=12, start=4, why=SET_SIZE_WHY, whole=True)',
                      'Param("set_size", unit="objects", choices=(4, 8))'),
-        "array_eccentricity": ('Param("array_eccentricity", unit="deg", low=5.0, high=14.0)',
+        "array_eccentricity": ('Param("array_eccentricity", unit="deg", low=0.0, start=8.0)',
                                'Param("array_eccentricity", unit="deg", choices=(6.0, 8.0))'),
     }[setting]
     text = Path("tasks/visual_search.py").read_text()

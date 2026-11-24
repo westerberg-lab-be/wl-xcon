@@ -225,6 +225,23 @@ def test_a_trial_line_says_where_each_stimulus_was_and_each_eyes_own_where_it_ha
             _is_at(drawn, ox, oy)
 
 
+def test_a_line_always_says_its_trial_kind_and_whether_it_stepped(tmp_path):
+    """The pop-out revision's Task 3, as wl-preproc accepted it on 2026-11-19 (XC-543, renaming
+    `kind` to `trial_kind`): every line carries both keys, so its shape does not move -- the kind
+    and the step as given, and null for each where a writer gives none, as a census does, which
+    runs no task's special trials and no staircase."""
+    record = SessionRecord.open(tmp_path, session_id="2027-01-14_01", subject="A")
+    for index, given in enumerate(({}, {"trial_kind": "normal", "stepped": True},
+                                   {"trial_kind": "target_absent", "stepped": False})):
+        record.trial(index=index, outcome="correct", params={}, run=0,
+                     position=Position.lone(index), fluid_ml=0.0, last_reward_at=None, placed=(),
+                     **given)
+    lines = [json.loads(line)
+             for line in (record.directory / "trials.jsonl").read_text().splitlines()]
+    assert [(line["trial_kind"], line["stepped"]) for line in lines] == [
+        (None, None), ("normal", True), ("target_absent", False)]
+
+
 def test_a_stimulus_with_a_disparity_is_recorded_at_its_cyclopean_position(tmp_path):
     """XC-399 (the review's M2): a disparity shifts each eye's image by -d/2 and +d/2 about the
     stimulus's position (engine spec §5.4); the record writes that position, the eyes' midpoint,
@@ -342,6 +359,75 @@ def test_a_stimulus_whose_appearance_is_a_setting_has_its_arrays_objects_only_wh
     assert (ring["drawn"], ring["target"]) == (True, 0)
     for drawn, (x, y) in zip(ring["objects"], _angles.ring(5.0, 0.0, 2.0, 90.0, 2), strict=True):
         _is_at(drawn, x, y)
+
+
+def test_an_array_with_no_target_writes_target_null_and_its_odd_place(tmp_path):
+    """XC-543, as wl-preproc answered it on 2026-11-19: an array found by `"none"` (a catch) writes
+    `target: null` and the index it declares, where an odd one would be, under its own key
+    `odd_place`; every other array writes its target and `odd_place: null`, the key always
+    written, as `size_deg` and `window_deg` are. Each array entry says what names its target
+    (`found_by`), and each object whether it was drawn (`drawn`), false at a place left empty."""
+    from wl_xcon.task import Array, Blank, Disc, P, Stimulus
+
+    catch = Stimulus("catch", at=(0.0, 0.0), looks=Array(
+        n=3, radius=4.0, target=P("odd"), looks=Blank(), among=Disc(size=1.0), found_by="none"))
+    search = Stimulus("search", at=(0.0, 0.0), looks=Array(n=3, radius=4.0, target=P("odd")))
+    cued = Stimulus("cued", at=(0.0, 0.0), looks=Array(n=3, radius=4.0, found_by="cue"))
+    none, look, cue = _line(tmp_path, (_shown(catch, 2), _shown(search, 2), _shown(cued, 2)),
+                            {"odd": 1})
+    assert (none["found_by"], none["target"], none["odd_place"]) == ("none", None, 1)
+    assert [each["drawn"] for each in none["objects"]] == [True, False, True]
+    assert (look["found_by"], look["target"], look["odd_place"]) == ("look", 1, None)
+    assert [each["drawn"] for each in look["objects"]] == [True, True, True]
+    assert (cue["found_by"], cue["target"], cue["odd_place"]) == ("cue", 0, None)
+    assert "odd_place" not in _line(tmp_path / "plain", (_shown(Stimulus(
+        "dot", at=(0.0, 0.0), looks=Disc()), 2),))[0]
+
+
+def test_each_look_drawn_in_a_color_sets_light_writes_its_light_xy(tmp_path):
+    """**`light_xy`** (accepted by wl-preproc 2026-11-18 as named): each `stimuli[]` entry and each
+    of an array's `objects[]` has the key, always: the CIE 1931 `[x, y]` of the light a color set's
+    light draws it in, at its saturation (a setting's value read from the line), as the rig draws
+    it on the run's panel (`photometry.colorset_xy`); null for the array's own entry, for a look in
+    no color set's light, and with no calibration to read it on."""
+    from wl_xcon import photometry
+    from wl_xcon.task import Array, Disc, P, Stimulus
+
+    isohue = photometry.ColorSet.load(Path(__file__).parent / "fixtures" / "isohue.json")
+    red = photometry.ColorSetLight(isohue, "red", saturation=P("pale"))
+    blue = photometry.ColorSetLight(isohue, "blue", fraction=0.5)
+    placed = (
+        _shown(Stimulus("odd", at=(5.0, 0.0), looks=Disc(size=1.0, color=red)), 3),
+        _shown(Stimulus("gray", at=(0.0, 0.0), looks=Disc(size=0.5, color=photometry.Gray(20.0))),
+               3),
+        _shown(Stimulus("ring", at=(0.0, 0.0), looks=Array(
+            n=3, radius=4.0, looks=Disc(size=1.0, color=red), among=Disc(size=1.0, color=blue))),
+            3),
+    )
+    record = SessionRecord.open(tmp_path, session_id="2027-01-14_01", subject="A")
+    record.trial(index=1, outcome="correct", params={"pale": 0.5}, run=0,
+                 position=Position.lone(1), fluid_ml=0.0, last_reward_at=None, placed=placed,
+                 calibration=photometry.SRGB)
+    odd, gray, ring = json.loads((record.directory / "trials.jsonl").read_text())["stimuli"]
+
+    drawn, _ = photometry.colorset_xy(photometry.ColorSetLight(isohue, "red", saturation=0.5),
+                                      photometry.SRGB)
+    assert odd["light_xy"] == list(drawn)
+    assert drawn != photometry.realized(isohue, photometry.SRGB).xy["red"]
+    assert gray["light_xy"] is None
+    assert ring["light_xy"] is None
+    assert [each["light_xy"] for each in ring["objects"]] == [list(drawn)] + [
+        list(photometry.realized(isohue, photometry.SRGB).xy["blue"])] * 2
+    (plain,) = _stimuli_of(tmp_path / "plain", placed[:1], {"pale": 0.5})
+    assert "light_xy" in plain and plain["light_xy"] is None
+
+
+def _stimuli_of(folder, placed, params) -> list[dict]:
+    """The `stimuli` of one line written with no calibration (a census's)."""
+    record = SessionRecord.open(folder, session_id="2027-01-14_01", subject="A")
+    record.trial(index=1, outcome="correct", params=params, run=0, position=Position.lone(1),
+                 fluid_ml=0.0, last_reward_at=None, placed=placed)
+    return json.loads((record.directory / "trials.jsonl").read_text())["stimuli"]
 
 
 def test_a_trial_row_is_never_written_without_what_it_showed(tmp_path):
@@ -927,3 +1013,40 @@ def test_a_warning_row_says_what_was_accepted_by_whom_when_and_in_which_kind(tmp
                    "accepted_in": ["training", "piloting", "recording"], "session_kind": "training",
                    "by": {"kind": "box", "name": "jake"}, "at": 1_800_000_000.0,
                    "at_local": _local(1_800_000_000.0), "how": "open", "run": None}
+
+
+def test_the_record_writes_each_objects_size_and_window(tmp_path):
+    """The console settings design's §5 and the wl-preproc ask of 2026-11-17 (XC-513, group 2):
+    each `stimuli[]` entry's `size_deg`, its look's size as drawn at its place, null for an array
+    and for a look with no single `size`; each object's own `size_deg` and `window_deg`, both keys
+    always written, `window_deg` null where the array has no object window; and a scaling the
+    line's `params` value for its setting, `{"class": "Scaled", "fields": {"factor": 0.3}}`. A ring
+    about (4°, 0°) scaled by 0.3 gives each object its own size at its own true eccentricity, and a
+    window ratio of 3 gives each 1.5 times its size."""
+    from wl_xcon.geometry import polar_of_deg
+    from wl_xcon.task import Array, Disc, Gabor, ObjectWindows, P, Scaled, Stimulus
+
+    disc = Disc(size=P("disc_size"))
+    ring = _shown(Stimulus("search", at=(4.0, 0.0),
+                           looks=Array(n=4, radius=4.0, looks=disc, among=disc)), 5)
+    fix = _shown(Stimulus("fix", at=(0.0, 0.0), looks=Disc(size=P("fix_size"))), 1)
+    gabor = _shown(Stimulus("g", at=(5.0, 0.0), looks=Gabor()), 2)
+    windows = (ObjectWindows(of="search", scale=3.0),)
+    record = SessionRecord.open(tmp_path, session_id="2027-01-14_01", subject="A")
+    record.trial(index=1, outcome="correct", run=0, position=Position.lone(1), fluid_ml=0.0,
+                 last_reward_at=None, placed=(fix, gabor, ring), object_windows=windows,
+                 params={"disc_size": Scaled(0.3), "fix_size": 0.3})
+    line = json.loads((record.directory / "trials.jsonl").read_text())
+    assert line["params"]["disc_size"] == {"class": "Scaled", "fields": {"factor": 0.3}}
+    shown_fix, shown_gabor, shown_ring = line["stimuli"]
+    assert (shown_fix["size_deg"], shown_gabor["size_deg"], shown_ring["size_deg"]) == (
+        0.3, None, None)
+    assert len(shown_ring["objects"]) == 4
+    for drawn in shown_ring["objects"]:
+        own = 0.3 * polar_of_deg(drawn["x"], drawn["y"])[0]
+        assert drawn["size_deg"] == pytest.approx(own, abs=1e-12)
+        assert drawn["window_deg"] == pytest.approx(1.5 * own, abs=1e-12)
+    assert shown_ring["objects"][0]["size_deg"] == pytest.approx(2.4, abs=1e-12)
+    # No object window: both keys still written, the window null; a size in degrees as itself.
+    (alone,) = _line(tmp_path / "plain", (ring,), params={"disc_size": 1.0})
+    assert [(o["size_deg"], o["window_deg"]) for o in alone["objects"]] == [(1.0, None)] * 4

@@ -12,6 +12,8 @@ sections below keep their headings as sent. **And one from the pop-out search, o
 **answered 2026-11-14** (wl-preproc's session, by message): accepted, with one rename, the trial line's `realized` now
 `color_realized`. **And one from demo mode, opened and answered 2026-11-14**, the last section.
 
+**Answered 2026-11-19 (XC-529, by message from wl-preproc's session):** the console interface rework's one new change kind, `withdrawn`, accepted as named by the PI: appended after `shaping`, not strobed, `was` equal to `now`, `cid`, `withdrawn` and `staged_by` as written, one row for each setting a withdrawn act covers, all sharing one fresh change id; Apply all adds no shape; a refused withdrawal writes no row. The last section of this file, kept as sent.
+
 **Updated 2026-10-11.** Of the four asks opened in August, **all four are done**; each is marked below
 with wl-preproc's evidence, and the headings are left as they were. What is open now is XC-288's ask
 (XC-321), the asks of engine spec §21 and the older backlog items, all delivered 2026-10-11 and listed
@@ -1140,3 +1142,301 @@ you only when someone points you at one.
 ## What is deliberately not asked for
 
 Nothing in the trial lines marks a demo, and nothing should: the session is the unit, and its `config.json` says it.
+
+# ANSWERED 2026-11-18 — the console settings: forms, scaled sizes, a light's saturation, the training switch (new, 2026-11-16)
+
+**Accepted by wl-preproc 2026-11-18, in full** (groups 1 to 4 and the 2026-11-18 addendum, no renames), with one change
+of ours told to it first and accepted as named: **a light's saturation now scales its CAM16-UCS chroma at a fixed hue**
+(the PI's answer of 2026-11-18, COL-39), so group 3's xy formula is gone and each look's `light_xy` takes its place
+(below). Closed XC-513.
+
+Opened 2026-11-16 on the PI's approved design (`docs/superpowers/specs/2026-11-16-console-settings-design.md`, §9: "Before
+anything here ships, it is told the new shapes and accepts them, as with XC-491 and XC-502"), backlog XC-513, **before
+any of these shapes is written**. Four groups, all shapes JSON, all read against our source on 2026-11-17
+(`wl_xcon/record.py`'s `KINDS` and `STROBED`, `taskd.Session._given_by`, `taskd._color_sets` and `_realization`, the trial
+line's `drawn` and the block end's `varied`). Yours to accept, rename or refuse before we write them; until your answer we
+build to these names.
+
+## What changes on our side
+
+**1. A setting a person draws or scales, in the console.** A person may now give a timing setting a draw (a uniform, a
+normal, a non-aging wait, a list, weights), or a size setting a scaling by eccentricity, where today a person gives a
+value, or changes the numbers of a draw the task declared.
+
+- **`parameter_changes.jsonl` gains kind `form`**, appended after `declined` (`KINDS` is appended only). **It strobes
+  `PARAM_CHANGED`, so it carries a `sequence`** as a `set`, `hand_back`, `range` and `revert` row does; `STROBED` becomes
+  exactly those five by name (today it is the first four of `KINDS` by place, which `form`'s place after `declined` no
+  longer allows). A reader's rule is unchanged: the n-th row of a strobed kind joins the n-th `PARAM_CHANGE`.
+- **`now` is the person's form**, written as the record writes any declared draw (`variation.recorded`), every field,
+  `repeat` included, and for a person's form `repeat` is always `"fresh"`:
+
+  ```json
+  {"class": "NonAging", "fields": {"minimum": 0.75, "mean": 0.9166666666666666, "maximum": 1.25, "repeat": "fresh"}}
+  ```
+
+  **A scaling** (a size as a factor times each object's own eccentricity, its true angle from straight ahead) is `{"class": "Scaled", "fields": {"factor":
+  0.3}}`.
+- **`was`** follows the rule every change row's `was` follows (`taskd.Session._given_by`): null where a draw, a staircase,
+  a pool or the conditions gave the setting, since no single value was held; the person's value or earlier form where one
+  stood; otherwise the run's value.
+- **`detail` gains `"shape"`**, one of `non_aging`, `uniform`, `normal`, `list`, `weights` or `scaled`, so a reader can
+  tell the form's kind without reading its class.
+- **A form ends** by a `set` row (a person gives a value), a `hand_back` row (its `was` the form), or `revert` rows (their
+  `was` and `now` forms or values, as a revert's rows say today).
+- **Each trial line's `drawn[name]` is the form row's `change` id**, an integer, exactly as it is for a range changed
+  live (the C3 ask: "the integer `change` id of the live act that put the range in force"). Its `params[name]` is the
+  value drawn, or, for a scaling, the `Scaled` object as written above.
+- **A block end's `varied[name]` entry** is `{"by": "draw", "from": <that id>, "distribution": <the form's `now`>}` for a
+  draw, as C3 wrote it, or **`{"by": "scaled", "from": <id>, "factor": <f>}`** for a scaling, a new `by` beside
+  `condition`, `draw` and `person`.
+- **A non-aging wait's mean, where a person gives one, is derived** in the console from its two ends: shortest + (longest
+  - shortest) / 3, so `0.75` to `1.25` gives the `0.9166666666666666` above (a ratio of 3 between the range and the
+  exponential's scale, `R/τ = 3.0`). A non-aging wait a task declares is written as declared, with the mean the task gave.
+
+**2. A scaled size and its window.** A look's size may be a factor times its own eccentricity, and an object window's
+radius a multiple of its object's radius; the record gives both in degrees, so a reader needs neither rule.
+
+- **Each `stimuli[]` entry of a trial line gains `size_deg`**: the look's size as drawn at its place, in degrees. Null for
+  an array (its objects carry theirs) and for a look with no single `size`. (This entry's existing `drawn` is a boolean
+  about its appearance, unrelated to the line's `drawn` object.)
+- **Each `objects[]` entry gains `size_deg` and `window_deg`**: the object's size and its object window's radius, both in
+  degrees, **both keys always written**, `window_deg` null where the array has no object window.
+- **An object window may be declared as a multiple of its object's radius.** Its setting's value is then that multiple, so
+  the pop-out search's `object_window` is `3.0` to start where it was `1.5` degrees; `window_deg` gives the degrees, which
+  is what a reader uses.
+
+**3. A color by set, with a hue, a saturation and two levels.** Where a color set's light is drawn at a hue, a
+saturation and a luminance a person may move.
+
+- **The `ColorSetLight` form gains `"saturation"`**, always written: a number, `1.0` by default, or a setting by reference,
+  beside the form's `color`, `colorset`, `fraction` and `luminance` (the set still by name alone).
+- **Each realization entry gains `"macaque_row": [rX, rY, rZ]`**: the start row's `color_sets[set].realized[]` entries and a
+  trial line's `color_realized[set][]` entries, beside their `luminance_cd_m2`, `desaturation`, `xy`, `xyz` and `drive`.
+  It is the calibration's macaque luminance row (the weights that turn an XYZ into the light's macaque luminance).
+- **Each `color_sets[set]` gains `"design"`**, `{"space": "CAM16-UCS", "gray_lightness": 65.0, "chroma": 29.49}` for a set
+  generated at equal hue steps and null for a set written by hand.
+- **Each `stimuli[]` entry and each `objects[]` entry of a trial line gains `light_xy`** (accepted by wl-preproc
+  2026-11-18, the PI's CAM16-UCS answer; it replaces the xy formula first asked): the CIE 1931 `[x, y]` of the light
+  the look is drawn in, where a color set's light draws it (`ColorSetLight`), after the saturation and any
+  desaturation the realization applied; null for an array's entry (its objects carry theirs), for a look in no color
+  set's light, and where it cannot be read; **both keys always written**, as `size_deg` and `window_deg` are. Computed
+  as the line is written, between trials, never in a frame.
+- **How a reader computes a look's light at any saturation**, from `light_xy`:
+  - `u = (x/y, 1, (1 − x − y)/y)`;
+  - its macaque luminance: `L = fraction × luminance`;
+  - its XYZ: `XYZ = u × L / (macaque_row · u)`.
+
+**4. The training switch.** The trainer's switch for the progression's help, beside the drumming and clear switches.
+
+- **Change kind `shaping`**, appended after `form`, **not strobed** (no `sequence`; your clock fit times it by `at`, as
+  for a `training` or `drum` row): `name` `"shaping"`, `was` and `now` each one of `"on"`, `"frozen"` or `"full"`, and
+  `meaning` null.
+- **Each trial line gains `"shaping"`**, the switch's state for that trial.
+- **`drawn[name]` may be `"full"`**, a new source token beside `task`, `block`, `condition`, `staircase` and `pool`, for
+  a value the task's full version gives.
+- **A run starts `"on"`.** Nothing is added to the start row.
+- **Added 2026-11-18 by the build's Task 10, sent 2026-11-18 by message** (two shapes the switch needs that the
+  ask above did not name): a block end's **`ended` may be `"shaping"`**, beside `rule`, `time`,
+  `fall_back`, `next`, `back`, `run_time` and `run`, for the stage the full task's start closes and
+  for the full task's block as training is switched on again, `by` who switched (the full task is a
+  block of its own, and so is the stage it reopens); and **a revert that takes the switch back
+  writes a `shaping` row**, not a `revert` row, of the revert's `change` id, still strobing nothing
+  and with no `sequence`, **with the revert's `moment`** beside it, as a revert's rows name it.
+
+## The ask
+
+1. Accept the names and shapes above, or rename them before we write them.
+2. Say whether your reader needs anything else of a `form` or `shaping` row. Until you read `form` and `shaping`, they are
+   published as written and noted as kinds it does not yet know, as `suggested` and `declined` were.
+
+## What is deliberately not asked for
+
+- The new warning codes: they are values in `warnings.jsonl`'s `code`, not shapes.
+- Sections and limit reasons: the task's declaration, which the record hashes as before.
+- Any timing claim: `form`'s mean and `size_deg` are arithmetic on declared numbers.
+
+---
+
+# ANSWERED 2026-11-19 — the console interface rework: a withdrawn change, and Apply all (new, 2026-11-19)
+
+> **Accepted by wl-preproc 2026-11-19, as named, no renames. Built to the names below on 2026-11-19** (the console interface plan's Task 4:
+> `record.KINDS` gains `withdrawn`, written by `taskd.Session._withdrawn`); renamed here and there if
+> you rename them, (the merge no longer waits on it).
+
+Opened 2026-11-19 on the PI's approved design (`docs/superpowers/specs/2026-11-19-console-interface-design.md`, "The
+record": "wl-preproc is told first, as XC-513 was"), backlog XC-529, **before the shape is written**. One change kind and
+nothing else, read against our source on 2026-11-19 (`wl_xcon/record.py`'s `KINDS`, `STROBED` and `change()`,
+`taskd.Session._staged`, `_pending`, `_apply_staged`, `_apply_pending`, `_given_by`). Yours to accept, rename or refuse;
+until your answer we build to these names.
+
+## What changes on our side
+
+The console gains **withdraw**: after a person's Apply (a card's, a group box's or Apply all) and until the next trial
+starts, the change is waiting, and the person may take it back. A group box's Apply and an Apply all are each one act,
+judged together, so a withdrawal takes back the whole of it. **A reward size is left out of both** (Apply all and
+withdraw; XC-527), so no welfare ceiling is in a withdrawn act.
+
+**When a change's row is written, which decides the shape.** A change is *staged* when the person sends it
+(`Session._staged`, with `_pending` for a hand-back, a range and a form) and is *applied* at the next boundary,
+between trials, by `_apply_staged`, which in one pass gives each its change id, strobes `PARAM_CHANGED`, takes its
+`sequence` and writes its row (`SessionRecord.change`). Nothing is written or strobed while it waits. So a change
+withdrawn while it waits **has no row, no `change` id and no strobe**: the record would say nothing of it, nor of who
+proposed it. And a change that has applied cannot be withdrawn (the console offers withdraw only until the boundary; a
+withdraw that arrives after it finds nothing waiting and is answered as refused, writing no row). That is why the
+withdrawal cannot name a change id: it names the id the console's page made for the command (`cid`), which the rig
+holds with the waiting change.
+
+**1. Change kind `withdrawn`**, appended after `shaping` (`KINDS` is appended only):
+
+```json
+{"change": 14, "kind": "withdrawn", "name": "ring_radius", "was": 6.0, "now": 6.0,
+ "by": {"...": "an Actor, as every row's"}, "at": 1763558712.4, "at_local": "2026-11-19T08:25:12.4-05:00",
+ "trial_number": 31, "run": 1, "meaning": null, "offered": [], "odds": null, "event_code": null,
+ "cid": "c-9f3a2b7e41",
+ "withdrawn": {"kind": "set", "now": 8.0},
+ "staged_by": {"...": "an Actor, or null"}}
+```
+
+- **One row for each setting the withdrawn act covers**, as the log writes one row for each setting an act moves, all
+  rows of one withdrawal sharing one `change` id (a revert's rows do). An Apply all of three settings, withdrawn, is
+  three rows, one `change` and one `cid`. A reader needs no list of the covered names beside them: they are the `name`s
+  of the rows of that `change`.
+- **`change`** is a fresh id from the same counter as every act's, taken when the withdrawal is made. It is not the
+  withdrawn act's (it never had one). The ids stay in the order the rows are written.
+- **`cid`**: the command id the console's page made for the Apply the person is taking back, a string of at most 64
+  printable characters. Opaque to you; it is there so a person reading the record can tell which Apply it was.
+- **`name`**: the setting, never empty. **`meaning`** null, **`offered`** `[]` and **`odds`** null, as any row of a kind
+  that moves no task setting writes them.
+- **`was` and `now` are equal**: the value the setting held and still holds, written by the rule every row's `was`
+  follows (`taskd.Session._given_by`): null where a draw, a staircase, a pool or the conditions give the setting, since no
+  single value was held. **Why equal rather than the waiting value in `now`**: nothing moved, and a reader who follows a
+  setting by the `now` of its rows reads the right value after a withdrawal with no special case.
+- **`withdrawn`**, the kind's own field: `{"kind": <the kind the row would have been: set, hand_back, range or
+  form>, "now": <what it would have written as `now`>}`, so the record says what was taken back. For a `set` it is the
+  value; for a `hand_back` it is null; for a `range` and a `form` it is the draw as written by `variation.recorded`.
+- **`by` and `at`**: who withdrew, and the instant, on the session's anchored clock, written as every row's (`at`
+  number and `at_local`). **`staged_by`**: who sent the change taken back, an Actor map or null, since otherwise no
+  row anywhere says who proposed it. (We hold the person's name for it, not the instant it was sent, so there is no
+  `staged_at`.)
+- **`trial_number`**: the first trial the withdrawn change would have applied to (the next trial to start), as an
+  applied row's; **`run`** the run it happened in.
+- **It does not strobe, and carries no `sequence`.** It changes nothing on screen and nothing a recording could align
+  to, and the strobe of the change it takes back never went out, since `_apply_staged` strobes as it applies. So
+  `STROBED` is unchanged: the n-th row of a strobed kind still joins the n-th `PARAM_CHANGE`, and a withdrawal sits
+  between those rows without disturbing the count. **`event_code` is null**, as for a `shaping` row; your clock fit
+  times it by `at`.
+
+**2. Apply all adds no shape, and nothing is asked for it.** Each setting it applies is its own row of its own act,
+as today, one `change` id, one strobe and one `sequence` each, written in the one `_apply_staged` pass at one boundary.
+We considered a marker on those rows saying they were applied together and found no reader of it: the one thing it
+would join, a withdrawal to the rows it took back, cannot exist, because a withdrawn act has no applied rows and an
+applied one cannot be withdrawn. The rows' `trial_number` and `at` already say they applied together, and a person who
+wants to know what one Apply did reads the rows between two trials. A marker would be a field every row carried for a
+join that never happens.
+
+## The ask
+
+1. Accept the name and shape above (kind `withdrawn`, appended after `shaping`; not strobed; `was` equal to `now`;
+   `cid`, `withdrawn` and `staged_by`; one row for each covered setting), or rename them before we write them.
+2. Say whether your reader needs anything else of a `withdrawn` row. Until you read it, it is published as written and
+   noted as a kind it does not yet know, as `suggested`, `declined`, `form` and `shaping` were.
+
+## What is deliberately not asked for
+
+- Any shape for Apply all or a group box's Apply (above): their rows are the rows of today.
+- A refused withdraw (one that finds nothing waiting) writes no row: it answers the console as refused, as a refused
+  value does where it is not a welfare ceiling's.
+- A reward size in either command: not built (XC-527).
+- Any timing claim: nothing here is measured.
+
+---
+
+# ANSWERED 2026-11-19 — the pop-out's revision: each trial's kind, whether it stepped, the go, and seven codes (new, 2026-11-19)
+
+> **Accepted by wl-preproc 2026-11-19 with two changes, both built (XC-543 closed).** (1) An array found by `"none"` writes
+> `target: null`, and the place an odd one would hold under its own key, `odd_place` (the index among the array's
+> objects); on every other array `odd_place` is absent or null. (2) The trial line's `kind` is renamed **`trial_kind`**
+> (same values, always written). Accepted as written: `stepped`, the start row's `specials`, `found_by`, `objects[].drawn`,
+> the looks and `go_delay` as params, the go as the fix entry's `update` with `changed: ["looks"]`, and items 6 and 8.
+> Codes 4139-4145 are not theirs to name (wl-xtasks' range, ADR-0007); no objection. **A correction to item 7:**
+> `correct_reject` and `false_alarm` are **not** in wl-preproc's frozen layer; they are ours (`wl_xcon/task.py`,
+> allocation 4123 and 4124), strobed as `TRIAL_CORRECT` and `TRIAL_ERROR` by our `codes.py`. The text below is the ask as
+> sent; read `kind` as `trial_kind` and item 3's target as above.
+
+Opened 2026-11-19 on the PI's approved design (`docs/superpowers/specs/2026-11-16-popout-revision-design.md`), backlog
+XC-543, **before any of these shapes is written**, as XC-491 and XC-513 were. Read against our source on 2026-11-19
+(`tasks/allocation.py`, `wl_xcon/record.py`, the trial line's `stimuli[]` and `objects[]`). Yours to accept, rename or
+refuse; until your answer we build to these names. To be sent to wl-preproc's session by message, by the controller.
+
+**Codes 4139-4145 are free.** Checked 2026-11-19: our allocation's highest is 4138 (`TIMEOUT_ON`), and your frozen
+`contracts/events.py` (wl-preproc `de004dbf`, read in source, not its README) allocates nothing in 4096-32767 (it names
+the range wl-xtasks', line 25), and holds none of 4139-4145 as a decimal or a hex literal. The codes are a task's, held in
+our `tasks/allocation.py` until wl-xtasks publishes its allocation (ADR-0007); they are told here so a reader may name
+them.
+
+| Code | Name | Strobed |
+|---|---|---|
+| 4139 | `GO_CUE` | the frame the fixation point takes its act look is decided, drawn on the next flip, normal and catch trials alike |
+| 4140 | `CATCH_FIXATION_HELD` | a catch's `catch_hold` completes, before `OUTCOME_CORRECT_REJECT` and `REWARD_COMMANDED` |
+| 4141 | `CATCH_FIXATION_BREAK` | gaze leaves the fixation window on a catch after the go, before `TIMEOUT_ON` |
+| 4142 | `SPECIAL_TARGET_ABSENT` | on the array's frame, after `ARRAY_ON` |
+| 4143 | `SPECIAL_ODD_PLACE_EMPTY` | likewise |
+| 4144 | `SPECIAL_DISTRACTOR_ALONE` | likewise |
+| 4145 | `SPECIAL_ODD_ONE_ALONE` | likewise |
+
+## What changes on our side
+
+**1. Each trial line gains `kind` (answered: `trial_kind`) and `stepped`**, always written.
+- `kind`: `"normal"` or a special kind's name (`"target_absent"`, `"odd_place_empty"`, `"distractor_alone"`,
+  `"odd_one_alone"`) for a task declaring special trials; `null` for one declaring none. The line's `structure` names the
+  structure it played.
+- `stepped`: `true` where the trial's outcome counted on its block's staircase (a success or a failure, TSK-33, on a trial
+  whose value the staircase gave); `false` where it moved nothing on it (a special trial, a value a person held, or an
+  outcome that is neither, an early saccade among them); `null` where the block has none. A level's move is read from the
+  next line's `params`, as today.
+- On a lone kind the line's `set_size` is the stage's value, which its array does not read; the objects drawn are its
+  `stimuli` entry's.
+
+**2. The start row gains `specials`**: `{"target_absent": {"share": "target_absent_percent", "structure":
+"target_absent"}, ...}` in declared order, or `null`. Each trial's percentages are in its `params`.
+
+**3. An array entry of `stimuli[]` gains `found_by`** (`"look"`, `"cue"` or `"none"`), and **each `objects[]` entry gains
+`drawn`**, false for a place left empty (beside XC-513's `size_deg` and `window_deg`). An array found by `"none"` has no
+target; its `target` is the index declared, the place an odd one would hold.
+
+**4. The fixation point's two looks** add no key. They are settings in `params`: `fix_look` and `fix_act_look`,
+appearances in REC-27's form; `fix_color` and `fix_act_color`, color-set lights with XC-513's `saturation`. The go is the
+`fix` entry of kind `"update"`, `changed: ["looks"]`, at the go's frame.
+
+**5. `go_delay`** is a setting in `params`, and drawn, in `drawn` as any form (XC-513).
+
+**6. The go and reaction time.** The task's reaction time runs from `GO_CUE` to `SACCADE_ONSET` (4098), no longer from
+`ARRAY_ON` (4103); with `go_delay` 0 the two are on one frame. Where a reader derives one, it starts at `GO_CUE`.
+
+**7. Two outcomes this work now reaches**, said to be in the frozen layer (answered: they are not; they are ours, see the note at the top): `correct_reject`, a catch held;
+`false_alarm`, a catch broken (reasons 4123, 4124).
+
+**8. Told, not asked:** a state whose wait is 0 now lasts no frame, so a trial with a zero `timeout` ends on the frame of
+its error, one frame sooner than before.
+
+## The ask
+
+1. Accept the names and shapes above, or rename them before we write them (the codes' names included).
+2. Say whether your reader needs anything else of `kind`, `stepped`, `specials`, `found_by` or `drawn`.
+
+## What is deliberately not asked for
+
+- The new warning codes (`specials-over-100`, `fixation-hidden-at-go`): values in `warnings.jsonl`'s `code`, not shapes.
+- The new settings' names: values in `params`.
+- Any timing claim: nothing here is measured; the one-frame note in item 8 is a consequence of the engine's rule, not a
+  figure.
+
+## Told, not asked (added 2026-11-19, on the answer; the record's shape is unchanged by either)
+
+- **The start row's `specials` is written with sorted keys**, not in the declared order above: `record.run_row` sorts
+  every row's keys. The declared order is the task's (its hash is on the start row), so a reader reproducing the draw
+  takes the order from the task, not from the row.
+- **A new wire command, `choice`** (`link.SetChoice`, kind `"choice"`): the console picks a setting's choice by its
+  words, a look's shape among them (`fix_look`, `fix_act_look`). It is recorded as an ordinary value set (a `set` change of
+  the setting, as any other), with no new record shape.
+

@@ -40,7 +40,12 @@ release between two frames is seen once.
   `EASE_SLACK_S` more, at most `LIVE_S`, the arrival frame its first (planner's call; the slack
   since the whole-build review's I2). So a hand's path reaches the detector as motion, a glide
   whose reports come a little irregularly is one saccade, and a one-report flick is still a
-  saccade; reports one a frame are taken exactly, with no slack. A first report, and the first
+  saccade; reports one a frame are taken exactly, with no slack, **but only in a stream**: every
+  report since the eye was found the frame after the one before. A report a frame after one that
+  came after a gap -- a flick's, the frame after a still pointer's (the 100 ms report), as a hand
+  that moves just after one is reported -- is eased with the slack too, since taken in its one
+  frame it is a jump the detector never confirms, a look that lands nowhere (2026-11-19, the
+  pop-out played with the mouse ending astray). A first report, and the first
   after the one in hand went stale (`LIVE_S`), is taken at once, where the pointer is, as a
   tracker finds the eye again: between trials, and mid-trial too, where a page's stall past
   `LIVE_S` that ends inside the task's `tracker_lost` grace moves the eye at once to where it
@@ -154,8 +159,9 @@ LIVE_S = 0.5
 #: assumed, not measured), so a move eased over only the gap before it could land and stop before
 #: the next report, and a glide reached the detector as two saccades. 25 ms, a frame and a half at
 #: 60 Hz, is what the review's probe found keeping 400 ms and 600 ms glides one saccade at 2-12 ms
-#: round trips, as `tests/test_pointer.py`'s glide test holds; only a report more than a frame
-#: after the one before takes it. Playable, and claiming nothing. **What it costs** (the build's
+#: round trips, as `tests/test_pointer.py`'s glide test holds; only a report continuing a stream
+#: of one a frame goes without it (`Source._adopt`; since 2026-11-19, before which a report a
+#: frame after any other did). Playable, and claiming nothing. **What it costs** (the build's
 #: re-review, N4; from `tools/measure_demo_ease_slack.py`, on an injected clock with assumed report
 #: timings, `docs/measurements/dev-machine/2026-11-16-demo-ease-slack.md`; not timing claims about
 #: a rig): the eye trails the hand by about 21 ms more, so a hand that leaves less than about that
@@ -273,6 +279,9 @@ class Source:
         self._start = 0.0
         self._span = 0.0
         self._landed = True
+        #: **Whether the reports are a stream of one a frame** (`_adopt`): every one since the eye
+        #: was found (a report taken at once) the frame after the one before.
+        self._streaming = False
         #: **The keys**: the held mask and the press counts in hand and as the previous frame had
         #: them, and the frame's edges, bit `k - 1` for key `k`.
         self._held_now = 0
@@ -408,21 +417,27 @@ class Source:
     def _adopt(self, now: float) -> None:
         """**The kept report becomes the one in hand**, arriving `now`. Over the drawing, the
         pointer is eased from where it is drawn now to the report's position, over the time since
-        the previous report arrived, and `EASE_SLACK_S` more when that was over a frame, at most
-        `LIVE_S`, starting a frame before `now` so that the arrival frame is the move's first (the
-        module docstring); a first report is taken at once, as is the first after the one in hand
-        went stale, and one where the pointer already goes leaves the move in flight as it was.
-        Off the drawing, it is at `AWAY_DEG` at once. Its keys and button are taken as they are;
-        the edges are `_edges`'."""
+        the previous report arrived, and `EASE_SLACK_S` more unless the report continues a stream
+        of one a frame (`_streaming`), at most `LIVE_S`, starting a frame before `now` so that the
+        arrival frame is the move's first (the module docstring); a first report is taken at once,
+        as is the first after the one in hand went stale, and one where the pointer already goes
+        leaves the move in flight as it was. Off the drawing, it is at `AWAY_DEG` at once. Its keys
+        and button are taken as they are; the edges are `_edges`'."""
         fields = self._kept
         x = fields.xy[0]
         y = fields.xy[1]
         flags = fields.raw[_FLAGS]
+        live = self._live(now)
+        gap = now - self._arrived
+        # **A stream of one a frame** goes on while each report comes the frame after the one
+        # before (half a frame's margin for the clock's rounding), and begins where the eye is
+        # found, a report taken at once; a report after a gap ends it, whatever it carries.
+        streaming = (self._streaming and gap <= 1.5 * self._step) if live else True
         if not flags & OVER:
             self._x = self._to_x = _AWAY_X
             self._y = self._to_y = _AWAY_Y
             self._landed = True
-        elif not self._live(now):
+        elif not live:
             # **A first report, or the first after the one in hand went stale** (`LIVE_S`): taken
             # at once, as a tracker finds the eye again where it is, never eased from where it
             # was lost. Between trials, once a page lets go and points again, the next trial's eye
@@ -441,13 +456,17 @@ class Source:
             pass
         else:
             self._ease(now)
-            span = now - self._arrived
-            if span > 1.5 * self._step:
+            span = gap
+            if not streaming:
                 # **A report after a gap, eased over it and `EASE_SLACK_S` more**: one
                 # a little later than that gap finds the pointer still moving, not stopped at the
-                # last report, so a glide is one saccade. One the frame after the last (half a
-                # frame's margin for the clock's rounding) has no gap to bridge, and is taken
-                # exactly, as before.
+                # last report, so a glide is one saccade. **And one the frame after a report that
+                # ended a gap**: a flick's the frame after a still pointer's, as a hand that moves
+                # just after the page's 100 ms report sends it. Taken in its one frame it is a jump
+                # the detector never confirms, under its six samples outside the threshold, a look
+                # landing nowhere (2026-11-19: the pop-out played with the mouse ended astray, the
+                # eye in the target's window). Only a report continuing a stream of one a frame has
+                # no gap to bridge, and is taken exactly, as before.
                 span += EASE_SLACK_S
             if span > LIVE_S:
                 span = LIVE_S
@@ -458,6 +477,7 @@ class Source:
             self._span = span
             self._start = now - self._step
             self._landed = False
+        self._streaming = streaming
         self._seq = self._best_seq
         self._flags = flags
         self._arrived = now
@@ -769,16 +789,34 @@ def _extent(looks, values) -> float:
     return width if math.isfinite(width) and width > 0.0 else OUTLINE_DEG
 
 
+def _targetless(drawn, options, values: dict) -> bool:
+    """Whether an array family has no target on the screen (`drawn_windows`): the array its drawn
+    stimulus shows is found by `"none"`, or, none drawn yet, every placement's is."""
+    def none(looks) -> bool:
+        looks = values.get(looks.name) if isinstance(looks, P) else looks
+        return isinstance(looks, Array) and looks.found_by == "none"
+
+    if drawn is not None:
+        return none(drawn.looks)
+    return bool(options) and all(none(placement.looks) for placement, _ in options)
+
+
 def drawn_windows(world: Tracked) -> "tuple[DrawnWindow, ...]":
     """**`world`'s windows as it judges them now** (§3.9, §14 item 4): each declared window and
     array object window with the center and radius `gaze.Tracked.in_window` compares gaze with on
     this frame -- an array's object windows where the trial placed them, switched with the array in
     `Tracked.display` -- and the eye it is judged for; an array alias's own stand-in left out, never
     drawn at the alias's nominal place, and an array's target's objects flagged, the scoring key.
-    A window the trial's values cannot place is drawn nowhere: the loop raises if a guard asks."""
+    **But an array's with no target** (`Array.found_by` `"none"`, a catch; the pop-out revision's
+    Task 4): its declared place is where an odd one would be, which nothing is, so no object of it
+    is labeled *target* -- while it is drawn so, or, before it is drawn, where each way the trial
+    can draw it is. A window the trial's values cannot place is drawn nowhere: the loop raises if
+    a guard asks."""
     aliases = world._members
-    targets = {name for alias, names in aliases.items() if alias.endswith(".target")
-               for name in names}
+    targetless = {f"{of}.target" for of, options in world._arrays
+                  if _targetless(world._drawn.get(of), options, world._values)}
+    targets = {name for alias, names in aliases.items()
+               if alias.endswith(".target") and alias not in targetless for name in names}
     found = []
     for name, declared in world._windows.items():
         if declared is None or name in aliases:

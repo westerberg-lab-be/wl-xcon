@@ -29,6 +29,11 @@ the moment it becomes someone's active job. Review this file at every milestone 
 | **P22** | **A browser page that can write is a page any site can try to make write** | **High** | Spec §2's four checks on every write, the `Host` check on every request, the rig's own validation behind them — see expanded note |
 | **P23** | **A coordinate read as a distance** | Medium | The angles the engine measures between positions are true visual angle, measured where they are, and what is still per axis is named (STE-27); a mean pixels per degree is used by no drawing, window or check by name — see expanded note |
 | **P24** | **A condition true as a state begins, read as an edge** | Medium | A guard derived from a signal judged in every state says what holds as its state begins, not only what changed on its frame; a test setup that steers round a behavior asks whether it is meant — see expanded note |
+| **P25** | **A range proof that fails closed once its cap goes** | Medium | A check that proved a setting safe from its declared cap is judged at the values the setting can take, not at the cap: remove the cap and the proof refuses (or silently passes) everything; test at the values — see expanded note |
+| **P26** | **A page that sends on a timer records half-way values** | Medium | A console control sends nothing until its box's Apply: a value typed or stepped is a draft the box says is *not sent*, and one Apply sends the box's change under one command id, so the record never holds a number a person was still reaching for (the console interface rework, 2026-11-19; the PI: "an apply button in each box") |
+| **P27** | **An answer read from absence** | Medium | A page says an outcome only on the rig's word for it -- a refusal carrying the act's command id, the act's id in `Telemetry.withdrawals` -- never because something stopped being on the frame, which a change applied does too; and an act answered *sent* the rig never answers is let go after a bound, saying so. Each end of the withdraw button passed its tests while the run loop read every press after the boundary had applied its change (the console interface rework's whole-build review, C1 and I1): test a two-ended feature through `Session.run` with the press a frame later, as a page makes it |
+| **P28** | **A zero wait that lasts a frame** | Medium | A state whose wait is 0 lasted a frame, so the pop-out's array and its go fell a frame apart at `go_delay` 0; a zero wait is now passed on the frame its entering edge is taken (TSK-78) |
+| **P29** | **A rule for a stream applied to a coincidence** | Medium | A rule keyed on how close two reports arrive says whether they *are* the regular stream it was made for, not only whether these two came close: a flick's report the frame after a still pointer's was taken as a one-a-frame report, in one frame, a jump no saccade detector confirms -- see expanded note |
 | **P30** | **The last message of a lossy stream, thrown away at the close** | Medium | "Latest wins, the next frame supersedes it" is true of every frame but the last, so the close of a stream says what becomes of what is still queued: `ZmqLink.close` closes its PUB with a bounded linger (`PUBLISH_LINGER_S`), not `linger=0`, so the frame that says how a session ended reaches the console; and a test helper that holds a socket open (a grace) is asked which paths it does not cover -- see expanded note |
 
 ## Expanded notes
@@ -393,6 +398,51 @@ point until it was drawn, "since a pointer already on the point as it appears ne
 window" -- the defect written down in a harness as a fact about the world, and steered round.
 Mitigation: `Entered` fires on a state's first judged frame on being inside (EYE-30), and a test
 whose setup avoids a behavior says why, so a reader can ask whether the behavior is meant.
+
+**P25 — A range proof that fails closed once its cap goes.** Several load checks proved a task safe by
+reading a setting's declared bounds, as if the highest a value could be were its cap. The console settings
+build removed the caps the PI never set (hard only where impossible), and each such check then either refused
+every task, or, written to pass on no bound, passed quietly: the pop-out search and the reference tasks loaded
+with `unexplained-limit` warnings, `bad-plan` and `bad-staircase` refused a bar or a window whose setting had an
+open side (XC-519), and a live color_luminance past the panel's saturation went unwarned, its code not among
+the layout's (the whole-build review's I2, closed as XC-518). A floor taken away goes the same way: a gaze
+window's radius lost its 0.5° lowest, and nothing else said that 0 is no radius, so 0 or -2 typed live was taken
+silently and every trial after it no fixation (I1, now `bad-window-radius`). Mitigation: judge a layout at the
+values a setting can take (`laid_out`, `check.LAYOUT`), where an open side is held at its start; give every
+value that cannot be a structure check of its own rather than leaving it to a bound; and test it at the values
+with the cap or the floor removed, not with it in place.
+
+**P28 — A zero wait that lasts a frame.** The trial loop took one edge a frame, so a state whose wait was 0
+lasted a frame: with `go_delay` at 0 the pop-out's array appeared on one frame and the fixation point's change to its
+act look (the go) came on the next, though the PI had asked for one (the revision design §3 item 5). TSK-78 now
+takes a zero wait's edge on the frame that enters the state, so the array and the go share a frame, and a reaction
+time measured from the go is not a frame short or long by construction. A one-frame gap this was once thought to
+leave beside `Exited`'s edge against the frame before was probed with the rig's tracked gaze world on 2026-11-19
+and is not there: an eye leaving on any frame about the hold's end is scored, a fixation break then the answer
+(`tests/test_popout_revision.py`, `test_an_eye_leaving_on_any_frame_about_the_holds_end_is_scored_by_an_edge`).
+Mitigation: the loop's rule is pinned (`tests/test_run.py`, TSK-78's section, and
+`test_exited_at_a_states_start_is_still_an_edge_against_the_frame_before`; `tests/test_popout_revision.py`,
+`test_leaving_on_the_frame_the_delay_ends_is_early`). A wait of 0 is a state that should judge no frame of its own;
+test it on the frame it is entered, not the one after.
+
+**P29 — A rule for a stream applied to a coincidence.** Demo mode eases each pointer report's move over the
+time since the report before, and `pointer.EASE_SLACK_S` more, so a hand's move reaches the saccade detector
+as motion; a report the frame after the last was taken exactly, for a page reporting one a frame. The page
+reports a still pointer every 100 ms and a moving one at most once an animation frame, so a report a frame
+after the last was never that stream: it was a flick made just after the page's still report, the two
+reaching the rig a frame apart. Taken in its one frame, the 8° flick was a jump the detector never confirmed
+(under its six samples outside the threshold), the pop-out's `flight` saw no landing, and its 0.3 s landing
+bound ended a look at the odd disc as `astray`, an abort, with the eye in the target's window
+(`tests/test_page_browser.py::test_the_popout_played_with_the_mouse_is_correct`, about one full-suite run in
+several from 2026-11-16 to 2026-11-19). It looked like a test that load breaks, and load only made the
+coincidence likelier: the suite slowed the test's sight of the report it times its flick from, moving the
+flick onto the page's next still report; flicked the moment a report went, on a quiet machine, some runs
+aborted, every one with the two reports a frame apart. A hand flicks whenever it flicks. Probed by recording
+the rig's frames, each report the rig took and each the server forwarded beside the suite's load (the
+session's own record says only `abort`). Mitigation: a report is taken exactly only in a stream of one a
+frame since the eye was found (`pointer.Source._adopt`); `tests/test_pointer.py`'s
+`test_a_flick_reported_the_frame_after_a_still_pointers_report_is_still_a_saccade`. When a test flakes only
+under load, read what the system saw on the failing frame before deciding the test is what is wrong.
 
 **P30 — The last message of a lossy stream, thrown away at the close.** Telemetry is lossy by
 design (S9a §9): `ZmqLink.publish` never blocks, and a frame lost costs nothing because the next

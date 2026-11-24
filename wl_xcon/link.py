@@ -57,6 +57,7 @@ from wl_xcon.actor import Actor
 from wl_xcon.findings import SESSION_KINDS
 from wl_xcon.geometry import Housing
 from wl_xcon.scheduler import DRUM_SCOPES, TRAINING
+from wl_xcon.task import SHAPES, SHAPING
 from wl_xcon.viewport import Viewport
 from wl_xcon.welfare import DAILY_FLUID, OUT_OF_CAGE
 
@@ -245,7 +246,115 @@ from wl_xcon.welfare import DAILY_FLUID, OUT_OF_CAGE
 #: demo's open, never a real animal's, so a page keeps *new session* live beside it. And an `open`
 #: command's `demo` on the wire (a command, not a frame: no schema of its own). Nothing else changed
 #: meaning. A reader of 20 refuses 21 and 21 refuses 20, by name, for all three shapes.
-SCHEMA = 21
+#:
+#: 22 (the console settings build, 2026-11-17; its design §3, the PI, 2026-11-16: every timing
+#: setting "fixed or drawn"): `ParamRow.switch`, `"drawn"` on a card whose setting a person may
+#: draw -- a live setting in seconds -- else `None`; and `ParamRow.shape`, the shape in force, a
+#: person's draw or the open block's, as `{"shape", "numbers", "values", "weights", "by"}`, `by`
+#: one of `"person"`, `"block"` or `"task"`, `None` where the setting is fixed; and
+#: `ParamRow.source` `"form"`, a person's draw; and `ParamRow.profile`, where `shape` is set, that draw's
+#: `{"edges", "density", "hazard"}` (`variation.profile`: a range's 20 bins or a list's values, each bin's
+#: share of the draws and its hazard against the first's), the declared distribution, not a measurement;
+#: and `ParamRow.why`, `{"low", "high"}`, each limit's one-line reason, or `None` (`task.limit_reason`;
+#: the design's §4: every declared bound is a hard limit). A staged row may be of kind `form`, its `was` and
+#: `now` in the rig's words. And a `form` command on the wire (`SetForm`). **A size scaled by
+#: eccentricity** (the design's §5; the build's Task 6): `ParamRow.switch` `"scaled"` on a live
+#: size setting (`task.size_settings`), `ParamRow.shape` `{"shape": "scaled", "numbers": {"factor"},
+#: ...}` for a person's scaling, and `ParamRow.gives`, the rig's words for what a scaled size or an
+#: object window's ratio gives each object in degrees, else `None`; a `form` command's shape may
+#: be `scaled`. **Colors by set, hue and two levels** (the design's §6; the build's Task 7):
+#: `ParamRow.color`, a color setting's card -- each set its choices show, with its apex,
+#: luminance, `design` and each hue's xy and sRGB swatch, the set and hue of the run's value, and
+#: its saturation level `{"setting", "value", "cd_m2"}` and its luminance level `{"setting",
+#: "value", "cd_m2", "set_wide"}`, `set_wide` true where the setting moves every light of the set --
+#: else `None`; and
+#: `ParamRow.words`, **a value that is an appearance or a color in the rig's words**
+#: (`review.appearance_words`; XC-420 closed), `value` `None` beside it, as a staged row's `was`
+#: and `now` carry one; and a `color` command on the wire (`SetColor`). **New colors, three ways** (the design's §6; the
+#: build's Task 8): a `define_color` command on the wire (`DefineColor`), taken by the service in
+#: any phase, and `Idle.controls`, the service's own changes-feed rows while no session is open.
+#: **Sections** (the design's §7; the build's Task 9): `ParamRow.section` and `ParamRow.changed`.
+#: **The training switch** (the design's §8; the build's Task 10): `Telemetry.shaping`, `"on"`,
+#: `"frozen"` or `"full"` in a run with training to switch, `""` otherwise; `Telemetry.full_task`,
+#: whether the run's plan declares a full task; `ParamRow.source` `"frozen"` and `"full"`, the
+#: value then what the switch holds; a staged row of kind `shaping`; and a `shaping` command on the
+#: wire (`Shaping`).
+#: The build's later tasks add their fields to 22 before it is released. A reader of 21 refuses 22 and 22 refuses 21,
+#: by name, for all three shapes.
+#:
+#: 23 (the console interface rework, 2026-11-19; its design's "What the rig must send that it does
+#: not", the PI's "Small boxes" and "Apply per box"): **each row says what its box needs**
+#: (`ParamRow.whole`, `step`, `choices` -- at most `CHOICES_LIMIT`, else none -- `start`, `label`,
+#: `help`, `group`, `percent`), **the pool's row its pairings as data** (`ParamRow.members`, each a
+#: `PoolMember`), **and the change in force** (`ParamRow.applied`, an `Applied`: the trial it took
+#: effect at and who made it; `ParamRow.warned`, the warnings it carried); **each verdict names the
+#: page-made command id it answers** (`Staged.cid`, `Refused.cid`), a staged change its warnings
+#: (`Staged.warnings`) and a refusal the value refused (`Refused.value`). And on the wire a box's
+#: command's `cid` (a command, not a frame: no schema of its own), beside its fields, never inside a
+#: value (`_cid`, never `_setting`). **And the task's groups** (`Telemetry.groups`, each a
+#: `GroupRow`; the rework's Task 7): each group's title, its settings in order, its sentence and its
+#: section, which the page draws one box from. **And a choice by its words** (the pop-out revision's
+#: Task 5b): a row's `choices` hold a look's words too (`choice_words`), and a `choice` command on the
+#: wire (`SetChoice`) picks one -- a command, not a frame field. The build's later tasks add their
+#: fields to 23 before it is released. A reader of 22 refuses 23 and 23 refuses 22, by name, for all three shapes.
+SCHEMA = 23
+
+#: **The most choices a row carries as words** (`ParamRow.choices`; schema 23): a box shows a
+#: categorical setting's choices as segments, and a frame is re-encoded at every trial boundary, so
+#: a setting declaring more carries none, its box then a field. A display bound, as
+#: `CONDITIONS_SHOWN` is, not a measurement.
+CHOICES_LIMIT = 30
+
+
+#: **The longest a choice's segment says it** before it says only what kind of look it is
+#: (`choice_label`): a display bound, so three looks fit one box, not a measurement.
+CHOICE_LABEL_LIMIT = 24
+
+
+def choice_label(words: str, choices) -> str:
+    """**What a choice is said by in short** (the console's segments, `web._choice_segments`; the
+    changes feed and the moments, `taskd`): its words (`choice_words`), or -- where they run past
+    `CHOICE_LABEL_LIMIT` -- what comes before their first ": ", the look's kind ("Ring" of
+    "Ring: inner fix_act_hole, outer ..."), where that tells it from every other choice of the
+    setting (`choices`, each by its words); else its words whole. Formatting, not derivation."""
+    if len(words) <= CHOICE_LABEL_LIMIT or ": " not in words:
+        return words
+    kinds = [choice.partition(": ")[0] for choice in choices]
+    kind = words.partition(": ")[0]
+    return kind if kinds.count(kind) == 1 else words
+
+
+def choice_words(choices) -> "dict[str, object] | None":
+    """**A setting's declared choices by the words its box shows them by** (`ParamRow.choices`; the
+    pop-out revision's Task 5b): each choice by its words, in the order declared -- a word as
+    written, an appearance in the rig's words (`review.appearance_words`) -- which a box shows as
+    segments and a `SetChoice` names, mapped back to the one declared choice it is
+    (`taskd.Session._choice`). **`None` for a setting a box cannot pick from by words**: one with
+    no choices or more than `CHOICES_LIMIT`; one with a choice that has no words (a number, a
+    position); one whose every choice shows a color-set light, picked on its color card
+    (`task.set_light`, `SetColor`); and one where two choices share their words, or a choice's
+    words run past `TEXT_LIMIT`, since a pick could not name it. At load, between trials, or as a
+    frame is made; never in a frame."""
+    from wl_xcon.review import appearance_words
+    from wl_xcon.task import set_light
+
+    choices = tuple(choices or ())
+    if not 0 < len(choices) <= CHOICES_LIMIT:
+        return None
+    if all(set_light(choice) is not None for choice in choices):
+        return None
+    found: dict[str, object] = {}
+    for choice in choices:
+        words = choice if isinstance(choice, str) else appearance_words(choice)
+        if not words or len(words) > TEXT_LIMIT or words in found:
+            return None
+        found[words] = choice
+    return found
+
+#: **The longest command id a page may make** (`SetParameter.cid` and the other box commands';
+#: schema 23): printable text of 1 to 64 characters, which a verdict echoes on every frame until it
+#: applies, so it is bounded as a word is. An engineering default, not a measurement.
+CID_LIMIT = 64
 
 #: How many refusals a session keeps, per source, and therefore how many one
 #: `Telemetry` frame can carry.
@@ -360,6 +469,15 @@ class Staged:
     #: ("handed back to the run, which gives it no value") -- for every row whose `hands_back`
     #: is true; empty for any other.
     to: str = ""
+    #: **The command id the page made for the change** (schema 23; the console interface design's
+    #: goal 4: every outcome on its box), echoed from its command (`SetParameter.cid` and the other
+    #: box commands'), so a page keys the verdict to the press that asked; `None` for a change sent
+    #: with none, a revert's among them.
+    cid: str | None = None
+    #: **The warnings the change carries** (schema 23), each `code: detail` as the changes feed says
+    #: it: what judging it newly warned of (`taskd.Session._laid_out`), accepted by whoever sent it.
+    #: Empty where it warned of nothing.
+    warnings: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,11 +493,48 @@ class Refused:
     write to a welfare-bounded name had even been attempted. `why` is `str(Exceeded)`,
     already a complete sentence (see `Session.set`'s own messages), not a code a
     console would need the source to interpret.
+
+    **And which press it answers** (schema 23; the console interface design's goal 4): `cid`, the
+    command id the page made, echoed from the command refused (`taskd.Session._answering_for`),
+    `None` for a refusal of a command sent with none, a transport's or a service's; and `value`,
+    the value a `set` asked for, a number or a word, `None` for any other command and for a value
+    that is neither.
     """
 
     name: str
     by: Actor | None
     why: str
+    cid: str | None = None
+    value: object = None
+
+
+@dataclass(frozen=True, slots=True)
+class PoolMember:
+    """**One pairing of a pool, as the pairings grid ticks it** (schema 23; `ParamRow.members`; the
+    console interface design's goal 7, the PI, "4 × 4 grid, add or remove"): `bit`, its number in
+    the pool's value (`task.Pool.number`: 2 ** its place, 1 for the first); `odd` and `among`, the
+    odd one's and the distractors' names -- a look's color-set hue, or a word as written, else its
+    look in the rig's words; `odd_hex` and `among_hex`, each color's swatch on the sRGB standard,
+    `#rrggbb`, approximate as every swatch is, empty where the standard cannot show it or the look
+    shows no color-set light; and `on`, whether the pool's value holds it."""
+
+    bit: int
+    odd: str
+    among: str
+    odd_hex: str
+    among_hex: str
+    on: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Applied:
+    """**The change in force on a setting** (schema 23; `ParamRow.applied`; the console interface
+    design's goal 4, "in force from trial N"): `trial`, the index of the first trial it applied to,
+    as a frame's `trial_index` counts; `by`, who made it, as a person reads an actor (`Box`'s
+    `NAME (box, unverified)`)."""
+
+    trial: int
+    by: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,11 +603,119 @@ class ParamRow:
     #: **How many more conditions set or draw it** than `conditions` names (schema 19; the engine
     #: C3 plan's engineering review, M-5): 0 where it names them all.
     more: int = 0
+    #: **Whether the card offers the drawn side** (schema 22; the console settings design's §3, the
+    #: PI, 2026-11-16: "every timing setting gets the switch on its card"): `"drawn"` on a live
+    #: setting in seconds while a run goes, whose card is *fixed* or *drawn* (`SetForm`);
+    #: **`"scaled"` on a live size setting** (`task.size_settings`; the design's §5), whose card is
+    #: *fixed* or *scaled* by a factor; `None` on every other card, a ceiling's, and between runs.
+    switch: str | None = None
+    #: **The shape in force, for the card's drawn side** (schema 22): a person's draw (`by`
+    #: `"person"`, `source` `"form"`) or the open block's own or the task's (`"block"`, `"task"`),
+    #: a range changed live included, as `{"shape", "numbers", "values", "weights", "by"}` -- one
+    #: of `task.SHAPES`, its numbers by the names a card sends back, a list's values and weights
+    #: as lists (`variation.shaped`). `None` where the setting is fixed, where every condition of
+    #: the block draws it from its own range, and for a direction.
+    shape: dict | None = None
+    #: **The histogram and hazard of that draw** (schema 22; the console settings design's §3):
+    #: `{"edges", "density", "hazard"}` (`variation.profile`) wherever `shape` is not `None` -- a
+    #: range's bins' ends (one more than `density`) or a list's values (as many), each bin's share
+    #: of the draws, and its hazard as a multiple of the first's. Arithmetic of the declared
+    #: distribution, not a measurement; built between trials, cached by distribution.
+    profile: dict | None = None
+    #: **Why each limit it declares stands** (schema 22; the console settings design's §4: "each
+    #: card says why for any limit that stays, in one line"): `{"low": reason, "high": reason}`,
+    #: each `task.limit_reason`'s -- a standard reason or the task's own line -- or `None` for a
+    #: side with no bound or a bound the task gives no reason for. `None` where it declares no
+    #: bound, has choices, or is a ceiling.
+    why: dict | None = None
+    #: **What it gives each object, in degrees, at its own place** (schema 22; the console settings
+    #: design's §5: "the card shows the radius in degrees it gives at each object's eccentricity"):
+    #: the rig's words for each distinct eccentricity the open placement draws it at, three at
+    #: most, then "and N more" -- an object window's ratio as `radius 1.5° at 8° out, every
+    #: object`, a size scaled by eccentricity as `2.4° at 8° out` -- made by the rig
+    #: (`taskd.Session.parameters`), so no console computes a size. `None` for every other card,
+    #: a fixed size's among them, and between runs.
+    gives: str | None = None
+    #: **A color setting's card** (schema 22; the console settings design's §6: "you select a set,
+    #: and then you have hue options from the set, then you have salience options for each hue"),
+    #: for a setting whose every choice shows a color-set light (`task.color_choices`), made by the
+    #: rig (`taskd.Session.parameters`): `{"sets", "set", "hue", "approximate", "saturation",
+    #: "luminance"}` -- `sets` each set its choices show by name, `{"apex", "luminance_cd_m2",
+    #: "design", "hues"}`, each hue the choices offer `{"xy", "srgb"}`, its chromaticity as the set
+    #: writes it and its swatch on the sRGB standard (`photometry.srgb_hex`), `approximate` always
+    #: true since no swatch is the rig's measured panel; `set` and `hue` the run's value's, `None`
+    #: where the pool draws it; and the two levels of its light, `saturation` `{"setting",
+    #: "value", "cd_m2"}` and `luminance` `{"setting", "value", "cd_m2", "set_wide"}` -- the
+    #: setting a person types it by (`None` where the task file writes a number), its value in that
+    #: setting's own unit, the light's macaque luminance in cd/m², and, the luminance's alone,
+    #: `set_wide`: true where its setting is the set's luminance, which moves every light of the set
+    #: that reads it, not this light's fraction (the card says so). `None` for every other card.
+    color: dict | None = None
+    #: **The value in the rig's words, where it is an appearance or a color** (schema 22; XC-420,
+    #: closed by the console settings build): `review.appearance_words`, `value` then `None`, as
+    #: `position` is for a whole position; `None` for every other value.
+    words: str | None = None
+    #: **The section of the Task parameters tab it sits in** (schema 22; the console settings design's
+    #: §7: "The task file names it"): `task.section_of` -- the task file's (`Param.section`, `/`
+    #: making a subsection), else Timing for a setting in seconds, else Other; a ceiling's is
+    #: `task.CEILINGS`. Empty for a row made by hand, which a console shows under Other.
+    section: str = ""
+    #: **Whether it differs from the task's start** (schema 22; the design's §7: each header counts
+    #: "how many differ"): true where a person holds it or gave its form, where a range a person
+    #: gave is in force, or where the run was given a value other than the task's (`source`
+    #: `"person"`, `"form"`, `"range"` or `"run"`). False for a ceiling and between runs.
+    changed: bool = False
+    #: **Whether its box takes whole numbers only** (schema 23; the console interface design's goal
+    #: 6, the PI: "for necessary whole numbers ... there should not be a decimal option"): the
+    #: task's `Param.whole`. False for a ceiling.
+    whole: bool = False
+    #: **How far one press of its -/+ moves it** (schema 23; `task.step_of`): the step it declares,
+    #: else 1 for a whole setting, else its unit's (`task.UNIT_STEPS`), else 0.01; a ceiling's its
+    #: unit's.
+    step: float = 0.01
+    #: **Its choices as words** (schema 23; `choice_words`): a categorical setting's choices, each a
+    #: word as written or, since the pop-out revision's Task 5b, a look in the rig's words, which a
+    #: box shows as segments and sends back as they are (`SetChoice`), at most `CHOICES_LIMIT`;
+    #: empty for a setting of numbers, one whose choices are positions, one whose every choice is a
+    #: color-set light (a color's are its card's, `color`), and one declaring more.
+    choices: tuple = ()
+    #: **The task's start for it** (schema 23; `Param.start`): a number or a word, `None` where it
+    #: declares none, or one that is neither (a look, a position).
+    start: object = None
+    #: **Its plain name and its one sentence** (schema 23; the design's goal 5, the PI: "Plain name,
+    #: code name small"): `Param.label` and `Param.help`, empty where the task gives none, the box
+    #: then showing its name alone.
+    label: str = ""
+    help: str = ""
+    #: **The group whose box holds it** (schema 23; `task.Group`, the design's goal 8), by its
+    #: title, `None` for a setting in a box of its own; the group's box sits in the section its
+    #: settings share (`section`; the load refuses a group across two, `bad-group`).
+    group: str | None = None
+    #: **Whether its box shows it ×100 with `%`** (schema 23; `Param.percent`): a fraction alone.
+    percent: bool = False
+    #: **The pool's pairings as data, on the pool's own setting** (schema 23; `task.Pool`; the
+    #: design's goal 7): one `PoolMember` for each pairing, in the pool's declared order, `on`
+    #: where the setting's value holds it; `None` on every other row.
+    members: tuple | None = None
+    #: **The change in force on it** (schema 23): an `Applied` -- the trial it took effect at, and
+    #: who made it -- for a setting a person's change of the run in progress gave, the last to
+    #: apply; `None` where none has, and between runs.
+    applied: Applied | None = None
+    #: **The warnings the change in force carried** (schema 23), as its staged row's (`Staged
+    #: .warnings`), so its box can say *in force, with a warning*; empty where it carried none.
+    warned: tuple = ()
 
     @classmethod
     def of(cls, name: str, unit: str, low: float | None, high: float | None, value: object,
            bounded: bool, choices=(), source: str | None = None, conditions=(),
-           draw: str | None = None, numbers: dict | None = None) -> "ParamRow":
+           draw: str | None = None, numbers: dict | None = None, switch: str | None = None,
+           shape: dict | None = None, profile: dict | None = None,
+           why: dict | None = None, gives: str | None = None,
+           color: dict | None = None, section: str = "", changed: bool = False,
+           whole: bool = False, step: float = 0.01, start: object = None, label: str = "",
+           help: str = "", group: str | None = None, percent: bool = False,
+           members: tuple | None = None, applied: Applied | None = None,
+           warned: tuple = ()) -> "ParamRow":
         """One row from `Session.parameters`' shape, `choices` the setting's own: a value that
         is a whole position (`review.position_words`: a `Polar`, or a pair where `choices`
         declare one) as its words in `position` -- a pair's eccentricity the true visual angle
@@ -463,18 +726,48 @@ class ParamRow:
         `Polar(8.123456789, 45)` reads `8.12346°`; a position holding an infinity or a NaN is
         said to be no position, as written. Any other value as it is. Where it comes from
         (`source`, `conditions`, `draw`, `numbers`; schema 19) as given, the conditions cut to the
-        first `CONDITIONS_SHOWN` and the rest counted (`more`)."""
-        from wl_xcon.review import position_words
+        first `CONDITIONS_SHOWN` and the rest counted (`more`). **A value that is an appearance
+        or a color** in the rig's words (`words`, `review.appearance_words`; XC-420), `value`
+        `None`: msgpack carries no declaration, and no console reads one.
+
+        **What its box needs** (schema 23) as given, but `choices`, which become the row's words
+        where a box can pick from them by words (`choice_words`), else none, and `start`, kept
+        where it is a finite number or a word, else `None`."""
+        from wl_xcon.review import appearance_words, position_words
 
         named = tuple(conditions)
         shown = named[:CONDITIONS_SHOWN]
         more = len(named) - len(shown)
         words = position_words(value, choices)
+        looks = appearance_words(value)
+        box = dict(
+            whole=whole, step=step, start=_scalar(start), label=label, help=help, group=group,
+            percent=percent, members=None if members is None else tuple(members), applied=applied,
+            warned=tuple(warned), choices=tuple(choice_words(choices) or ()))
+        if looks is not None:
+            return cls(name, unit, low, high, None, bounded, None, source, shown, draw,
+                       numbers, more, switch, shape, profile, why, gives, color, looks,
+                       section, changed, **box)
         if words is None:
             return cls(name, unit, low, high, value, bounded, None, source, shown, draw,
-                       numbers, more)
+                       numbers, more, switch, shape, profile, why, gives, color, None, section,
+                       changed, **box)
         return cls(name, unit, low, high, None, bounded, words, source, shown, draw, numbers,
-                   more)
+                   more, switch, shape, profile, why, gives, color, None, section, changed,
+                   **box)
+
+
+def _scalar(value: object) -> object:
+    """`value` where a frame carries it as it is -- a finite number that is not a `bool`, or a word
+    -- else `None` (`ParamRow.start`, `Refused.value`; schema 23)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,7 +802,9 @@ class Control:
     `set`, `hand_back`, `range` and `revert` applied, or said dropped as a run ends before it
     applies -- `suggestion` (the rig's suggestion of a move under a confirmed progression, or its
     withdrawal as its bar stops holding) and `decline` (a person's hold of one; the pop-out
-    search build, 2026-11-07), or `warning` (a warning said as it
+    search build, 2026-11-07), `withdrawn` (a waiting change taken back by a person, each setting
+    of the act; the console interface rework, which the change log records as a `withdrawn` row),
+    or `warning` (a warning said as it
     happens, since the PI's rulings on XC-352, 2026-10-11);
     `by` is who sent it, `None` for a mark's stamp, whose sender arrives with its note;
     `at` is on the session's anchored clock; `said` is the sentence after the kind.
@@ -697,6 +992,21 @@ class Pooled:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupRow:
+    """**A group of settings that share one box and one Apply** (schema 23; `Telemetry.groups`;
+    `task.Group`; the console interface design's goal 8, the PI: "One box after Timing"), from
+    `taskd.Session.groups`: `name`, the box's title; `settings`, the names it holds, in the order
+    the group declares them; `sentence`, the one its box reads as, a `{name}` place for each of its
+    settings (`string.Formatter`'s), or `None` where it declares none; and `section`, the one its
+    settings share (`check`'s `bad-group`), where its box sits. Its Apply sends one `ApplyMany`."""
+
+    name: str
+    settings: tuple
+    sentence: str | None
+    section: str
+
+
+@dataclass(frozen=True, slots=True)
 class Question:
     """A far mark a console owes an answer on (P4d-2b spec §6.2): which mark, for which
     session, the instant it was typed as, `welfare`'s sentence, and the answers --
@@ -837,6 +1147,12 @@ class Idle:
     #: page offers its demo choice only where one can open. `False` by default; demo mode's Task 4
     #: sets it (`Service.publish`).
     gaze: bool = False
+    #: **What the service did itself while no session was open** (schema 22; the console settings
+    #: build's Task 8): `Control` rows for the changes feed, newest last, at most
+    #: `CONTROL_HISTORY` -- a new color saved as a set's proposed file (`define_color`), and a
+    #: `warning` of how a panel shows the set with it (`service.Service._define_color`). Cleared as a
+    #: session opens, as the idle refusals are. Empty by default.
+    controls: tuple = ()
 
     @classmethod
     def of(
@@ -854,6 +1170,7 @@ class Idle:
         warnings=(),
         demo: bool = False,
         gaze: bool = False,
+        controls=(),
     ) -> "Idle":
         """One idle frame: the service's refusals and the link's, capped at
         `REFUSAL_HISTORY` and counted, as `Telemetry.of` caps a session's; and the last
@@ -875,6 +1192,7 @@ class Idle:
             warnings=tuple(warnings),
             demo=demo,
             gaze=gaze,
+            controls=tuple(controls)[-CONTROL_HISTORY:],
         )
 
 
@@ -1212,6 +1530,23 @@ class Telemetry:
     #: console` says DEMO on it. `False` by default, a real session's; `Telemetry.of` reads it from
     #: the session's spec (`taskd.SessionSpec.demo`).
     demo: bool = False
+    #: **The training switch** (schema 22; the console settings design's §8; `taskd.Session.shaping`):
+    #: `"on"`, `"frozen"` or `"full"` while a run with a training progression, a staircase or a
+    #: pool goes, else `""`, which no switch is offered for; and **whether the run's plan declares
+    #: a full task** (`task.Plan.full`), the switch's *full task* grayed where it does not.
+    shaping: str = ""
+    full_task: bool = False
+    #: **The task's groups** (schema 23; the console interface rework's Task 7; `taskd.Session
+    #: .groups`), each a `GroupRow`, in the order the task declares them: the page draws each
+    #: group's settings as one box with one Apply. `()` by default, a task with none, and before a
+    #: task is loaded.
+    groups: tuple = ()
+    #: **The acts a withdrawal took back** (schema 23; the console interface rework's whole-build
+    #: review, I1; `taskd.Session.withdrawals`): the command id of each, oldest first, at most
+    #: `REFUSAL_HISTORY`, as a refused withdrawal's `Refused` is kept, for the run in progress. The
+    #: rig's word that a withdrawal was done: the page says "withdrawn" on this alone, never on a
+    #: change waiting no more, which a change applied does too. `()` by default, and between runs.
+    withdrawals: tuple = ()
 
     @classmethod
     def of(cls, session, tally, scheduler, index: int) -> "Telemetry":
@@ -1244,8 +1579,11 @@ class Telemetry:
         """
         link = session.link
         wall_now = session.wall_now()
+        # Each refusal with the command id and the value it answers (schema 23), one for each in
+        # order (`taskd.Session.answers`, which `_refuse` keeps beside `refusals`).
         refusals = (
-            tuple(Refused(name=n, by=b, why=w) for n, b, w in session.refusals)
+            tuple(Refused(name=n, by=b, why=w, cid=c, value=v)
+                  for (n, b, w), (c, v) in zip(session.refusals, session.answers, strict=True))
             + tuple(link.refused)
         )
         kept = refusals[-REFUSAL_HISTORY:]
@@ -1329,8 +1667,8 @@ class Telemetry:
             staged=tuple(
                 Staged(name=n, was=_carried(w, choices.get(n, ())),
                        now=_carried(v, choices.get(n, ())), by=b, bounded=bd, kind=k,
-                       overrides=o, hands_back=h, to=t)
-                for n, w, v, b, bd, k, o, h, t in session.staged
+                       overrides=o, hands_back=h, to=t, cid=c, warnings=tuple(warned))
+                for n, w, v, b, bd, k, o, h, t, c, warned in session.staged
             ),
             # `session.refusals`, already public -- unlike `_staged`, nothing private
             # to reach around -- plus `session.link.refused`, fix round 1's CRITICAL
@@ -1451,6 +1789,14 @@ class Telemetry:
             # Schema 21 (demo mode §3.7): a demo session's spec carries what it is (`taskd.Demo`),
             # and no other's does. Read as a plain attribute, as the spec's other fields are.
             demo=session.spec.demo is not None,
+            # The console settings build's Task 10 (schema 22): the training switch.
+            shaping=session.shaping,
+            full_task=session.full_task,
+            # The console interface rework's Task 7 (schema 23): the task's groups, read as a plain
+            # attribute, as the session's other fields are.
+            groups=tuple(GroupRow(*row) for row in session.groups),
+            # The whole-build review's I1 (schema 23): the acts withdrawn, by command id.
+            withdrawals=tuple(session.withdrawals),
         )
 
 
@@ -1524,16 +1870,20 @@ class Drawn:
 def _carried(value: object, choices=()) -> object:
     """A staged value as a frame carries it: a whole position -- a `Polar`, or a pair where its
     setting's `choices` declare one -- as the rig's words for it, eccentricity and direction first
-    with its (x, y) beside them (`review.position_words`; schema 18, XC-401), anything else as
-    it is."""
-    from wl_xcon.review import position_words
+    with its (x, y) beside them (`review.position_words`; schema 18, XC-401); **an appearance or a
+    color, or a piece of one, as its words** (`review.appearance_words`; XC-420, closed by the
+    console settings build: a color pick stages a look); anything else as it is."""
+    from wl_xcon.review import appearance_words, position_words
 
     words = position_words(value, choices)
+    if words is None:
+        words = appearance_words(value)
     return value if words is None else words
 
 
 def _refusals_out(refusals) -> list:
-    return [{"name": r.name, "by": actors.to_map_or_none(r.by), "why": r.why} for r in refusals]
+    return [{"name": r.name, "by": actors.to_map_or_none(r.by), "why": r.why, "cid": r.cid,
+             "value": r.value} for r in refusals]
 
 
 def _preflight_out(preflight: Preflight | None) -> dict | None:
@@ -1684,6 +2034,13 @@ def encode(telemetry: Telemetry | Idle | Drawn) -> bytes:
                 # Demo mode (schema 21).
                 "demo": telemetry.demo,
                 "gaze": telemetry.gaze,
+                # The service's own acts with no session open (schema 22; the console settings
+                # build's Task 8).
+                "controls": [
+                    {"kind": c.kind, "by": actors.to_map_or_none(c.by), "at": c.at,
+                     "said": c.said}
+                    for c in telemetry.controls
+                ],
             },
             use_bin_type=True,
         )
@@ -1719,6 +2076,7 @@ def _drawn_out(drawn: Drawn) -> dict:
 
 #: A `Suggestion`'s fields, in order, as a frame carries them (schema 20).
 _SUGGESTION_FIELDS = ("change", "move", "block", "to", "correct", "of", "at_hardest")
+_MEMBER_FIELDS = tuple(f.name for f in fields(PoolMember))
 _STAIRCASE_FIELDS = tuple(f.name for f in fields(StaircaseRow))
 _BARS_FIELDS = tuple(f.name for f in fields(Bars))
 
@@ -1757,6 +2115,8 @@ def _telemetry_out(telemetry: Telemetry) -> dict:
                 "overrides": list(s.overrides),
                 "hands_back": s.hands_back,
                 "to": s.to,
+                "cid": s.cid,
+                "warnings": list(s.warnings),
             }
             for s in telemetry.staged
         ],
@@ -1779,6 +2139,29 @@ def _telemetry_out(telemetry: Telemetry) -> dict:
                 "draw": p.draw,
                 "numbers": p.numbers,
                 "more": p.more,
+                "switch": p.switch,
+                "shape": p.shape,
+                "profile": p.profile,
+                "why": p.why,
+                "gives": p.gives,
+                "color": p.color,
+                "words": p.words,
+                "section": p.section,
+                "changed": p.changed,
+                "whole": p.whole,
+                "step": p.step,
+                "choices": list(p.choices),
+                "start": p.start,
+                "label": p.label,
+                "help": p.help,
+                "group": p.group,
+                "percent": p.percent,
+                "members": (None if p.members is None
+                            else [{name: getattr(m, name) for name in _MEMBER_FIELDS}
+                                  for m in p.members]),
+                "applied": (None if p.applied is None
+                            else {"trial": p.applied.trial, "by": p.applied.by}),
+                "warned": list(p.warned),
             }
             for p in telemetry.params
         ],
@@ -1874,6 +2257,15 @@ def _telemetry_out(telemetry: Telemetry) -> dict:
         ),
         # Demo mode (schema 21): on every frame.
         "demo": telemetry.demo,
+        # The training switch (schema 22; the console settings build's Task 10).
+        "shaping": telemetry.shaping,
+        "full_task": telemetry.full_task,
+        # The task's groups (schema 23; the console interface rework's Task 7).
+        "groups": [{"name": group.name, "settings": list(group.settings),
+                    "sentence": group.sentence, "section": group.section}
+                   for group in telemetry.groups],
+        # The acts withdrawn, by command id (schema 23; the whole-build review's I1).
+        "withdrawals": list(telemetry.withdrawals),
     }
 
 
@@ -1977,12 +2369,90 @@ def _describe(exc: Exception) -> str:
 
 
 def _refused_in(r: dict) -> Refused:
-    """A refusal row off the wire: its `by` an actor's map, or null for nobody."""
+    """A refusal row off the wire: its `by` an actor's map, or null for nobody; the command id it
+    answers and the value refused (schema 23), each checked (`_cid_of`, `_scalar_of`)."""
     return Refused(
         name=r["name"],
         by=None if r["by"] is None else actors.from_map(r["by"]),
         why=r["why"],
+        cid=_cid_of(r["cid"]),
+        value=_scalar_of(r["value"]),
     )
+
+
+def _cid_of(value: object) -> str | None:
+    """A verdict's command id on the wire (schema 23): `None`, or printable text of 1 to
+    `CID_LIMIT` characters, as a command's is (`_cid`); anything else is a malformed frame
+    (`TypeError`, which `decode` makes a `FrameError`)."""
+    if value is None or _is_cid(value):
+        return value
+    raise TypeError(f"a command id is printable text of 1 to {CID_LIMIT} characters, not "
+                    f"{_quoted(value)}")
+
+
+def _cids_of(value: object) -> tuple:
+    """A list of command ids on the wire (`Telemetry.withdrawals`; schema 23) as a tuple, each
+    checked as a verdict's is (`_cid_of`), none `None`; anything else is a malformed frame
+    (`TypeError`)."""
+    if not isinstance(value, list) or not all(_is_cid(cid) for cid in value):
+        raise TypeError(f"a list of command ids, not {_quoted(value)}")
+    return tuple(value)
+
+
+def _scalar_of(value: object) -> object:
+    """A start or a refused value on the wire (schema 23): `None`, a finite number that is not a
+    `bool`, or a word; anything else is a malformed frame (`TypeError`)."""
+    if value is None or _scalar(value) is not None:
+        return value
+    raise TypeError(f"a value is a finite number or a word, not {_quoted(value)}")
+
+
+def _words_of(value: object) -> tuple:
+    """A list of words on the wire -- a row's choices, a change's warnings (schema 23) -- as a
+    tuple, or a malformed frame (`TypeError`)."""
+    if not isinstance(value, list) or not all(isinstance(word, str) for word in value):
+        raise TypeError(f"a list of words, not {_quoted(value)}")
+    return tuple(value)
+
+
+def _member_in(data: dict) -> PoolMember:
+    """One pairing of a pool's row off the wire (schema 23), each field checked by its kind."""
+    if isinstance(data["bit"], bool) or not isinstance(data["bit"], int) or data["bit"] < 1:
+        raise TypeError(f"a pairing's bit is a whole number from 1, not {data['bit']!r}")
+    return PoolMember(bit=data["bit"], odd=_word_of(data["odd"]), among=_word_of(data["among"]),
+                      odd_hex=_swatch_of(data["odd_hex"]), among_hex=_swatch_of(data["among_hex"]),
+                      on=_flag(data["on"]))
+
+
+_SWATCH = re.compile(r"#[0-9a-f]{6}")
+
+
+def _swatch_of(value: object) -> str:
+    """A pairing's swatch on the wire (schema 23): `#rrggbb` in lower case, or empty for none."""
+    if value == "" or (isinstance(value, str) and _SWATCH.fullmatch(value)):
+        return value
+    raise TypeError(f"a swatch is #rrggbb or empty, not {_quoted(value)}")
+
+
+def _row_in(p: dict) -> ParamRow:
+    """One row off the wire: what schema 22 carried as it is, and what its box needs (schema 23),
+    each checked by its kind."""
+    step = _real(p["step"])
+    if step <= 0:
+        raise TypeError(f"a step is a number above 0, not {step!r}")
+    applied = p["applied"]
+    return ParamRow(**{
+        **p, "conditions": tuple(p["conditions"]), "whole": _flag(p["whole"]), "step": step,
+        "choices": _words_of(p["choices"]), "start": _scalar_of(p["start"]),
+        "label": _word_of(p["label"]), "help": _word_of(p["help"]),
+        "group": None if p["group"] is None else _word_of(p["group"]),
+        "percent": _flag(p["percent"]),
+        "members": (None if p["members"] is None
+                    else tuple(_member_in(member) for member in p["members"])),
+        "applied": (None if applied is None
+                    else Applied(trial=_whole(applied["trial"]), by=_word_of(applied["by"]))),
+        "warned": _words_of(p["warned"]),
+    })
 
 
 def _idle_from(data: dict) -> Idle:
@@ -2007,6 +2477,10 @@ def _idle_from(data: dict) -> Idle:
         warnings=_warnings_in(data["warnings"]),
         demo=_flag(data["demo"]),
         gaze=_flag(data["gaze"]),
+        controls=tuple(
+            Control(**{**c, "by": None if c["by"] is None else actors.from_map(c["by"])})
+            for c in data["controls"]
+        ),
     )
 
 
@@ -2124,6 +2598,35 @@ def _bars_in(data: dict | None) -> Bars | None:
                    "wrong": _counted(data["wrong"]), "left_out": _counted(data["left_out"])})
 
 
+#: The fields of a group on the wire (`GroupRow`; schema 23), every one, nothing more.
+_GROUP_FIELDS = frozenset({"name", "settings", "sentence", "section"})
+
+
+def _groups_in(data: object) -> tuple:
+    """**The task's groups off the wire** (`Telemetry.groups`; schema 23): a list of groups, each
+    a mapping of exactly `_GROUP_FIELDS` -- its title and section words, its settings a list of one
+    or more names, its sentence a word or `None` -- else a malformed frame (`TypeError`, which
+    `decode` makes a `FrameError`): the page builds a box's fields from them."""
+    if not isinstance(data, list):
+        raise TypeError(f"a frame's groups are a list, not {data!r}")
+    groups = []
+    for group in data:
+        if not isinstance(group, dict) or set(group) != _GROUP_FIELDS:
+            raise TypeError(f"a group is its name, settings, sentence and section, not {group!r}")
+        settings = group["settings"]
+        if (not isinstance(settings, list) or not settings
+                or not all(isinstance(name, str) and name for name in settings)):
+            raise TypeError(f"a group's settings are one or more names, not {settings!r}")
+        sentence = group["sentence"]
+        if sentence is not None:
+            _word_of(sentence)
+        if not _word_of(group["name"]):
+            raise TypeError("a group's name is a word, not empty")
+        groups.append(GroupRow(name=group["name"], settings=tuple(settings), sentence=sentence,
+                               section=_word_of(group["section"])))
+    return tuple(groups)
+
+
 def _pooled_in(data: dict | None) -> Pooled | None:
     """The trainer's panel's pool off the wire (schema 20), each field read by name."""
     if data is None:
@@ -2158,15 +2661,16 @@ def _telemetry_from(data: dict) -> Telemetry:
         staged=tuple(Staged(**{**s, "by": actors.from_map(s["by"]),
                                  "overrides": tuple(s["overrides"]),
                                  "hands_back": _flag(s["hands_back"]),
-                                 "to": _destination(s["to"])})
+                                 "to": _destination(s["to"]),
+                                 "cid": _cid_of(s["cid"]),
+                                 "warnings": _words_of(s["warnings"])})
                      for s in data["staged"]),
         refusals=tuple(_refused_in(r) for r in data["refusals"]),
         refusals_dropped=data["refusals_dropped"],
         task=data["task"],
         allocation=data["allocation"],
         bounds_config=data["bounds_config"],
-        params=tuple(ParamRow(**{**p, "conditions": tuple(p["conditions"])})
-                     for p in data["params"]),
+        params=tuple(_row_in(p) for p in data["params"]),
         floor_ml=data["floor_ml"],
         out_of_cage_limit_s=data["out_of_cage_limit_s"],
         wall_at=data["wall_at"],
@@ -2245,6 +2749,10 @@ def _telemetry_from(data: dict) -> Telemetry:
         bars=_bars_in(data["bars"]),
         pool=_pooled_in(data["pool"]),
         demo=_flag(data["demo"]),
+        shaping=_word_of(data["shaping"]),
+        full_task=_flag(data["full_task"]),
+        groups=_groups_in(data["groups"]),
+        withdrawals=_cids_of(data["withdrawals"]),
     )
 
 
@@ -2265,6 +2773,11 @@ class SetParameter:
     name: str
     value: float | str
     by: Actor
+    #: **The command id the page made for this press** (schema 23; the console interface design's
+    #: goal 4): printable text of 1 to `CID_LIMIT` characters, carried beside the command's fields
+    #: and never inside a value (`_cid`, not `_setting`), which the verdict echoes (`Staged.cid`,
+    #: `Refused.cid`); `None` where the sender made none.
+    cid: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2524,6 +3037,21 @@ class Training:
 
 
 @dataclass(frozen=True, slots=True)
+class Shaping:
+    """**Move the training switch** (the console settings design's §8; the PI, 2026-11-16: "both, a
+    freeze training option and a full task option"): `position` one of `task.SHAPING` -- `"on"`,
+    training as declared; `"frozen"`, the stage, the staircases' levels and the pool's pairings
+    held, no move, no suggestion and no step, its trials counted toward no bar; `"full"`, the
+    plan's full task (`task.Plan.full`) -- staged to the next trial, recorded as a `shaping` change
+    row and revertible (`taskd.Session._shaping`). Recorded with who moved it."""
+
+    KIND: ClassVar[str] = "shaping"
+
+    position: str
+    by: Actor
+
+
+@dataclass(frozen=True, slots=True)
 class NextBlock:
     """**Move the run on to its next block** (engine build C2b; the PI, 2026-10-19, "'Next' and
     'back one'": "Both directions by hand, each recorded with who"): the block its plan's order
@@ -2579,6 +3107,8 @@ class HandBack:
 
     name: str
     by: Actor
+    #: The page's command id, as `SetParameter.cid` (schema 23).
+    cid: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2598,6 +3128,159 @@ class SetRange:
     name: str
     numbers: dict[str, float]
     by: Actor
+    #: The page's command id, as `SetParameter.cid` (schema 23).
+    cid: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SetForm:
+    """**A person asks that a timing setting be drawn each trial, from a shape they give** (the
+    console settings design's §3; the PI, 2026-11-16: every timing setting "fixed or drawn",
+    staged until the next trial like any change): setting `name` drawn from `shape`, one of
+    `task.SHAPES` -- or `"scaled"`, a size's scaling by eccentricity (the design's §5) -- from the next
+    trial, recorded as a change, over what the block gives it until a typed value, a hand-back or
+    a revert ends it. **Its own command, never a `SetParameter` or a `SetRange`**: `numbers` are
+    the shape's by name (a non-aging wait's `shortest` and `longest`, a uniform's `low` and `high`,
+    a normal's `mean`, `sd`, `low` and `high`, a scaling's `factor`; none for a list), and
+    `values` and `weights` a list's, at most `LISTED_LIMIT` each; every one decoded by `_setting`,
+    M8's rule, welfare-listed and called unchanged, so each is a finite `float`, a word refused
+    (`_numbers`, `_listed`). Which shapes the setting takes and whether the draw can be drawn are
+    the session's to judge (`taskd.Session._form`), since only the task knows its settings."""
+
+    KIND: ClassVar[str] = "form"
+
+    name: str
+    shape: str
+    numbers: dict[str, float]
+    by: Actor
+    values: tuple = ()
+    weights: tuple = ()
+    #: The page's command id, as `SetParameter.cid` (schema 23).
+    cid: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SetColor:
+    """**A person picks a color setting's hue on its card** (the console settings design's §6; the
+    PI, 2026-11-16: "you select a set, and then you have hue options from the set"): setting
+    `name` to the one choice it declares whose color-set light is `color` of set `colorset`
+    (`task.color_choices`), from the next trial, through `Session.set` unchanged as the choice it
+    names (`taskd.Session._color`), so it is recorded as any value set is. **Its own command,
+    never a `SetParameter`**: a console sends words alone (`_setting`), and a pick names the set
+    and the hue, never a choice's place in a list. Each of the three is text of 1 to
+    `TEXT_LIMIT` characters; which choice they name is the session's to say."""
+
+    KIND: ClassVar[str] = "color"
+
+    name: str
+    colorset: str
+    color: str
+    by: Actor
+    #: The page's command id, as `SetParameter.cid` (schema 23).
+    cid: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SetChoice:
+    """**A person picks one of a setting's declared choices on its box, by its words** (the pop-out
+    revision's design §2: each look's shape "a setting on the console"; its plan's Task 5b): setting
+    `name` to the one choice it declares whose words are `choice` (`choice_words`, the words
+    `ParamRow.choices` gives), from the next trial, through `Session.set` unchanged as the choice it
+    names (`taskd.Session._choice`), so it is recorded as any value set is. **Its own command,
+    never a `SetParameter`**: a look is no number and no word `_setting` takes, and a pick names
+    the choice by the words the box showed it by, never its place in a list. Both fields are text
+    of 1 to `TEXT_LIMIT` characters, decoded as `SetColor`'s are (`_word`), never by `_setting`;
+    which choice the words name is the session's to say."""
+
+    KIND: ClassVar[str] = "choice"
+
+    name: str
+    choice: str
+    by: Actor
+    #: The page's command id, as `SetParameter.cid` (schema 23).
+    cid: str | None = None
+
+
+#: **The most changes one `ApplyMany` may carry** (the console interface plan's Task 4): a bound on
+#: one packet's reach into the refusals, the record and every frame, as `VALUES_LIMIT` is, not a rule
+#: about boxes -- no task here declares half as many settings.
+APPLY_LIMIT = 64
+
+#: **The kinds of change an `ApplyMany` carries** (the console interface design's goal 2): a value,
+#: a drawn range, a person's draw, a color's pick and, since the pop-out revision's Task 5b, a
+#: choice's pick by its words, each as its own command's fields. A hand-back, a revert and every
+#: other command are sent on their own.
+APPLY_KINDS = ("set", "range", "form", "color", "choice")
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyMany:
+    """**Several changes applied together** (the console interface design's goal 2; the PI, 2026-11-19,
+    "Apply per box, plus Apply all"): a group box's Apply or an Apply all, one act, **judged together
+    and staged together, or refused whole** (`taskd.Session._apply_many`), as a revert is judged: a
+    change that only works with another goes with it, and one refused refuses them all, none staged.
+    `changes` are 1 to `APPLY_LIMIT` of `SetParameter`, `SetRange`, `SetForm`, `SetColor` and
+    `SetChoice`, each
+    with this command's `by` and no command id of its own, each decoded by its own kind's rule, so
+    every value and number passes `_setting`, M8's rule, welfare-listed and called unchanged. **A
+    reward size is never among them** (XC-527): a welfare ceiling's name in one refuses the whole,
+    with a sentence. `cid` is the page's command id for the press, required, which every staged row
+    and every refusal of it echoes, and which a `Withdraw` names."""
+
+    KIND: ClassVar[str] = "apply_many"
+
+    changes: tuple
+    cid: str
+    by: Actor
+
+
+@dataclass(frozen=True, slots=True)
+class Withdraw:
+    """**A change waiting for the next trial, taken back** (the console interface design's goal 3; the
+    PI, 2026-11-19, "Yes, a withdraw button"): every change the act of command id `cid` staged --
+    a box's Apply, a group box's or an Apply all, which is one act -- removed before it applies, and
+    recorded as a `withdrawn` change row for each setting it covered (`taskd.Session._withdraw`;
+    XC-529). Refused, writing no row, once it has applied ("already in force from trial N"), where
+    nothing of that id waits, and for a reward size, which is never withdrawn (XC-527)."""
+
+    KIND: ClassVar[str] = "withdraw"
+
+    cid: str
+    by: Actor
+
+
+@dataclass(frozen=True, slots=True)
+class DefineColor:
+    """**A person defines a new color from a color card's panel** (the console settings design's
+    §6; the PI, 2026-11-16: "1,2,or 3. you select an option and then enter the info", "Saved into a
+    color set file"; its plan's Task 8, "Proposed file first"): color `name` of set `colorset` --
+    a new set of that name where `new_set` -- by `method`, one of `colordef.METHODS`, its `numbers`
+    named (`colordef.NUMBERS`). **Taken by the service, never a run** (`service.Service
+    ._define_color`, in any phase): it writes the set's file with the color added under
+    `stimuli/proposed/` beside `--tasks`, for the PI to review and commit, and never the set's own
+    file. Its words are text of 1 to `TEXT_LIMIT` characters, its numbers decoded by `_setting` as a
+    range's are (`_numbers`, kind `define_color`); which numbers a method takes, and whether the
+    name is free in the set, are the service's to say."""
+
+    KIND: ClassVar[str] = "define_color"
+
+    colorset: str
+    new_set: bool
+    name: str
+    method: str
+    numbers: dict[str, float]
+    by: Actor
+
+
+#: **The shapes a `form` command may name on the wire**: the five a timing card draws
+#: (`task.SHAPES`) and a size's scaling (`task.Scaled`; the design's §5), which the session takes
+#: on a size setting alone (`taskd.Session._scale`).
+FORM_SHAPES = (*SHAPES, "scaled")
+
+#: **The most values, and the most weights, one `SetForm` may carry**: a bound on one packet's reach
+#: into a refusal row, the record and every frame, as `VALUES_LIMIT` is, not a rule about draws --
+#: a list on a card is typed by hand (the console settings plan's Global Constraints, TSK-75).
+LISTED_LIMIT = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -2633,10 +3316,17 @@ Command = (
     | ClearOwed
     | Drum
     | Training
+    | Shaping
     | NextBlock
     | BackBlock
     | HandBack
     | SetRange
+    | SetForm
+    | SetColor
+    | SetChoice
+    | ApplyMany
+    | Withdraw
+    | DefineColor
     | Revert
     | Decline
 )
@@ -2709,8 +3399,10 @@ def _encode_command(command: Command) -> bytes:
     since P4d-2b b3a `OpenSession`, `CheckRun`, `StartRun` and `EndSession`, since
     XC-026 `ResumeSession`, since engine build C2a `ClearOwed`, `Drum` and `Training`, since C2b
     `NextBlock` and `BackBlock`, since C3 `HandBack`, `SetRange` and `Revert`, and since the
-    pop-out search build `Decline` and the `suggestion` a `NextBlock` or a `BackBlock` confirms --
-    tagged by kind so `_decode_command` knows which dataclass to rebuild.
+    pop-out search build `Decline` and the `suggestion` a `NextBlock` or a `BackBlock` confirms,
+    and since the console interface rework `ApplyMany`, its changes each by its own kind's fields
+    (`_change_fields`), and `Withdraw` -- tagged by kind so `_decode_command` knows which dataclass
+    to rebuild.
 
     Private, unlike `encode`/`decode`: its callers are `ZmqConsole.send` and
     `ZmqCommands.deliver`, both in this same file, so this is an implementation detail
@@ -2732,6 +3424,7 @@ def _encode_command(command: Command) -> bytes:
             "name": command.name,
             "value": command.value,
             "by": actors.to_map(command.by),
+            "cid": command.cid,
         }
     elif isinstance(command, (Stop, Pause, Resume, CancelScheduledStop, ManualReward)):
         payload = {"kind": command.KIND, "by": actors.to_map(command.by)}
@@ -2797,16 +3490,59 @@ def _encode_command(command: Command) -> bytes:
     elif isinstance(command, Training):
         payload = {"kind": "training", "by": actors.to_map(command.by), "setting": command.setting,
                    "on": command.on}
+    elif isinstance(command, Shaping):
+        payload = {"kind": "shaping", "by": actors.to_map(command.by), "position": command.position}
     elif isinstance(command, HandBack):
-        payload = {"kind": "hand_back", "by": actors.to_map(command.by), "name": command.name}
+        payload = {"kind": "hand_back", "by": actors.to_map(command.by), "name": command.name,
+                   "cid": command.cid}
     elif isinstance(command, SetRange):
         payload = {"kind": "range", "by": actors.to_map(command.by), "name": command.name,
-                   "numbers": dict(command.numbers)}
+                   "numbers": dict(command.numbers), "cid": command.cid}
+    elif isinstance(command, SetForm):
+        payload = {"kind": "form", "by": actors.to_map(command.by), "name": command.name,
+                   "shape": command.shape, "numbers": dict(command.numbers),
+                   "values": list(command.values), "weights": list(command.weights),
+                   "cid": command.cid}
+    elif isinstance(command, SetColor):
+        payload = {"kind": "color", "by": actors.to_map(command.by), "name": command.name,
+                   "colorset": command.colorset, "color": command.color, "cid": command.cid}
+    elif isinstance(command, SetChoice):
+        payload = {"kind": "choice", "by": actors.to_map(command.by), "name": command.name,
+                   "choice": command.choice, "cid": command.cid}
+    elif isinstance(command, DefineColor):
+        payload = {"kind": "define_color", "by": actors.to_map(command.by),
+                   "colorset": command.colorset, "new_set": command.new_set, "name": command.name,
+                   "method": command.method, "numbers": dict(command.numbers)}
     elif isinstance(command, Revert):
         payload = {"kind": "revert", "by": actors.to_map(command.by), "change": command.change}
+    elif isinstance(command, ApplyMany):
+        payload = {"kind": "apply_many", "by": actors.to_map(command.by), "cid": command.cid,
+                   "changes": [_change_fields(change) for change in command.changes]}
+    elif isinstance(command, Withdraw):
+        payload = {"kind": "withdraw", "by": actors.to_map(command.by), "cid": command.cid}
     else:
         raise TypeError(f"no wire encoding for {command!r}")
     return msgpack.packb(payload, use_bin_type=True)
+
+
+def _change_fields(change) -> dict:
+    """**One change of an `ApplyMany`, as its own kind's fields** (`_encode_command`), with no `by`
+    and no `cid`: the act's are the command's own."""
+    if isinstance(change, SetParameter):
+        return {"kind": "set", "name": change.name, "value": change.value}
+    if isinstance(change, SetRange):
+        return {"kind": "range", "name": change.name, "numbers": dict(change.numbers)}
+    if isinstance(change, SetForm):
+        return {"kind": "form", "name": change.name, "shape": change.shape,
+                "numbers": dict(change.numbers), "values": list(change.values),
+                "weights": list(change.weights)}
+    if isinstance(change, SetColor):
+        return {"kind": "color", "name": change.name, "colorset": change.colorset,
+                "color": change.color}
+    if isinstance(change, SetChoice):
+        return {"kind": "choice", "name": change.name, "choice": change.choice}
+    raise TypeError(f"an apply of several carries values, ranges, draws, colors and choices, not "
+                    f"{change!r}")
 
 
 class CommandRefused(ValueError):
@@ -2961,6 +3697,84 @@ def _word(data: dict, key: str, kind: str, by: Actor, *, optional: bool = False)
     return value
 
 
+#: **The kinds a page's box sends that carry its command id** (`_cid`; schema 23; the console
+#: interface design's goal 4): a value, a hand-back, a range, a person's draw and a color's pick, and
+#: since its plan's Task 4 an apply of several and a withdrawal, which require one (`_named_cid`),
+#: and since the pop-out revision's Task 5b a choice's pick.
+CID_KINDS = frozenset({"set", "hand_back", "range", "form", "color", "choice", "apply_many",
+                       "withdraw"})
+
+
+def _is_cid(value: object) -> bool:
+    """Whether `value` is a command id a page may make: printable text of 1 to `CID_LIMIT`
+    characters."""
+    return (isinstance(value, str) and 0 < len(value) <= CID_LIMIT and value.isprintable())
+
+
+def _cid(data: dict, kind: str, by: Actor) -> str | None:
+    """**A box command's command id** (schema 23; `CID_KINDS`): absent or `None` for none, else
+    printable text of 1 to `CID_LIMIT` characters, refused otherwise, naming the field. **Beside
+    the command's fields, never inside a value**: `_setting`, M8's rule and welfare-listed, is not
+    asked, and no value passes through here."""
+    value = data.get("cid")
+    if value is None:
+        return None
+    if not _is_cid(value):
+        raise CommandRefused(
+            kind,
+            by,
+            f"a {kind!r} command's cid is printable text of 1 to {CID_LIMIT} characters, and "
+            f"{_quoted(value)} is not, so it is refused",
+        )
+    return value
+
+
+def _named_cid(data: dict, kind: str, by: Actor) -> str:
+    """**The command id an `ApplyMany` or a `Withdraw` names**, required: `_cid`'s rule, and refused
+    where absent, since the act it stages, or takes back, is known by it alone."""
+    cid = _cid(data, kind, by)
+    if cid is None:
+        raise CommandRefused(
+            kind, by,
+            f"a {kind!r} command names its act by a cid, printable text of 1 to {CID_LIMIT} "
+            f"characters, and it names none, so it is refused",
+        )
+    return cid
+
+
+def _changes(data: dict, by: Actor) -> tuple:
+    """**An `ApplyMany`'s changes**: 1 to `APPLY_LIMIT` of them, each an object of one of
+    `APPLY_KINDS` holding no `by` and no `cid` of its own (the act's are the command's), each
+    decoded by its own kind's rule in `_command_from` -- a value by `_setting`, a range's and a
+    draw's numbers by `_numbers` and `_listed`, each through `_setting`, M8's rule, called
+    unchanged -- with the command's `by`. Anything else is refused, naming it."""
+    changes = data.get("changes")
+    if not isinstance(changes, (list, tuple)) or not 1 <= len(changes) <= APPLY_LIMIT:
+        raise CommandRefused(
+            "apply_many", by,
+            f"an 'apply_many' command's changes are 1 to {APPLY_LIMIT} in a list, and "
+            f"{_quoted(changes)} is not that, so it is refused",
+        )
+    decoded = []
+    for change in changes:
+        if not isinstance(change, dict) or change.get("kind") not in APPLY_KINDS:
+            kind = change.get("kind") if isinstance(change, dict) else change
+            raise CommandRefused(
+                "apply_many", by,
+                f"an 'apply_many' command's changes are each a {', '.join(APPLY_KINDS[:-1])} or "
+                f"{APPLY_KINDS[-1]}, and {_quoted(kind)} is none of them, so it is refused",
+            )
+        own = sorted(key for key in ("by", "cid") if key in change)
+        if own:
+            raise CommandRefused(
+                "apply_many", by,
+                f"a change in an 'apply_many' command takes no {' or '.join(own)} of its own: the "
+                f"act's are the command's, so it is refused",
+            )
+        decoded.append(_command_from({**change, "by": data.get("by")}))
+    return tuple(decoded)
+
+
 def _values(data: dict, kind: str, by: Actor) -> dict:
     """A run's starting values: at most `VALUES_LIMIT` names, each a parameter name, each
     value what a setting may be (`_setting`, M8's rule, called unchanged)."""
@@ -2982,26 +3796,29 @@ def _values(data: dict, kind: str, by: Actor) -> dict:
     return checked
 
 
-def _numbers(data: dict, name: str, by: Actor) -> dict[str, float]:
-    """A live range's numbers (engine build C3, the C3 spec §6): 1 to `NUMBERS_LIMIT` of them, each
-    named by text of 1 to `TEXT_LIMIT` characters, each value decoded by `_setting`, M8's rule,
-    called unchanged and filed under the setting `name` as a value is. `_setting` lets a word
-    through for a categorical setting; a range's numbers are numbers, so a word is refused here."""
+def _numbers(data: dict, name: str, by: Actor, *, kind: str = "range") -> dict[str, float]:
+    """A live range's numbers (engine build C3, the C3 spec §6), or a person's draw's (`kind`
+    `"form"`; the console settings build): 1 to `NUMBERS_LIMIT` of them, each named by text of 1
+    to `TEXT_LIMIT` characters, each value decoded by `_setting`, M8's rule, called unchanged and
+    filed under the setting `name` as a value is. `_setting` lets a word through for a categorical
+    setting; a range's numbers are numbers, so a word is refused here. Each sentence names `kind`'s
+    command."""
     numbers = data.get("numbers")
     if not isinstance(numbers, dict) or not 1 <= len(numbers) <= NUMBERS_LIMIT:
         raise CommandRefused(
-            "range",
+            kind,
             by,
-            f"a 'range' command's numbers are 1 to {NUMBERS_LIMIT} named numbers, and "
+            f"a {kind!r} command's numbers are 1 to {NUMBERS_LIMIT} named numbers, and "
             f"{_quoted(numbers)} is not that, so it is refused",
         )
+    drawn = {"range": "drawn range", "define_color": "new color"}.get(kind, f"drawn {kind}")
     checked = {}
     for key, value in numbers.items():
         if not isinstance(key, str) or not key or len(key) > TEXT_LIMIT:
             raise CommandRefused(
-                "range",
+                kind,
                 by,
-                f"a range's number is named by text of 1 to {TEXT_LIMIT} characters, and "
+                f"a {kind}'s number is named by text of 1 to {TEXT_LIMIT} characters, and "
                 f"{_quoted(key)} is not, so it is refused",
             )
         number = _setting(value, name, by)
@@ -3009,12 +3826,42 @@ def _numbers(data: dict, name: str, by: Actor) -> dict[str, float]:
             raise CommandRefused(
                 name,
                 by,
-                f"{name!r} was sent the word {_quoted(number)} as its {key!r}: a drawn range's "
+                f"{name!r} was sent the word {_quoted(number)} as its {key!r}: a {drawn}'s "
                 f"numbers are finite numbers, never a word, so it is refused and the session "
                 f"runs on",
             )
         checked[key] = number
     return checked
+
+
+def _listed(data: dict, key: str, name: str, by: Actor) -> tuple[float, ...]:
+    """**A person's draw's `values` or `weights`** (`SetForm`; the console settings build): absent
+    or a list of at most `LISTED_LIMIT`, each decoded by `_setting`, M8's rule, called unchanged
+    and filed under the setting `name` as a value is; a word among them refused, as a range's
+    numbers refuse one (`_numbers`)."""
+    items = data.get(key)
+    if items is None:
+        return ()
+    if not isinstance(items, (list, tuple)) or len(items) > LISTED_LIMIT:
+        raise CommandRefused(
+            "form",
+            by,
+            f"a 'form' command's {key} are at most {LISTED_LIMIT} numbers in a list, and "
+            f"{_quoted(items)} is not that, so it is refused",
+        )
+    checked = []
+    for item in items:
+        number = _setting(item, name, by)
+        if isinstance(number, str):
+            raise CommandRefused(
+                name,
+                by,
+                f"{name!r} was sent the word {_quoted(number)} among its {key}: a drawn form's "
+                f"{key} are finite numbers, never a word, so it is refused and the session runs "
+                f"on",
+            )
+        checked.append(number)
+    return tuple(checked)
 
 
 def _decode_command(payload: bytes) -> Command:
@@ -3055,7 +3902,8 @@ def _command_from(data: dict) -> Command:
                 f"({_quoted(name)}), so it is refused",
             )
         by = _actor(data.get("by"), name)
-        return SetParameter(name=name, value=_setting(data.get("value"), name, by), by=by)
+        return SetParameter(name=name, value=_setting(data.get("value"), name, by), by=by,
+                            cid=_cid(data, kind, by))
     simple = {
         command.KIND: command
         for command in (Stop, Pause, Resume, CancelScheduledStop, ManualReward)
@@ -3256,13 +4104,72 @@ def _command_from(data: dict) -> Command:
                 f"neither, so it is refused",
             )
         return Training(setting=data["setting"], on=data["on"], by=by)
+    if kind == "shaping":
+        by = _actor(data.get("by"), kind)
+        if data.get("position") not in SHAPING:
+            raise CommandRefused(
+                "shaping", by,
+                f"the training switch is {', '.join(SHAPING[:-1])} or {SHAPING[-1]}, and "
+                f"{_quoted(data.get('position'))} is none of them, so it is refused",
+            )
+        return Shaping(position=data["position"], by=by)
     if kind == "hand_back":
         by = _actor(data.get("by"), kind)
-        return HandBack(name=_word(data, "name", kind, by), by=by)
+        return HandBack(name=_word(data, "name", kind, by), by=by, cid=_cid(data, kind, by))
     if kind == "range":
         by = _actor(data.get("by"), kind)
         name = _word(data, "name", kind, by)
-        return SetRange(name=name, numbers=_numbers(data, name, by), by=by)
+        return SetRange(name=name, numbers=_numbers(data, name, by), by=by,
+                        cid=_cid(data, kind, by))
+    if kind == "form":
+        by = _actor(data.get("by"), kind)
+        name = _word(data, "name", kind, by)
+        shape = data.get("shape")
+        if not isinstance(shape, str) or shape not in FORM_SHAPES:
+            raise CommandRefused(
+                kind, by,
+                f"a 'form' command's shape is one of {', '.join(FORM_SHAPES)}, and "
+                f"{_quoted(shape)} is not one, so it is refused",
+            )
+        # A list's draw carries no numbers; any it does carry are decoded as a range's are, and
+        # the session says which its shape takes (`taskd.Session._form`).
+        numbers = ({} if data.get("numbers") in (None, {})
+                   else _numbers(data, name, by, kind=kind))
+        return SetForm(name=name, shape=shape, numbers=numbers, by=by,
+                       values=_listed(data, "values", name, by),
+                       weights=_listed(data, "weights", name, by), cid=_cid(data, kind, by))
+    if kind == "color":
+        by = _actor(data.get("by"), kind)
+        return SetColor(name=_word(data, "name", kind, by),
+                        colorset=_word(data, "colorset", kind, by),
+                        color=_word(data, "color", kind, by), by=by,
+                        cid=_cid(data, kind, by))
+    if kind == "choice":
+        by = _actor(data.get("by"), kind)
+        return SetChoice(name=_word(data, "name", kind, by),
+                         choice=_word(data, "choice", kind, by), by=by,
+                         cid=_cid(data, kind, by))
+    if kind == "define_color":
+        by = _actor(data.get("by"), kind)
+        new_set = data.get("new_set")
+        if not isinstance(new_set, bool):
+            raise CommandRefused(
+                kind, by,
+                f"a 'define_color' command's new_set is true or false, and {_quoted(new_set)} is "
+                f"neither, so it is refused",
+            )
+        from wl_xcon.colordef import METHODS
+
+        method = data.get("method")
+        if not isinstance(method, str) or method not in METHODS:
+            raise CommandRefused(
+                kind, by,
+                f"a new color is defined by {', '.join(METHODS)}, and {_quoted(method)} is none of "
+                f"them, so it is refused",
+            )
+        name = _word(data, "name", kind, by)
+        return DefineColor(colorset=_word(data, "colorset", kind, by), new_set=new_set, name=name,
+                           method=method, numbers=_numbers(data, name, by, kind=kind), by=by)
     if kind == "revert":
         by = _actor(data.get("by"), kind)
         change = data.get("change")
@@ -3278,6 +4185,13 @@ def _command_from(data: dict) -> Command:
                 f"run's start or a change id, and {_quoted(change)} is not one, so it is refused",
             )
         return Revert(change=change, by=by)
+    if kind == ApplyMany.KIND:
+        by = _actor(data.get("by"), kind)
+        cid = _named_cid(data, kind, by)
+        return ApplyMany(changes=_changes(data, by), cid=cid, by=by)
+    if kind == Withdraw.KIND:
+        by = _actor(data.get("by"), kind)
+        return Withdraw(cid=_named_cid(data, kind, by), by=by)
     raise ValueError(f"unknown command kind on the wire: {_quoted(kind)}")
 
 
@@ -3514,17 +4428,24 @@ _COMMAND_EXPOSURE = {
     "clear": ("both", "clear trials from a condition's count"),
     "drum": ("both", "switch drumming"),
     "training": ("both", "switch a training setting"),
+    "shaping": ("both", "switch training on, frozen or to the plan's full task"),
     "next_block": ("both", "move the run on a block"),
     "back_block": ("both", "move the run back a block"),
     "decline": ("both", "hold a stage move or a widening the rig suggests"),
     "hand_back": ("both", "hand a held setting back"),
     "range": ("both", "change a drawn range"),
+    "form": ("both", "draw a timing setting each trial from a shape a person gives"),
+    "color": ("both", "pick a color setting's hue by its set"),
+    "choice": ("both", "pick one of a setting's declared choices by its words"),
+    "apply_many": ("both", "apply several setting changes together, to the same trial"),
+    "withdraw": ("both", "withdraw a setting change still waiting for the next trial"),
     "revert": ("both", "take the run's settings and ranges back to an earlier change"),
     "open": ("taskd", "open a session, recording the animal's departure time and the fluid it has already had today, and accepting warnings"),
     "check": ("taskd", "take a run's pre-flight"),
     "start": ("taskd", "start a run, acknowledging its unknown pre-flight items"),
     "end": ("taskd", "end a session, recording the animal's return time"),
     "resume_session": ("taskd", "resume a stranded session"),
+    "define_color": ("taskd", "write a new color as a color set's proposed file, in the stimuli folder beside its tasks folder"),
 }
 
 

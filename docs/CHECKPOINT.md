@@ -1,6 +1,6 @@
 # Where this build is
 
-**Last updated 2026-11-16**, at the commit this file was committed in (`git log -1 -- docs/CHECKPOINT.md`). **This page
+**Last updated 2026-11-21**, at the commit this file was committed in (`git log -1 -- docs/CHECKPOINT.md`). **This page
 is the current state only, and stays one page** (the PI, 2026-11-07, after a whole-project audit). Every earlier
 entry, 2026-08-31 to 2026-11-07, is in `docs/CHECKPOINT-history-2026-08-31-to-2026-11-07.md`, unchanged: read one
 there only when this page or a backlog line sends you to it. A session ends by updating this page (CLAUDE.md).
@@ -26,22 +26,32 @@ from then). **Hardware verified: none.**
 if the box cannot be reached the rig refuses to open and says why. Its client is XC-460; until then the operator's.
 
 ## Where the branches are
-- **`main` is `1d77392`**: the pop-out search (merged 2026-11-09) and wl-preproc's XC-491 answers, merged on the
-  PI's "Merge it". wl-preproc's pop-out reader is on its main, `d8fe06b`, and reads them.
-- **Demo mode is built on `demo-build-2026-11-14`** (worktree `.claude/worktrees/demo-plan-2026-11-10`; its plan
-  `docs/superpowers/plans/2026-11-10-demo-mode.md`, its design `docs/superpowers/specs/2026-10-06-demo-mode-design.md`),
-  with main `1d77392` merged in; its whole-build review and the scoped re-review of its fix round (2026-11-16) are
-  answered, every finding fixed. **His welfare review is done** (2026-11-16, design §15 item 3): `_open`'s two
-  changes approved as built (`tools/welfare_diff.py 1d77392 HEAD`: `_open` alone `DIFFERS`), and a real record in
-  the demo folder held and settled there "fine as built". **It waits on, in order:** his try-out in Safari, `wlx demo
-  wl-xtasks/tasks/popout_search.py --set response_deadline=3.0`; and his merge, by his yes by name and a clean CI.
-  **Changed during the try-out** (2026-11-16, his find): an eye already in a window as its state begins has entered it (EYE-30).
-- **Tell him first, in plain words**: the run begins when he first points at the demo screen; after Escape or a
-  switch of tab the trial under way ends as tracker lost and the run waits until he moves the pointer on it again; a
-  slow glide (600 ms) can still end on the pop-out's own 0.3 s landing bound, the try-out's question, a little more
-  often for the easing (a few ms longer on average), and a quick flick is the steady answer; one page steers at a
-  time; colors and durations cannot be judged on the Mac's monitor; and a rig's `--demo-root` is a folder of its own
-  (a real session found there is held as the session it is, and named at every start).
+**The repositories moved** to the `westerberg-lab-be` organization on 2026-11-21 (`f637bc99`; old URLs redirect).
+- **`main` is the console build's merge** (this page's commit), merged 2026-11-21 on the PI's "Merge it": the console
+  settings build, the console interface rework (each setting a box with its own Apply, groups, percents, find and
+  pins, telemetry schema 23), the summary-and-editor layout, the pop-out revision (TSK-78 to TSK-80, codes
+  4139-4145), the pop-out mouse flake fix (pitfall P29), one whole-build review and its fix wave, and the PI's
+  Safari try-out answers ("ring" everywhere; a too-dim panel starts at its reachable top with a warning; the
+  Special trials line never cuts). Evidence: push CI 44954599943 clean; full sweep 44746169158 read to every
+  shard's end (4 survivors, all fixed); the 97 changed functions no shard reached broken by hand, one at a time, all
+  caught, each confirmed alone (`.superpowers/handbreak-web-2026-11-21/`); welfare diff against `89f7b94` all SAME.
+  **wl-xtasks' main is `3de82c2`** (the revised pop-out); CI checks out its main again.
+- **Built, unmerged, local** (each also bundled in `.superpowers/migration-2026-11-21/`; ledgers in each worktree's
+  `.superpowers/sdd/`). Each merges the new main in before it is pushed:
+  - **`xc505-warning`** (`7d53d9de`) and **`nightly-flakes`** (`cf256b5c`): built and reviewed; merge next, in that
+    order, each on the PI's yes after CI (nightly-flakes at its merge: pitfall P30's number, its backlog line).
+  - **`rig-readings`** (XC-434/435; `ab451a73`): every animal has an ID (element-animal's `subject`, at most 8
+    lowercase) and a Nickname (at most 64), the PI's ruling of 2026-11-21; `/health` readings for wl.works. Built,
+    reviewed, fix wave re-reviewed clean. Its push sweeps every module (it edits `mutation_gate.py`), so it is
+    pushed only after the CI-time build. At its merge: `out_since` to the PI as a numbered welfare item.
+  - **`build-e`** (the display process; plan `docs/superpowers/plans/2026-11-20-build-e.md` on the branch): Tasks
+    1-7 done on OrbStack's Linux (lavapipe), standing in for wh-dws0. The PI, 2026-11-21: wh-dws0 may be used over
+    SSH for off-screen tests; ask him again before any on-screen run. Next: Task 8, `direct` and `window` on
+    wh-dws0.
+  - **Telemetry schema**: build-e and rig-readings each take `link.SCHEMA` 24; the second to merge renumbers to 25.
+- **The CI-time build** (the PI, 2026-11-21: "holding up other repos"; he chose likely tests first, a cap on machines
+  at once, and skipping unchanged nights): design and plan approved, in `.superpowers/migration-2026-11-21/`
+  (`ci-time-design.md`, `ci-time-plan.md`); cut `ci-time` from this main and build it next.
 
 ## What exists
 - **Tasks**: the task object and its load check (`task.py`, `check.py`), engine builds A1 to C3; five reference
@@ -54,21 +64,28 @@ if the box cannot be reached the rig refuses to open and says why. Its client is
 - **Running**: the trial loop, daemon and CLI (`run.py`, `taskd.py`, `cli.py`); the simulated animal and eye.
 - **The console**: a page on the LAN (`serve.py`, `web.py`, `link.py`), writes from the box only; wl.works sign-in
   waits on the rig's https page (XC-151, XC-152).
-- **Demo mode** (on the branch above; XC-013): the mouse as the eye (`pointer.py`), the exact drawer's frames on the
+- **Demo mode** (`wlx demo <task>`; XC-013): the mouse as the eye (`pointer.py`), the exact drawer's frames on the
   page (`demoscreen.py`), `POST /gaze`, `wlx taskd --demo`, `wlx demo` (`demo.py`), and a demo from a live rig's page
-  (`--demo-root`, `--link`'s fourth endpoint). Open: XC-506 (fidelity), XC-509 (the rig lock on macOS).
+  (`--demo-root`, `--link`'s fourth endpoint). Open: XC-506 (fidelity), XC-509 (the rig lock on macOS), XC-515
+  (Ctrl-C raised where it lands in `wlx taskd` and `wlx serve`; `wlx demo` counts it, `demo.py`'s docstring).
 - **Welfare** (`bounds.py`, `welfare.py`, `marks.py`, `stranded.py` and the functions architecture.md lists, held to
   `tests/welfare_manifest.json`): one limit, out of the cage to back in, eight hours (the institution's); the day's
   fluid is a floor; each delivery's size is a ceiling; a task names how reward is configured, never how much. **The
   record**: the session folder `xcon/` that wl-preproc reads (`record.py`).
 
-## What is next (the PI, 2026-11-07 and 2026-11-14)
-1. **Demo mode's welfare review, try-out and merge** (above).
-2. **The XC-505 warning**, a side build after demo mode (the PI, 2026-11-14: "Warn when settings allow it").
-3. **Then the display (build E)**, designed with the PI; "done" includes a real screen.
-4. **Side work on the January path**: the sync-box client (XC-460), the operator's guide (XC-014, with a rig's demo
-   set-up), the default limits file (XC-459, a welfare design with the PI), and wl-preproc's C3 fixture (XC-510).
-5. **Paused until the pop-out search has run on a rig**: engine builds C4 to C9 and the rig-edit build.
+## What is next (the PI, 2026-11-07 to 2026-11-21)
+In order:
+1. **The CI-time build**, then the merges of **xc505-warning** and **nightly-flakes**, then **rig-readings**; each
+   merge on his yes by name after clean CI.
+2. **Build E, the display**: Task 8 onward (`direct` on wh-dws0, the fault path with its welfare review, the desktop
+   proof at 120 Hz); "done" includes a real screen.
+3. **The setting drawings** (his ask in the try-out: a small schematic beside the setting opened; mock-up
+   `.superpowers/brainstorm/71253-1795178057/`, notes `.superpowers/brainstorm/drawings-2026-11-20-notes.md`): a
+   design with him, element by element. Then **lab time: XC-391, XC-392, XC-393**.
+4. **Paradigms above tasks**, designed with wl.works.
+5. **Side work on the January path**: the sync-box client (XC-460), the operator's guide (XC-014), the default limits
+   file (XC-459, a welfare design with the PI), wl-preproc's C3 fixture (XC-510).
+6. **Paused until the pop-out search has run on a rig**: engine builds C4 to C9 and the rig-edit build.
 
 **How the work is run** (the PI, 2026-11-07): a plan is a design and a list of tests, built once; one review of the
 whole build, and his welfare review of any welfare-listed change; side work only on the January path; a rare edge case
@@ -77,8 +94,8 @@ is settled from his stated principles and told to him in one line; every merge w
 ## Working here
 - **Suite**: `WLX_REQUIRE_PREPROC=1 WLX_REQUIRE_BROWSER=1 WLX_REQUIRE_XTASKS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p
   no:cacheprovider -n auto` (a `wl-preproc` checkout or link at the root, at `d8fe06b` or later, and a `wl-xtasks`
-  one, git-ignored at `/wl-xtasks`; wl-sync at the commit `wl-preproc/pyproject.toml` pins). **6198 passed on
-  `demo-build-2026-11-14`**, none skipped; 5858 on `main`.
+  one, git-ignored at `/wl-xtasks`; wl-sync at the commit `wl-preproc/pyproject.toml` pins). **6660 passed on
+  `main`**; none skipped.
 - **CI**: each push sweeps the changed modules with mutants (`tools/mutation_gate.py`), the nightly all, in 36 shards;
   a big branch runs that sweep by hand before its merge (`gh workflow run ci.yml --ref <branch>`). Read every shard's
   log to its closing line; the run's summary can be wrong.

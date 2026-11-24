@@ -42,9 +42,13 @@ posted to `/gaze` by the script; and the New session dialog's demo choice (`_dn_
 from __future__ import annotations
 
 import html
+import dataclasses
 import math
+import re
+import string
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from importlib import resources
 from pathlib import PurePath
 
@@ -53,9 +57,13 @@ from wl_xcon.actor import Actor, Member
 from wl_xcon.cli import _clock, _moment, _setup_words
 from wl_xcon.demoscreen import GAZE_EVERY_MS
 from wl_xcon.link import RECENT_OUTCOMES, ConditionRow, Counts, Idle, Question, Telemetry
+# The segments' bound, said where a choice is said in short (`link.choice_label`).
+from wl_xcon.link import CHOICE_LABEL_LIMIT, choice_label  # noqa: F401
 from wl_xcon.pointer import KEYS as _KEYS
 from wl_xcon.pointer import LIVE_S as _LIVE_S
-from wl_xcon.task import Family, Outcome, at_hardest
+from wl_xcon.task import (
+    BELOW_ZERO, CEILINGS, OTHER, SPECIAL_UNIT, TRAINING_SECTION, Family, Outcome, at_hardest,
+)
 from wl_xcon.warnlist import HEAD_FREE, UNLISTED
 
 
@@ -131,6 +139,7 @@ class SignIn:
 FRAGMENT_IDS = (
     "demo-tag",
     "state",
+    "bar-nums",
     "head-id",
     "presence",
     "strip",
@@ -141,13 +150,16 @@ FRAGMENT_IDS = (
     "controls",
     "rt-trials",
     "rt-work",
-    "rt-train",
+    "rt-shaping",
     "rt-need",
     "rt-wrong",
     "rt-health",
     "rt-changes",
     "params",
     "moments",
+    "shaping",
+    "rt-train",
+    "training-params",
     "pf-sum",
     "preflight",
     "setup",
@@ -274,10 +286,31 @@ NO_MARK_ENDPOINT = (
 #: taskd` session, it gives one between runs and while the return is awaited (PI,
 #: 2026-09-29, spec §6.0; `taskd.Session._manual_reward`).
 REWARD_ONLY_PAUSED = "a manual reward is given only while the session is paused: pause first"
-#: How long after the last click on a parameter's arrows the change is sent, in
-#: milliseconds: the mockup's debounce (spec §5.2), housekeeping and not a
-#: measurement. The page's script reads it from `<body>`.
-DEBOUNCE_MS = 600
+#: **The most changes Apply all sends as one act** (the console interface rework's Task 6): a
+#: refused act writes a refusal per change, and a frame keeps only the last
+#: `link.REFUSAL_HISTORY` (50) of them, so an act of more could lose some boxes' own reasons. Below
+#: `link.APPLY_LIMIT` (64), which the rig takes. The page's script reads it from `<body>`.
+APPLY_ALL_LIMIT = 50
+
+#: **The page around the boxes** (the console interface rework's Task 8), its words: the *session*
+#: button's title, the find box's, Runtime's Pinned strip's line, and the demo screen's folded keys
+#: (the design's call: "fold to one line ("keys and demo limits"), open on the first visit only").
+SESSION_SAID = ("the session's details: who, which run and block, the animal's fluid and time out, "
+                "the next run's task and plan, a scheduled stop")
+FIND_SAID = "find a setting or section"
+#: **What the find box says where nothing matches** (the summary and editor plan's Review Focus 4:
+#: "Find with no match / Enter on no match dims everything and opens nothing, saying 'no setting
+#: matches'").
+NO_MATCH = "no setting matches"
+PINNED_SAID = ("settings you pinned from the settings tabs; click one to change it here, one draft "
+               "between here and its tab")
+#: **What Runtime's editor says with no pinned setting opened** (the summary and editor build's
+#: Task 3: the design's goal 9, "a click opens the same editor on Runtime").
+PINNED_EMPTY = "click a pinned setting above to change it"
+#: **What the editor says where the find box hides the setting opened in it** (the ledger's
+#: ruling for the summary and editor build's Task 3), in place of a blank editor.
+FIND_HIDES_OPENED = "the opened setting is hidden by find · clear find to see it"
+DEMO_FOLD_SAID = "keys and demo limits"
 #: The trials the plain run is offered with: `wlx run --trials`'s default (`cli`), the flat run
 #: of N trials, one block (the b3a-2 plan, decision 6). A run of one of its task's plans has its
 #: plan's lengths, and the box is hidden while a plan is chosen (engine build C2b). A starting
@@ -318,11 +351,6 @@ def _num(value: object) -> str:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return f"{value:.2f}"
     return str(value)
-
-
-def _edge(value: object) -> str:
-    """One end of a declared range: `open` where the task declared none."""
-    return "open" if value is None else _num(value)
 
 
 def _pct(part: float, whole: float) -> float:
@@ -409,6 +437,33 @@ def _head(frame: Telemetry | None) -> str:
         f'<span><span class="k">{name}</span><span class="v"{attr}>{value}</span></span>'
         for name, value, attr in cells
     )
+
+
+def _bar_nums(frame: Telemetry | None) -> str:
+    """**The top bar's numbers** (the console interface design's call: "the top of the page
+    becomes one bar that stays in view: state, trial, correct, fluid, cage time and the run's
+    buttons"; the layout review's finding 4): the trial, the session's right answers over its
+    trials as the strip's first line counts them (`_level`), the fluid given today, and when the
+    animal is due back in its cage (`_back_to_cage`) -- each the strip's own figure, so the bar and
+    the strip behind *session* never disagree. Nothing before a session: the pill says so."""
+    if frame is None:
+        return ""
+    _, right, percent, _, _ = _level("session", frame.performance.session, "")
+    fluid = ('<span class="nm">unknown</span>' if frame.fluid_today_ml is None
+             else f'{frame.fluid_today_ml:.2f}<span class="u"> mL</span>')
+    _, cage, _, note, tone = _back_to_cage(frame)
+    cells = (
+        ("trial", _e(frame.trial_index), "", ""),
+        ("correct", f"{right} {percent}".strip(), "", ""),
+        ("fluid today", fluid, "", ""),
+        ("cage", cage, tone, note),
+    )
+    out = []
+    for label, value, tone, note in cells:
+        classes = "bn " + tone if tone else "bn"
+        title = f' title="{note}"' if note else ""
+        out.append(f'<span class="{classes}"{title}><span class="k">{label}</span> <b>{value}</b></span>')
+    return " ".join(out)
 
 
 def _presence(view: View) -> str:
@@ -1330,7 +1385,7 @@ def _plan_row(frame: Telemetry, view: View) -> str:
     nothing = ("" if frame.next_block is not None
                else ' disabled title="this block is the last its plan gives"')
     return (
-        f'<div class="kv"><span class="nm">{_e(" · ".join(said))}</span>'
+        f'<div class="kv wrap"><span class="nm">{_e(" · ".join(said))}</span>'
         f'<button type="button" class="btn" data-cmd="next_block"{_gate(view, nothing)}>'
         f"next block</button>"
         f'<button type="button" class="btn" data-cmd="back_block"{_gate(view)}>back one</button>'
@@ -1421,7 +1476,10 @@ def _need(frame: Telemetry | None, view: View) -> str:
             for scope, label in DRUM_SWITCHES
             if scope != (frame.drumming or "off")
         )
-        rows.append(f'<div class="kv"><span class="nm">{now}</span>{switches}</div>')
+        # A row of a sentence and its buttons wraps, the buttons going under the sentence where
+        # both do not fit (`.kv.wrap`; the workflow review's F12: a button that would not shrink
+        # squeezed "this block has no percentage rule..." to one letter a line).
+        rows.append(f'<div class="kv wrap"><span class="nm">{now}</span>{switches}</div>')
         if frame.clearing:
             # The controller's ruling M4: on where nothing in the run can be cleared, it says so.
             said = ("clear is on" if frame.clearable
@@ -1445,7 +1503,7 @@ def _need(frame: Telemetry | None, view: View) -> str:
                       *judged[1:])
         for setting, (said, on, label) in (("clear", clear), ("first_answers", judged)):
             rows.append(
-                f'<div class="kv"><span class="nm">{said}</span><button type="button" class="btn" '
+                f'<div class="kv wrap"><span class="nm">{said}</span><button type="button" class="btn" '
                 f'data-cmd="training" data-setting="{setting}" data-on="{on}"{_gate(view)}>'
                 f"{label}</button></div>"
             )
@@ -1745,10 +1803,12 @@ def _health_pane(frame: Telemetry | Idle | None, view: View) -> str:
 
 #: How the changes feed and a card lead a staged change of each kind but a person's value
 #: (`Staged.kind`, telemetry schema 19; the C3 spec §6 and §8).
-_STAGED_KINDS = {"hand_back": "hand back", "range": "range", "revert": "revert"}
+_STAGED_KINDS = {"hand_back": "hand back", "range": "range", "revert": "revert",
+                 # A person's draw (the console settings build; telemetry schema 22).
+                 "form": "drawn"}
 
 
-def _becomes(change) -> str:
+def _becomes(change, row=None) -> str:
     """**What a staged change leaves its setting with**, in words (the C3 plan's calls 23 and 30;
     its review, M-15). A hand-back's is where the rig says it goes (`Staged.to`, as it is offered,
     read from the open block as the hand-back is): its conditions, its draw, or the run -- the
@@ -1756,15 +1816,20 @@ def _becomes(change) -> str:
     line says -- never "unset", which it is not. A revert's change that hands a setting back
     (`Staged.hands_back`, whatever its `now`) says so the same way, "handed back to ...". Any other
     change's is its new value, a range's its new draw in the rig's words, as `_num` shows a
-    value. Escaped (`_e`), ready for the page."""
+    value. Escaped (`_e`), ready for the page. Given its setting's `row`, a number is shown as its
+    box shows it (`_figure`: a whole setting's with no decimals); the feed's, without, as `_num`."""
+    shown = _num if row is None else (lambda value: _figure(row, value))
+    if row is not None and row.members is not None:
+        # A pool's value is its pairings' numbers summed: said as how many it holds (`_pooled`).
+        shown = lambda value: _pooled(row, value)  # noqa: E731
     if change.hands_back:
         back = ("its draw" if change.to == "draw"
-                else "the run's " + _e(_num(change.now)) if change.to == "run" and
+                else "the run's " + _e(shown(change.now)) if change.to == "run" and
                 change.now is not None
                 else "the run, which gives it no value" if change.to == "run"
                 else "its conditions")
         return back if change.kind == "hand_back" else "handed back to " + back
-    return _e(_num(change.now))
+    return _e(shown(change.now))
 
 
 def _will_override(named: tuple) -> str:
@@ -1870,52 +1935,173 @@ def _significant(value: float) -> str:
 
 
 def _range(row) -> str:
+    """**A box's limits and why each stands, whole** (`ParamRow.why`), as its *more* says them:
+    each end at the box's own decimals (`_figure`), a whole setting's with none (the design's goal
+    6: "1 to 36 objects")."""
     if row.bounded:
         return f"welfare ceiling {_e(_significant(row.high))} {_e(row.unit)}"
     if row.low is None and row.high is None:
-        return "no declared range"
-    return f"{_e(_edge(row.low))} to {_e(_edge(row.high))} {_e(row.unit)}"
-
-
-#: The arrows' step by unit: the mockup's `stepOf` (`docs/superpowers/mockups/
-#: 2026-09-26-console-mockup-v12.html`), in this repository's unit names -- the tasks
-#: say `deg` where the mockup said `°`. A display choice, not a rule about values:
-#: `Session.set` checks the range whatever step reached it.
-_STEPS = {"mL": 0.01, "s": 0.05, "deg": 0.1}
+        return "no limit"
+    ends = ("open" if end is None else _figure(row, end) for end in (row.low, row.high))
+    said = f"{_e(next(ends))} to {_e(next(ends))} {_e(_unit_of(row))}"
+    # **Why each limit stands, in one line** (`ParamRow.why`; the console settings design's §4:
+    # "each card says why for any limit that stays"). The standard "below 0 cannot be" is left
+    # unsaid beside another reason, which it goes without saying beside (the builder's call): a
+    # fraction's card reads "0 to 1 fraction · a fraction is at most 1".
+    why = row.why or {}
+    reasons = list(dict.fromkeys(reason for reason in (why.get("low"), why.get("high"))
+                                 if reason))
+    if len(reasons) > 1 and BELOW_ZERO in reasons:
+        reasons.remove(BELOW_ZERO)
+    reasons = [_in_percent(row, reason) for reason in reasons]
+    return f"{said} · {_e('; '.join(reasons))}" if reasons else said
 
 
 def _step(row) -> float:
-    return _STEPS.get(row.unit, 0.01)
+    """**How far one press of a box's − or + moves it** (`ParamRow.step`, the rig's `task.step_of`:
+    a declared step, else 1 for a whole setting, else its unit's, else 0.01; the console interface
+    design's call on steps): 1 for a whole setting whatever a hand-made row says. A display
+    choice, not a rule about values: `Session.set` and `_impossible` judge whatever reached them."""
+    return 1.0 if row.whole else row.step
 
 
-def _field(row, view: View) -> str:
-    """A card's input and arrows (spec §5.2). A number is shown at its step's
-    decimals and carries the step and the declared range for the script's arrows,
-    which clamp to it; a categorical value is a word, with no arrows. Greyed away
-    from the box."""
+def _hundred(value: float) -> float:
+    """**A fraction as its percent** (`ParamRow.percent`; the console interface design's call: "a
+    fraction may be shown as a percent"), with a float's noise taken off at twelve significant
+    digits: 0.07 is 7, never 7.000000000000001, and 0.575 is 57.5, never 57.49999999999999. Display
+    arithmetic only: the setting, the command and the record keep the fraction."""
+    return float(f"{value * 100:.12g}")
+
+
+def _shown_step(row) -> float:
+    """A box's step as its field steps (`_step`), ×100 for a percent (`_hundred`): 0.05 is 5."""
+    return _hundred(_step(row)) if row.percent else _step(row)
+
+
+def _unit_of(row) -> str:
+    """The unit a box shows beside its numbers: `%` for a percent, else its setting's own."""
+    return "%" if row.percent else row.unit
+
+
+#: A number as the rig writes one in a sentence (`f"{value:g}"`), not inside a name or a longer
+#: number, and the word ` fraction` after it where the sentence gives its unit (`_in_percent`).
+_SAID_NUMBER = re.compile(r"(?<![\w.])(-?\d+(?:\.\d+)?(?:e[-+]?\d+)?)(?!\w|\.\d)( fraction\b)?")
+#: What ties a number to a setting in the rig's sentence, read just before it (`_in_percent`): the
+#: setting's quoted name, `'move_up_bar' at ` or `'move_up_bar' `, as `Session.set` and the checks
+#: write a value ("'move_up_bar' at 1.2 is refused").
+_NAMED_BEFORE = re.compile(r"'([^']+)'(?: at| is| of| =)? $")
+#: And what ties one to the setting the sentence is about: "its 1", "its lowest, 0.2, ", and the
+#: standard limit's "a fraction is at most 1" (`task.FRACTION_TOP`).
+_ITS_BEFORE = re.compile(r"(?:\bits(?: \w+,)? |\ba fraction is at most )$")
+
+
+def _percents(frame) -> frozenset:
+    """The settings a frame shows as percents (`ParamRow.percent`), by name: a sentence's number
+    given as one of theirs is converted in any box (`_in_percent`)."""
+    return frozenset(row.name for row in frame.params if row.percent) if frame else frozenset()
+
+
+def _in_percent(row, said: str, peers: frozenset = frozenset()) -> str:
+    """**The rig's sentence about a percent setting, in percent** (the console interface design's
+    call: "the rig's sentences are converted on the page"), each number **where the sentence ties
+    it to a percent setting** (the whole-build review, I7): after a percent setting's quoted name
+    -- the row's own, or a peer's among `peers` (`_percents`), "'move_up_bar' at 0.8" -- and, in a
+    sentence about the row's own percent setting, after "its" or "a fraction is at most", or given
+    in its unit ("1.2 fraction", its ` fraction` dropped), as `_hundred` shows it with `%`:
+    "'move_up_bar' at 120% is above its 100%". Any other number stands as written -- "block 1",
+    "the last 1 answers" -- whatever the setting's limits or value. A sentence naming no percent
+    setting is as the rig wrote it. Plain words in, plain words out, escaped where used."""
+    named = set(peers) | ({row.name} if row.percent else set())
+    if not named:
+        return said
+
+    def shown(found: re.Match) -> str:
+        before = said[:found.start()]
+        quoted = _NAMED_BEFORE.search(before)
+        tied = (quoted is not None and quoted.group(1) in named) or (row.percent and (
+            found.group(2) is not None or _ITS_BEFORE.search(before) is not None))
+        if not tied:
+            return found.group(0)
+        return f"{_hundred(float(found.group(1))):g}%"
+
+    return _SAID_NUMBER.sub(shown, said)
+
+
+def _places(step: float) -> int:
+    """The decimals a step shows: 0.05 two, 0.1 one, 1 and 10 none."""
+    exponent = Decimal(repr(float(step))).normalize().as_tuple().exponent
+    return max(0, -exponent) if isinstance(exponent, int) else 0
+
+
+#: The most decimals a box shows of a value's own (`_figure`): a value's digits past its step's are
+#: shown, never rounded away, up to these.
+_OWN_PLACES = 6
+
+
+def _figure(row, value: object) -> str:
+    """**A number as its box shows it** (the console interface design's goal 6, the PI: "for
+    necessary whole numbers (set size), there should not be a decimal option"): a whole setting's
+    with no decimals, `4`, never `4.00` (its step is 1, `_step`); any other's at its step's
+    decimals (`_places`), or more where the value holds more -- 0.35 on a 0.1 step reads 0.35,
+    never 0.3 -- up to `_OWN_PLACES`, so a box never shows a value it does not hold. `unset` for `None`; a word as
+    written. Formatting, not derivation."""
+    if value is None:
+        return "unset"
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return str(value)
+    number = float(value)
+    if not math.isfinite(number):
+        return str(value)
+    if row.percent:
+        # A fraction shown ×100 (`ParamRow.percent`), its step's decimals the percent's: 0.8 is 80.
+        number = _hundred(number)
+    own = f"{number:.{_OWN_PLACES}f}".rstrip("0").partition(".")[2]
+    return f"{number:.{max(_places(_shown_step(row)), len(own))}f}"
+
+
+def _unit(said: str) -> str:
+    """A field's unit beside it (the design's call: "the unit beside every field, the drawn side's
+    fields included"); nothing where there is none."""
+    return f'<span class="unit">{_e(said)}</span>' if said else ""
+
+
+def _field(row, view: View, unit: bool = True) -> str:
+    """**A box's field** (the console interface design's goal 1): − , the value, +, and its unit
+    beside it. A number is shown as `_figure` shows it and carries the step and the declared range
+    for the script's − and +, which clamp to it; a whole setting's field steps by 1 and asks for
+    the numeric keyboard (goal 6). A categorical value is a word, with neither. **A percent**
+    (`ParamRow.percent`; the console interface rework's Task 7) is shown ×100, its step and its
+    range ×100 too (`_hundred`), `%` its unit, and marked `data-percent`: the script sends what is
+    typed as the fraction it is. `unit` false leaves the unit out but a percent's `%`, for a field
+    standing in its group's sentence, which names what it counts. Greyed away from the box."""
     off = _gate(view)
     name = _e(row.name)
     if isinstance(row.value, str):
         return (
-            f'<span class="spin"><input class="field mono" data-param="{name}" '
-            f'data-kind="word" value="{_e(row.value)}" aria-label="{name}"{off}></span>'
+            f'<span class="fu"><span class="spin"><input class="field mono" data-param="{name}" '
+            f'data-kind="word" value="{_e(row.value)}" aria-label="{name}"{off}></span></span>'
         )
-    step = _step(row)
-    places = len(f"{step:g}".partition(".")[2])
-    value = "" if row.value is None else f"{row.value:.{places}f}"
+    step = _shown_step(row)
+    value = "" if row.value is None else _figure(row, row.value)
     edges = "".join(
-        f' data-{end}="{_e(edge)}"'
+        f' data-{end}="{_e(f"{_hundred(edge):g}" if row.percent else edge)}"'
         for end, edge in (("min", row.low), ("max", row.high))
         if edge is not None
     )
+    keys = "numeric" if row.whole else "decimal"
+    whole = ' data-whole="1"' if row.whole else ""
+    if row.percent:
+        whole += ' data-percent="1"'
+    said = _unit(_unit_of(row)) if unit or row.percent else ""
     return (
-        f'<span class="spin"><input class="field mono" data-param="{name}" '
-        f'data-step="{step:g}"{edges} inputmode="decimal" value="{value}" '
+        f'<span class="fu"><span class="spin">'
+        f'<button type="button" class="stp" data-dir="-1" tabindex="-1" '
+        f'aria-label="decrease {name}"{off}>−</button>'
+        f'<input class="field mono" data-param="{name}" '
+        f'data-step="{step:g}"{edges}{whole} inputmode="{keys}" value="{_e(value)}" '
         f'aria-label="{name}"{off}>'
-        f'<span class="arrows"><button type="button" data-dir="1" tabindex="-1" '
-        f'aria-label="increase {name}"{off}>▲</button>'
-        f'<button type="button" data-dir="-1" tabindex="-1" '
-        f'aria-label="decrease {name}"{off}>▼</button></span></span>'
+        f'<button type="button" class="stp" data-dir="1" tabindex="-1" '
+        f'aria-label="increase {name}"{off}>+</button></span>{said}</span>'
     )
 
 
@@ -1926,6 +2112,17 @@ _SOURCES = {
     "task": "from the task's start",
     "run": "given by this run",
     "person": "held by a person",
+    # The training switch (the console settings design's §8; telemetry schema 22).
+    "frozen": "training frozen",
+    "full": "given by the full task",
+}
+#: **What the training switch holds a card at** (`Telemetry.shaping`; the console settings
+#: design's §8: "each frozen value shows on its card"): its value led by these words -- `frozen at
+#: 0.6` -- and what its field to set a value over it is for. A person's value still applies ("the
+#: experimenter needs free control").
+_HELD_BY = {
+    "frozen": ("frozen at", "a value over the frozen training"),
+    "full": ("full task at", "a value over the full task"),
 }
 #: The sources that give each trial a value of its own -- its conditions, or its draw -- whose
 #: words stand in the value's place on the card, the run's value being one no trial of the open
@@ -1944,7 +2141,419 @@ _PER_TRIAL = {
     # A task's pool of pairings (`task.Pool`; the pop-out search build's Task 5): each trial draws
     # a pairing into the odd one's look and the distractors', and a value set over either holds it.
     "pool": ("drawn each trial from its pool", "a value over its pool"),
+    # A person's draw from the card's drawn side (the console settings build; telemetry schema
+    # 22): each trial draws it, and a value set over it ends it, the card's fixed side.
+    "form": ("drawn each trial, from a person&#x27;s draw", "a value over this draw"),
 }
+
+#: A size a person scales by eccentricity (the console settings design's §5; `_params`): said in
+#: its value's place, each object having its own, with what its field to set one value over it is
+#: for.
+_SCALED = ("scaled by eccentricity, by a person", "a value over this scaling")
+
+#: **The shapes a timing card's drawn side offers, in the trainer's words** (`task.SHAPES`; the
+#: console settings design's §3, the PI, 2026-11-16), each with the fields its numbers are typed in,
+#: by the names a `form` command sends them under (`variation.FORM_NUMBERS`; a list's and a weighted
+#: list's typed as numbers between commas). A size's scaling is not offered here: a size's card
+#: takes it, *fixed* or *scaled* (`_scaled_side`; the design's §5).
+_SHAPES = (
+    ("non_aging", "non-aging", ("shortest", "longest")),
+    ("uniform", "uniform", ("low", "high")),
+    ("normal", "normal, cut", ("mean", "sd", "low", "high")),
+    ("list", "a list, in shuffled passes", ("values",)),
+    ("weights", "a list, weighted", ("values", "weights")),
+)
+
+
+def _typed(value: object) -> str:
+    """A number as a drawn side's field holds it, every digit (a float's `str`, the shortest that
+    reads back the same), or a list of them between commas; empty for none."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
+
+def _switch(row, view: View, drawn: bool, other: str = "drawn") -> str:
+    """**A timing card's switch, *fixed* or *drawn*** (`ParamRow.switch`; the console settings
+    design's §3: "every timing setting gets the switch on its card"), **or a size's, *fixed* or
+    *scaled*** (`other`; the design's §5): two buttons, the side open pressed. Pressing one opens
+    its side on the page alone, a draft of its box; nothing is sent until the box's Apply (the
+    console interface rework's Task 6). Greyed away from the box."""
+    name, off = _e(row.name), _gate(view)
+
+    def side(which: str, on: bool) -> str:
+        return (f'<button type="button" class="btn small seg{" on" if on else ""}" '
+                f'data-switch="{which}" data-name="{name}" '
+                f'aria-pressed="{"true" if on else "false"}"{off}>{which}</button>')
+
+    return (f'<div class="sw" role="group" aria-label="{name}: fixed or {other}">'
+            f'{side("fixed", not drawn)}{side(other, drawn)}</div>')
+
+
+#: **What a size's factor multiplies**, beside its field as its unit (the design's call: "the unit
+#: beside every field").
+SCALED_UNIT = "× each object's eccentricity"
+
+#: **What a weighted list's weights are counted in**, beside their field: each weight against the
+#: others, not in the setting's unit (`variation`'s weighted list).
+WEIGHTS_UNIT = "relative"
+
+
+def _scaled_side(row, view: View) -> str:
+    """**A size card's scaled side** (the console settings design's §5; the PI, 2026-11-16, "Size =
+    factor x eccentricity"): its factor, filled from the scaling in force (`ParamRow.shape`); the
+    box's Apply sends it as `form` with shape `scaled` (`link.SetForm`), staged until the next
+    trial: each object is then drawn at the factor times its own eccentricity. Greyed away from the
+    box."""
+    off, name = _gate(view), _e(row.name)
+    shape = row.shape or {}
+    factor = (shape.get("numbers") or {}).get("factor") if shape.get("shape") == "scaled" else None
+    return (f'<div class="shp rng" data-fields="scaled"><label class="rn">factor'
+            f'<input class="field mono" data-form="factor" inputmode="decimal" '
+            f'value="{_e(_typed(factor))}" aria-label="{name}: factor"{off}>'
+            f"{_unit(SCALED_UNIT)}</label></div>")
+
+
+def _drawn_side(row, view: View) -> str:
+    """**A timing card's drawn side** (the console settings design's §3; the PI, 2026-11-16: "the
+    shapes: non-aging: shortest, longest; uniform: min, max; normal cut to a range: mean, SD, min,
+    max; a list of values: shuffled passes, or a weight each"): the shape select, the shape in
+    force selected (`ParamRow.shape`, a person's or the block's) or non-aging, and each shape's
+    fields, only the selected shape's shown, each filled from the shape in force where it is that
+    shape, each with its unit beside it (a weighted list's weights `WEIGHTS_UNIT`); the box's Apply
+    sends them as `form` (`link.SetForm`), staged until the next trial. Its profile is in the
+    box's *more* (`_profile`). Greyed away from the box."""
+    off, name = _gate(view), _e(row.name)
+    shape = row.shape or {}
+    chosen = shape.get("shape", "non_aging")
+    options = "".join(
+        f'<option value="{key}"{" selected" if key == chosen else ""}>{_e(said)}</option>'
+        for key, said, _ in _SHAPES)
+    groups = []
+    for key, _, fields in _SHAPES:
+        mine = shape if key == chosen else {}
+        numbers = mine.get("numbers") or {}
+        typed = {field: _typed(mine.get(field) if field in ("values", "weights")
+                               else numbers.get(field)) for field in fields}
+        cells = "".join(
+            f'<label class="rn">{field}<input class="field mono" data-form="{field}" '
+            f'inputmode="decimal" value="{_e(typed[field])}" '
+            f'aria-label="{name}: {field}"{off}>'
+            f'{_unit(WEIGHTS_UNIT if field == "weights" else row.unit)}</label>'
+            for field in fields)
+        groups.append(f'<div class="shp rng" data-fields="{key}"'
+                      f'{"" if key == chosen else " hidden"}>{cells}</div>')
+    return (f'<select class="field" data-shape="{name}" aria-label="{name}: shape"{off}>'
+            f"{options}</select>{''.join(groups)}")
+
+
+#: **The profile's drawing, in the SVG's own units** (`_profile`): its width, each panel's left,
+#: right, top and base, and the words under it. Fixed here because they are a figure's geometry, not
+#: a setting; the figure scales to its card (`.prof` in the style).
+_PROFILE_W, _PROFILE_LEFT, _PROFILE_RIGHT = 240, 8, 232
+_PROFILE_PANELS = ((14, 54), (76, 116))
+_PROFILE_SAID = "the declared distribution, not a measurement"
+
+
+def _profile(row) -> str:
+    """**A drawn card's histogram and hazard** (`ParamRow.profile`; the console settings design's
+    §3; the PI, 2026-11-16): one inline SVG of two panels -- bars for the density, each bin's share
+    of the draws, scaled to the tallest; and a line for the hazard against a dashed line at 1,
+    *flat*, a rising line meaning the chance of the draw ending climbs -- under the words *the
+    declared distribution, not a measurement*, since it is arithmetic of what was declared. A range
+    has a bar a bin, a list a bar a value. Plain inline SVG, nothing outside it: no font file, no
+    link, no style of its own beyond the page's classes. Every word is rendered here, escaped; ""
+    where the rig sent none or an empty one."""
+    shown = row.profile
+    if not shown or not shown.get("density"):
+        return ""
+    edges, density, hazard = shown["edges"], shown["density"], shown["hazard"]
+    count = len(density)
+    discrete = len(edges) == count
+    slot = (_PROFILE_RIGHT - _PROFILE_LEFT) / count
+    width = slot * (0.6 if discrete else 1.0)
+    (top_a, base_a), (top_b, base_b) = _PROFILE_PANELS
+    tallest = max(density) or 1.0
+    ceiling = max(max(hazard), 1.0) or 1.0
+
+    def at(place: int) -> float:
+        return _PROFILE_LEFT + slot * (place + 0.5)
+
+    bars = "".join(
+        f'<rect class="bar" x="{at(place) - width / 2:.2f}" '
+        f'y="{base_a - (base_a - top_a) * share / tallest:.2f}" width="{width:.2f}" '
+        f'height="{(base_a - top_a) * share / tallest:.2f}"/>'
+        for place, share in enumerate(density))
+    rises = " ".join(f"{at(place):.2f},{base_b - (base_b - top_b) * rate / ceiling:.2f}"
+                     for place, rate in enumerate(hazard))
+    flat = base_b - (base_b - top_b) / ceiling
+    ends = (edges[0], edges[-1]) if count > 1 or not discrete else (edges[0],)
+    unit = f" {row.unit}" if row.unit else ""
+    sides = "".join(
+        f'<text class="ax" x="{x}" y="128" text-anchor="{anchor}">{_e(f"{end:.4g}{unit}")}</text>'
+        for (x, anchor), end in zip(((_PROFILE_LEFT, "start"), (_PROFILE_RIGHT, "end")), ends))
+    name = f"{row.name}: {_PROFILE_SAID}, its density and its hazard against flat"
+    return (
+        f'<svg class="prof" viewBox="0 0 {_PROFILE_W} 144" role="img" aria-label="{_e(name)}">'
+        f'<text class="ax" x="{_PROFILE_LEFT}" y="10">share of draws</text>{bars}'
+        f'<line class="base" x1="{_PROFILE_LEFT}" y1="{base_a}" x2="{_PROFILE_RIGHT}" '
+        f'y2="{base_a}"/>'
+        f'<text class="ax" x="{_PROFILE_LEFT}" y="72">chance it ends, given it has not, against flat'
+        f'</text>'
+        f'<line class="flat" x1="{_PROFILE_LEFT}" y1="{flat:.2f}" x2="{_PROFILE_RIGHT}" '
+        f'y2="{flat:.2f}" stroke-dasharray="4 3"/>'
+        f'<text class="ax" x="{_PROFILE_RIGHT}" y="{flat - 3:.2f}" text-anchor="end">flat</text>'
+        f'<polyline class="haz" points="{rises}"/>{sides}'
+        f'<text class="ax" x="{_PROFILE_LEFT}" y="141">{_PROFILE_SAID}</text></svg>')
+
+
+#: **What a color card says of its swatches** (the console settings design's §6: "the swatches are
+#: approximate on any panel not measured, and the page says so"), word for word.
+COLOR_APPROXIMATE = (
+    "approximate: this screen is not measured; the rig's measured panel decides what is drawn")
+
+#: A swatch's color as the page may write it into a style: `#` and six hex digits, nothing else.
+_HEX = frozenset("0123456789abcdef")
+
+
+def _swatch(hex_: object) -> str:
+    """A swatch's `#rrggbb` as the rig sent it (`photometry.srgb_hex`), or `""` where it is not one,
+    so nothing but a color ever reaches the style attribute."""
+    if (isinstance(hex_, str) and len(hex_) == 7 and hex_[0] == "#"
+            and set(hex_[1:].lower()) <= _HEX):
+        return hex_.lower()
+    return ""
+
+
+def _color_level(said: str, level: object, frame, view: View, note: str = "") -> str:
+    """**One of a color card's two levels** (`ParamRow.color`'s `saturation` or `luminance`): typed in
+    its setting's own unit, as that setting's card types it (`set`, the setting's name), the cd/m²
+    of the light beside it; or, where the task file writes a number, shown as fixed there."""
+    level = level if isinstance(level, dict) else {}
+    setting, value, cd_m2 = level.get("setting"), level.get("value"), level.get("cd_m2")
+    lit = (f' <span class="unit">· {_e(_num(cd_m2))} cd/m²</span>'
+           if isinstance(cd_m2, (int, float)) and not isinstance(cd_m2, bool) else "")
+    if not isinstance(setting, str) or not setting:
+        shown = _num(value) if isinstance(value, (int, float)) else "–"
+        return (f'<span class="rn lvl">{_e(said)} <span class="mono">{_e(shown)}</span>'
+                f'{" cd/m²" if said == "luminance" else ""}, fixed in the task file{lit}</span>')
+    row = next((other for other in getattr(frame, "params", ()) if other.name == setting), None)
+    unit = row.unit if row is not None else ""
+    typed = "" if not isinstance(value, (int, float)) or isinstance(value, bool) else f"{value:g}"
+    return (f'<label class="rn lvl">{_e(said)} <span class="mono">{_e(setting)}</span>'
+            f'<input class="field mono" data-param="{_e(setting)}" inputmode="decimal" '
+            f'value="{_e(typed)}" aria-label="{_e(setting)}: {_e(said)}"{_gate(view)}>'
+            f'<span class="unit">{_e(unit)}</span>{lit}{note}</label>')
+
+
+#: **What the New color panel says of where a color goes** (the console settings design's §6; its
+#: plan's Task 8, "Proposed file first"), the set's name between its two halves.
+NEW_COLOR_SAVED = ("saved to wl-xtasks/stimuli/proposed/", ".json for the PI to review and commit; "
+                   "a rig uses it once committed and pulled")
+
+#: Each method's fields as the panel offers them (`colordef.NUMBERS`, `OPTIONAL` and `FRAMING`):
+#: the field, its label's unit, and whether it is sent only for a new set.
+_NEW_COLOR_FIELDS = {
+    "hue_angle": (("hue_deg", "°", False), ("gray_lightness", "J′, a new set's frame", True),
+                  ("chroma", "a new set's frame", True)),
+    "dkl": (("azimuth_deg", "°", False), ("elevation_deg", "°", False),
+            ("contrast", "blank: the set's mean radius", False)),
+    "xy": (("x", "", False), ("y", "", False)),
+}
+
+
+def _new_color(section: str, sets: dict, chosen: str, view: View) -> str:
+    """**The New color… panel of a section of color cards** (the console settings design's §6; the
+    PI, 2026-11-16: "1,2,or 3. you select an option and then enter the info", "Saved into a color
+    set file"; the console interface design's call: "the new-color panel moves out of each color's
+    box into one *New color…* panel for the Colors section"), once per section holding a color
+    card, after its boxes, keyed by the section (`data-newc`): the method (`colordef.METHODS`, in
+    its words, `colordef.SAID`), its fields, a name, and the set it goes into -- one of the
+    section's cards' sets, or a new one by its name -- then *preview*, which asks `wlx serve` (`GET
+    /color-preview`) and writes nothing, so any viewer may, and *save as a proposal*, which sends
+    `define_color` (`link.DefineColor`), greyed away from the box. Then where it goes:
+    `NEW_COLOR_SAVED`, naming the set."""
+    from wl_xcon.colordef import METHODS, NAME_LIMIT, SAID
+
+    name, off = _e(section), _gate(view)
+    methods = "".join(f'<option value="{m}">{_e(SAID[m])}</option>' for m in METHODS)
+    fields = []
+    for method in METHODS:
+        inputs = "".join(
+            f'<label class="rn"{" data-newset-only" if only else ""}>{_e(field)} '
+            f'<input class="field mono" data-newc-num="{field}" inputmode="decimal" '
+            f'aria-label="{name}: new color {_e(field)}"><span class="unit">{_e(unit)}</span></label>'
+            for field, unit, only in _NEW_COLOR_FIELDS[method])
+        fields.append(f'<div class="nf" data-newc-fields="{method}"'
+                      f'{"" if method == METHODS[0] else " hidden"}>{inputs}</div>')
+    into = "".join(
+        f'<option value="{_e(named)}"{" selected" if named == chosen else ""}>{_e(named)}</option>'
+        for named in sets) + '<option value="">a new set</option>'
+    return (f'<details class="newc" data-newc="{name}"><summary>New color…</summary>'
+            f'<label class="rn">by <select class="field" data-newc-method aria-label="{name}: '
+            f'new color method">{methods}</select></label>{"".join(fields)}'
+            f'<label class="rn">name <input class="field" data-newc-name maxlength="{NAME_LIMIT}" '
+            f'aria-label="{name}: new color name"></label>'
+            f'<label class="rn">into <select class="field" data-newc-into aria-label="{name}: '
+            f'new color set">{into}</select><input class="field" data-newc-set maxlength="'
+            f'{NAME_LIMIT}" placeholder="a name for the new set" aria-label="{name}: new set name" hidden>'
+            f'</label>'
+            f'<div class="newc-do"><button type="button" class="btn small" data-cmd="preview_color" '
+            f'data-name="{name}">preview</button><button type="button" class="btn small" '
+            f'data-cmd="define_color" data-name="{name}"{off}>save as a proposal</button></div>'
+            f'<span class="newc-out" aria-live="polite"></span>'
+            f'<span class="src">{_e(NEW_COLOR_SAVED[0])}<span data-newc-path>{_e(chosen)}</span>'
+            f'{_e(NEW_COLOR_SAVED[1])}</span></details>')
+
+
+def _color_card(row, frame, view: View) -> str:
+    """**A color setting's card** (`ParamRow.color`; the console settings design's §6; the PI,
+    2026-11-16: "you select a set, and then you have hue options from the set, then you have
+    salience options for each hue"), three steps: **the set** (a select of the sets its choices
+    show, the run's value's chosen), **the hue** (a swatch with its name for each hue the set
+    offers, the run's value's pressed; pressing one is a draft of its box, which the box's Apply
+    sends as `color`, `link.SetColor`, staged until the next trial: the console interface rework's
+    Task 6), and **two levels** (`_color_level`): its saturation, gray to full, its luminance
+    held, and its luminance, its saturation held -- the latter the light's fraction setting, or its
+    set's luminance setting, which moves every light of the set that reads it. The caption,
+    `COLOR_APPROXIMATE`, is in its box's *more*, its status line saying "approximate on this
+    screen" at rest (`_box`). Each swatch's color is the rig's (`photometry.srgb_hex`), written only
+    where it is a `#rrggbb`. Greyed away from the box. `""` where the rig sent none."""
+    color = row.color
+    if not isinstance(color, dict) or not isinstance(color.get("sets"), dict) or not color["sets"]:
+        return ""
+    name, off = _e(row.name), _gate(view)
+    sets = color["sets"]
+    chosen = color.get("set") if color.get("set") in sets else next(iter(sets))
+    options = "".join(
+        f'<option value="{_e(named)}"{" selected" if named == chosen else ""}>{_e(named)}</option>'
+        for named in sets)
+    groups = []
+    for named, entry in sets.items():
+        hues = entry.get("hues") if isinstance(entry, dict) else None
+        buttons = []
+        for hue, shown in (hues or {}).items():
+            hex_ = _swatch((shown or {}).get("srgb"))
+            on = named == color.get("set") and hue == color.get("hue")
+            chip = (f'<span class="chip" style="background:{hex_}"></span>' if hex_
+                    else '<span class="chip none"></span>')
+            buttons.append(
+                f'<button type="button" class="btn small hue{" on" if on else ""}" '
+                f'data-name="{name}" data-colorset="{_e(named)}" '
+                f'data-color="{_e(hue)}" aria-pressed="{"true" if on else "false"}"{off}>'
+                f"{chip}{_e(hue)}</button>")
+        groups.append(f'<div class="hues" data-hues="{_e(named)}" data-name="{name}"'
+                      f'{"" if named == chosen else " hidden"}>{"".join(buttons)}</div>')
+    luminance = color.get("luminance") if isinstance(color.get("luminance"), dict) else {}
+    # The light's set's luminance moves every light of the set that reads it, not this one alone
+    # (the design's §6, as the card says).
+    every = (' <span class="unit">· moves every light of the set</span>'
+             if luminance.get("setting") and luminance.get("set_wide") is True else "")
+    return (f'<div class="clr" data-color="{name}">'
+            f'<label class="rn">set <select class="field" data-colorset="{name}" '
+            f'aria-label="{name}: color set"{off}>{options}</select></label>'
+            f'{"".join(groups)}'
+            f'<div class="lvls">{_color_level("saturation", color.get("saturation"), frame, view)}'
+            f'{_color_level("luminance", luminance, frame, view, every)}</div></div>')
+
+
+def _new_colors(rows: list, view: View) -> dict:
+    """**Each section's one New color… panel** (`_new_color`), by section, for every section that
+    holds a color card (`ParamRow.color` with its sets): the sets its cards show, in the order they
+    first show them, the first card's set chosen."""
+    panels: dict = {}
+    for section, row in rows:
+        color = row.color
+        if not isinstance(color, dict) or not isinstance(color.get("sets"), dict) or not color["sets"]:
+            continue
+        sets, chosen = panels.setdefault(section, ({}, [None]))
+        for named, entry in color["sets"].items():
+            sets.setdefault(named, entry)
+        if chosen[0] is None:
+            chosen[0] = color.get("set") if color.get("set") in color["sets"] else next(
+                iter(color["sets"]))
+    return {section: _new_color(section, sets, chosen[0], view)
+            for section, (sets, chosen) in panels.items()}
+
+
+#: **What a pool's box says at rest** (the console interface design's goal 7), its status line.
+POOL_REST = "odd color down, distractor across · each trial draws one pair ticked"
+
+
+def _pooled(row, value: object) -> str:
+    """**A pool's value as its box says it**: how many of its pairings it holds (`ParamRow
+    .members`, each a bit of the value: `task.Pool.number`), "2 of 12 pairs"; the value as written
+    where it names no pool of them (no whole number from 1, or a bit past its pairings)."""
+    total = len(row.members)
+    whole = _whole(value)
+    if whole is None or not 1 <= whole < 1 << total:
+        return _figure(row, value)
+    held = sum(1 for member in row.members if whole & member.bit)
+    return f"{held} of {total} pair{'' if total == 1 else 's'}"
+
+
+def _pairings(row, view: View) -> str:
+    """**A pool's grid** (`ParamRow.members`; the console interface design's goal 7; the PI,
+    2026-11-19: "4 × 4 grid, add or remove"): the odd one's color down, the distractors' across,
+    each color with its swatch (`PoolMember.odd_hex`, `among_hex`, the rig's, written only where
+    it is a `#rrggbb`), a tick for each pair the pool offers, ticked where the value holds it
+    (`on`), named "blue among red" for a screen reader, carrying its number (`data-bit`); the
+    diagonal empty, a color never among itself, and a cell empty where the pool offers no such
+    pair. Ticks are a draft of the box: its Apply sends one `set` of the pool's number, the ticked
+    pairs' bits summed (the script's `poolSum`), which is what is recorded; adding and removing
+    pairs both go live. The bits and swatches are the rig's, never worked out here. Greyed away
+    from the box."""
+    name, off = _e(row.name), _gate(view)
+    colors: dict = {}
+    for member in row.members:
+        for named, hex_ in ((member.odd, member.odd_hex), (member.among, member.among_hex)):
+            if not colors.get(named):
+                colors[named] = _swatch(hex_)
+    pairs = {(member.odd, member.among): member for member in row.members}
+
+    def color(named: str) -> str:
+        hex_ = colors[named]
+        chip = (f'<span class="chip" style="background:{hex_}"></span>' if hex_
+                else '<span class="chip none"></span>')
+        return f"{chip}{_e(named)}"
+
+    head = "".join(f'<th scope="col">{color(named)}</th>' for named in colors)
+    lines = []
+    for odd in colors:
+        cells = []
+        for among in colors:
+            member = pairs.get((odd, among))
+            if odd == among:
+                cells.append('<td class="diag"></td>')
+            elif member is None:
+                cells.append('<td class="none"></td>')
+            else:
+                said = _e(f"{odd} among {among}")
+                cells.append(
+                    f'<td><input type="checkbox" class="tick" data-bit="{member.bit}"'
+                    f'{" checked" if member.on else ""} aria-label="{said}" title="{said}"{off}></td>')
+        lines.append(f'<tr><th scope="row">{color(odd)}</th>{"".join(cells)}</tr>')
+    return (f'<table class="pairs" data-pool="{name}" aria-label="{name}: pairs, odd color down, '
+            f'distractor across"><thead><tr><th scope="col" class="corner">'
+            f'<span>odd ↓</span><span>among →</span></th>{head}</tr></thead>'
+            f'<tbody>{"".join(lines)}</tbody></table>')
+
+
+def _beneath(row, frame) -> str:
+    """**What a person's draw overrides**, as its card says it (the console settings design's §3:
+    "the card names what it overrides, as `_whence` does"): the open block's staircase where it
+    steps the setting (`Telemetry.staircase`), its draw where one draws it (`ParamRow.draw`), its
+    conditions where they set it, else the run's value."""
+    stair = getattr(frame, "staircase", None)
+    if stair is not None and stair.setting == row.name:
+        return "its staircase"
+    if row.draw is not None:
+        return "its draw"
+    if row.conditions:
+        return "its conditions"
+    return "the run's value"
 
 
 def _over(row, place: str, view: View) -> str:
@@ -1954,35 +2563,37 @@ def _over(row, place: str, view: View) -> str:
     replaces a draw"): empty, since no one number is in force for it to show, and **never a
     spinner** (XC-418), no arrows stepping from a number no trial takes. A word where the run's
     value is one, else a number, as `_field` reads it; greyed away from the box."""
-    word = ' data-kind="word"' if isinstance(row.value, str) else ' inputmode="decimal"'
+    word = isinstance(row.value, str)
+    keys = ' data-kind="word"' if word else (
+        ' data-whole="1" inputmode="numeric"' if row.whole else ' inputmode="decimal"')
+    if row.percent and not word:
+        keys += ' data-percent="1"'
     name = _e(row.name)
-    return (f'<input class="field mono over" data-param="{name}"{word} value="" '
-            f'placeholder="{place}" aria-label="{name}: {place}"{_gate(view)}>')
+    return (f'<span class="fu"><input class="field mono over" data-param="{name}"{keys} value="" '
+            f'placeholder="{place}" aria-label="{name}: {place}"{_gate(view)}>'
+            f'{"" if word else _unit(_unit_of(row))}</span>')
 
 
 def _range_editor(row, view: View) -> str:
     """**The numbers of the card's draw a person may change live** (`ParamRow.numbers`; the PI,
     2026-10-30, Q7b: "Yes, range changes live"), each in a field of its own as the wire carried
-    it, every digit (a float's `str` is the shortest that reads back the same), and *change the
-    range*, which sends those a person changed (`SetRange`), laid by the rig over the numbers in
-    force. On a
-    card whose `numbers` is not `None` alone: none for a setting declared not live, a
-    direction, a weighted set or a list (review M-4; XC-443, XC-445). Greyed away from the
-    box."""
+    it, every digit (a float's `str` is the shortest that reads back the same). A number changed
+    is a draft of its box, sent by the box's Apply as a `range` of those a person changed
+    (`SetRange`), laid by the rig over the numbers in force (the console interface rework's Task
+    6: *change the range* is gone, the box's Apply its one send). On a card whose `numbers` is not
+    `None` alone: none for a setting declared not live, a direction, a weighted set or a list
+    (review M-4; XC-443, XC-445). Greyed away from the box."""
     off, name = _gate(view), _e(row.name)
     fields = "".join(
         f'<label class="rn">{_e(number)}<input class="field mono" data-number="{_e(number)}" '
         f'inputmode="decimal" value="{_e(value)}" aria-label="{name}: {_e(number)}"{off}>'
-        f"</label>"
+        f"{_unit(row.unit)}</label>"
         for number, value in row.numbers.items()
     )
-    return (f'<div class="rng">{fields}<button type="button" class="btn small" data-cmd="range" '
-            f'data-name="{name}"{off}>change the range</button></div>'
-            f'<span class="src rhold" hidden>not sent: press change the range, or put its '
-            f'numbers back; the cards wait for it</span>')
+    return f'<div class="rng">{fields}</div>'
 
 
-def _whence(row, view: View) -> str:
+def _whence(row, view: View, over: str = "", ranges: bool = True) -> str:
     """**Where a card's value comes from, and what a person may do about it** (telemetry schema
     19; the C3 spec §6: "each setting's card says where its value comes from (task, run,
     conditions, a draw and its range, or a person) and which conditions set or draw it"),
@@ -1997,11 +2608,19 @@ def _whence(row, view: View) -> str:
     - on a card a person holds, *hand back* (the PI, 2026-10-30, Q7a: "Yes, a 'hand back'
       button"): from the next trial its conditions, its draw or the run's own value give it
       again, recorded as a change. Typing the old value back does not hand it back; this does.
+    - on a card a person's draw gives (`source` `form`; the console settings build), what it
+      overrides (`over`, from `_beneath`) and *hand back*, which ends the draw.
 
-    Nothing between runs, nor for a ceiling, when the rig sends none."""
+    Nothing between runs, nor for a ceiling, when the rig sends none. `ranges` false leaves out
+    the live numbers' fields, for a group box's *more*, whose one Apply sends its fields' values
+    only (`_group_box`)."""
     parts = []
     if row.source in _SOURCES:
         parts.append(f'<span class="src">{_SOURCES[row.source]}</span>')
+    if row.source == "form":
+        what = ("scaling" if row.shape is not None and row.shape.get("shape") == "scaled"
+                else "draw")
+        parts.append(f'<span class="src">a person&#x27;s {what}, over {_e(over)}</span>')
     if row.conditions:
         # The rig names at most twenty and counts the rest (`ParamRow.more`; the C3 plan's
         # engineering review, M-5).
@@ -2011,20 +2630,263 @@ def _whence(row, view: View) -> str:
                      f'{", ".join(map(_e, row.conditions))}{more}</span>')
     if row.draw is not None:
         parts.append(f'<span class="src">its draw: {_e(row.draw)}</span>')
-    if row.numbers is not None:
+    if row.numbers is not None and ranges:
         parts.append(_range_editor(row, view))
-    if row.source == "person":
+    if row.source in ("person", "form"):
         parts.append(f'<button type="button" class="btn small" data-cmd="hand_back" '
                      f'data-name="{_e(row.name)}"{_gate(view)}>hand back</button>')
     return "".join(parts)
 
 
-def _params(frame: Telemetry | None, view: View) -> str:
-    """One card per `ParamRow`: value, unit, range, the ceiling flag, a staged
-    marker, and -- P4d-2b b2a -- the input and arrows that set it and the last
-    refusal of it with its sentence (spec §5.2: "A refusal shows on the card and in
-    the feed"). *Last* is the word because a refusal carries no time: it stays on
-    the card beside whatever the value has since become, and says it is the last.
+def _plain(markup: str) -> str:
+    """Markup this module made, as the words it shows, for a `title` that holds a cut text whole."""
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", "", markup)).split())
+
+
+#: **How much of a refusal its box's status line says** (`_gist`), in characters: its reason, cut
+#: at a word; the whole sentence is in the box's *more* (the layout review's finding 2: "a refusal
+#: of 14 lines that never leaves").
+GIST_LIMIT = 80
+
+
+def _gist(why: str) -> str:
+    """**A refusal's reason in short**, for its box's one status line: the part after the rig's
+    "...is refused, and the previous value stands:" where it says one, else the sentence, cut at a
+    word to `GIST_LIMIT` characters with "…"."""
+    said = " ".join((why.partition(": ")[2] or why).split())
+    if len(said) <= GIST_LIMIT:
+        return said
+    return (said[:GIST_LIMIT].rpartition(" ")[0] or said[:GIST_LIMIT]).rstrip(",;:") + "…"
+
+
+def _limits(row) -> str:
+    """**A box's limits in short**, for its status line at rest (the layout review's finding 2:
+    "`0 or more` for `0.00 to open s · below 0 cannot be`"): its ends as `_figure` shows them, a
+    whole setting's said whole; the sentence with each limit's reason is in its *more*
+    (`_range`). Plain words, escaped where used."""
+    if row.bounded:
+        return f"welfare ceiling {_significant(row.high)} {row.unit}"
+    low, high = (None if end is None else _figure(row, end) for end in (row.low, row.high))
+    said = ("" if low is None and high is None else f"{low} or more" if high is None
+            else f"up to {high}" if low is None else f"{low} to {high}")
+    if row.whole:
+        return f"{said} · whole number" if said else "whole number"
+    return said
+
+
+def _status(row, change, refusal, peers: frozenset = frozenset()) -> tuple[str, str]:
+    """**A box's one status line** (the console interface design's goal 4) as the rig's frame
+    says it, and the state it marks the box with: a change waiting for the next trial and who
+    sent it (`staged`); else the last refusal of it, the value refused and its gist (`refused`);
+    else, while a run plays, the change in force and the trial it took effect at (`Applied`), with
+    a warning where the rig judged one (`warned`, else `applied`); else, at rest, its limits in
+    short (`_limits`) -- a color's that its swatches are approximate. The page's own states (*not
+    sent*, *sending…*, *cannot send*) are its script's (the plan's Task 6)."""
+    if change is not None:
+        return "staged", f"{WAITING} · {_who(change.by)}"
+    if refusal is not None:
+        value = "" if refusal.value is None else f" {_e(_refused_value(row, refusal.value))}"
+        return "refused", f"refused{value} · {_e(_gist(_in_percent(row, refusal.why, peers)))}"
+    if row.applied is not None:
+        if row.warned:
+            return "warned", f"in force, with a warning · from trial {_e(row.applied.trial)}"
+        return "applied", f"in force from trial {_e(row.applied.trial)}"
+    if row.members is not None:
+        return "", _e(POOL_REST)
+    return "", _e("approximate on this screen" if row.color is not None else _limits(row))
+
+
+def _refused_value(row, value: object) -> str:
+    """The value a refusal refused, as its box shows it (`_figure`), a percent's with its `%`."""
+    shown = _figure(row, value)
+    return f"{shown}%" if row.percent and isinstance(value, (int, float)) else shown
+
+
+def _under(row, change) -> str:
+    """**Who changed a box under a person's draft, in words** (the console interface plan's Review
+    Focus 4: "the draft is untouched, the head shows the new value in force, the status says who
+    changed it"): a change waiting for the next trial, who sent it and what it leaves the setting
+    with; else the change in force, who made it and the trial it took effect at. Plain text, for
+    the box's `data-under`, which the script says after *not sent* while a draft stands over it;
+    "" for neither."""
+    if change is not None:
+        return f"{_plain(_who(change.by))} is changing this to {_plain(_becomes(change, row))}"
+    if row.applied is not None:
+        return f"{row.applied.by} changed this from trial {row.applied.trial}"
+    return ""
+
+
+def _withdraw(change, together: tuple, view: View) -> str:
+    """**A waiting change's *withdraw*** (the console interface design's goal 3; the PI,
+    2026-11-19: "Yes, a withdraw button"), in its box's status line beside Apply: it sends
+    `withdraw` naming the act's command id (`Staged.cid`, `link.Withdraw`), which takes back the
+    whole act, so it says so first where the act holds more than this box ("withdraw all 3",
+    "withdraws the 3 applied together: ..." in its title; the design's call). None for a change
+    no page sent (no cid). Greyed away from the box."""
+    if change is None or not change.cid:
+        return ""
+    if len(together) > 1:
+        said, title = (f"withdraw all {len(together)}",
+                       f"withdraws the {len(together)} applied together: {', '.join(together)}")
+    else:
+        said, title = "withdraw", "takes this change back before the next trial"
+    # The title rides on a wrapper: the button's own is the gate's ("controls work only at the rig
+    # PC"), which the sign-in's script takes while it is live.
+    return (f'<span class="wd" title="{_e(title)}"><button type="button" class="btn small" '
+            f'data-withdraw="{_e(change.cid)}" tabindex="0"{_gate(view)}>{_e(said)}</button></span>')
+
+
+#: **A waiting change's status line, short, and its whole** (the console interface rework's
+#: whole-build review, I4): beside *withdraw* a box of 190 px has about 100 px for its line, so it
+#: says "waiting · who" and its title the whole, "waiting for the next trial · who".
+WAITING, WAITING_WHOLE = "waiting", "waiting for the next trial"
+
+
+def _awaited(value: str, change, row, lead: str | None = None) -> str:
+    """**A head's value in force and what waits for the next trial after an arrow** (`_box`,
+    `_group_box`): a number's unit said once, after what waits -- "0.30 → 0.50 s", "4 → 12 objects"
+    -- so the arrow and the new value fit a narrow box (the whole-build review, I4); any other value
+    -- a draw, a person's hold, words, a pool's pairs -- as it is, then the arrow. `value` alone where
+    nothing waits."""
+    if change is None:
+        return value
+    becomes = f'→ {"" if lead is None else _e(lead) + " "}{_becomes(change, row)}'
+    unit = _e(_unit_of(row))
+    tail = f' <span class="unit">{unit}</span></span>'
+    if lead is None and value.startswith('<span class="pv">') and value.endswith(tail):
+        return (f'{value[:-len(tail)]}</span> <span class="to">{becomes}</span>'
+                f' <span class="unit">{unit}</span>')
+    return f'{value} <span class="to">{becomes}</span>'
+
+
+def _whole_say(state: str, said: str) -> str:
+    """A status line's whole, for its `title`: a waiting one's "waiting for the next trial · who"
+    (`WAITING_WHOLE`), any other as it is. Plain text."""
+    plain = _plain(said)
+    if state == "staged" and plain.startswith(WAITING + " · "):
+        return WAITING_WHOLE + plain[len(WAITING):]
+    return plain
+
+
+def _box(row, frame, view: View, value: str, editor: str, change, refusal,
+         together: tuple = ()) -> str:
+    """**One setting's box** (the console interface design's goal 1; the PI, 2026-11-19, "Small
+    boxes"; the controls review's §2, "three zones, fixed places"), the markup the page's script
+    works on:
+
+        <div class="box[ state][ ceiling][ wide]" data-card="NAME">
+          <div class="head">   the plain name (`ParamRow.label`) with the code name small, or the
+                               code name alone; the ceiling's mark; the value in force, and what
+                               waits for the next trial after an arrow
+          <div class="editor"> the field with − and + and its unit, or the fixed/drawn switch and
+                               its sides, or a color's set and swatches
+          <div class="status"> one line (`_status`) and, at its right, *withdraw* for a change
+                               waiting under a command id (`_withdraw`), Discard and Apply, hidden
+                               by `visibility` until the script marks the box `draft` (or the box
+                               is `staged`), so its height never jumps; Apply and Discard are
+                               in the Tab order, Safari's too (`tabindex="0"`)
+          <details class="more"> opened in place: what it is (`ParamRow.help`), its limits and
+                               why (`_range`), where its value comes from and *hand back*
+                               (`_whence`), what it gives, the staged change, the warnings and the
+                               last refusal whole, and a draw's profile
+
+    Every text a narrow box may cut short carries its whole in its `title`.
+
+    **What the script reads off a box** (the console interface rework's Task 6): `data-staged-cid`,
+    the command id of the change waiting (`Staged.cid`); `data-refusal`, a key of the last
+    refusal shown, and `data-refusal-cid`, its command id (`Refused.cid`); `data-applied`, the
+    trial the change in force took effect at; `data-under`, who changed it under a draft
+    (`_under`); and on a refusal's status line, `data-rest` and `data-rest-state`, what the line
+    says once a later change has been accepted (the design's goal 4: "a refusal is cleared by a
+    later accepted change of that setting")."""
+    name, off = _e(row.name), _gate(view)
+    if row.label:
+        names = (f'<span class="names"><span class="lbl" title="{_e(row.label)}">{_e(row.label)}'
+                 f'</span><span class="code" title="{name}">{name}</span></span>')
+    else:
+        names = f'<span class="names"><span class="code only" title="{name}">{name}</span></span>'
+    flag = '<span class="ceil">ceiling</span>' if row.bounded else ""
+    lead = None if change is None else _STAGED_KINDS.get(change.kind)
+    if change is not None and change.kind == "form" and row.switch == "scaled":
+        lead = "scaled"
+    now = _awaited(value, change, row, lead)
+    peers = _percents(frame)
+    state, said = _status(row, change, refusal, peers)
+    mark = (
+        ""
+        if change is None
+        else f'<span class="stg">staged{"" if lead is None else " " + lead} → '
+        f"{_becomes(change, row)} by {_who(change.by)}</span>"
+    )
+    more = [_pin(name)]
+    if row.help:
+        more.append(f'<span class="what">{_e(row.help)}</span>')
+    more.append(f'<span class="range">{_range(row)}</span>')
+    more.append(_whence(row, view, _beneath(row, frame)))
+    if row.gives is not None:
+        # What it gives each object, in degrees, made by the rig (`ParamRow.gives`; the
+        # console settings design's §5).
+        more.append(f'<span class="src gives">gives {_e(row.gives)}</span>')
+    more.append(mark)
+    more.extend(f'<span class="wrn">warning: {_e(_in_percent(row, warned, peers))}</span>'
+                for warned in row.warned)
+    if refusal is not None:
+        more.append(f'<span class="rfs">last refused: '
+                    f'{_e(_in_percent(row, refusal.why, peers))}</span>')
+    if row.switch == "drawn":
+        more.append(_profile(row))
+    if isinstance(row.color, dict) and row.color.get("sets"):
+        more.append(f'<span class="src approx">{_e(COLOR_APPROXIMATE)}</span>')
+    wide = row.color is not None or row.members is not None
+    classes = " ".join(word for word in ("box", state, "ceiling" if row.bounded else "",
+                                         "wide" if wide else "") if word)
+    marks = []
+    if change is not None and change.cid:
+        marks.append(f' data-staged-cid="{_e(change.cid)}"')
+    if refusal is not None:
+        marks.append(f' data-refusal="{_e(refusal.cid or refusal.why)}"')
+        if refusal.cid:
+            marks.append(f' data-refusal-cid="{_e(refusal.cid)}"')
+    if row.applied is not None:
+        marks.append(f' data-applied="{_e(row.applied.trial)}"')
+    under = _under(row, change)
+    if under:
+        marks.append(f' data-under="{_e(under)}"')
+    if _echoes(row):
+        marks.append(" data-echo")
+    rest = ""
+    if state == "refused":
+        rest_state, rest_said = _status(row, change, None, peers)
+        rest = f' data-rest="{_e(_plain(rest_said))}" data-rest-state="{rest_state}"'
+    return (
+        f'<div class="{classes}" data-card="{name}"{"".join(marks)}>'
+        f'<div class="head">{names}{flag}<span class="now" title="{_e(_plain(now))}">{now}</span>'
+        f"</div>"
+        f'<div class="editor">{editor}</div>'
+        f'<div class="status"><span class="say" title="{_e(_whole_say(state, said))}"{rest}>'
+        f'{said}</span><span class="acts">'
+        f'{_withdraw(None if row.bounded else change, together, view)}'
+        f'<button type="button" class="btn small" data-discard="{name}" tabindex="0"{off}>'
+        f'Discard</button><button type="button" class="btn small primary" '
+        f'data-apply="{name}" tabindex="0"{off}>Apply</button></span></div>'
+        f'<details class="more"><summary aria-label="{_e(MORE_SAID)}" title="{_e(MORE_SAID)}">⋯'
+        f'</summary><div class="detail">{"".join(more)}</div></details></div>'
+    )
+
+
+def _params(frame: Telemetry | None, view: View, training: bool = False) -> str:
+    """**A settings tab: the summary, its legend, then the editor** (the summary and editor design
+    of 2026-11-19, mock-up A, which the PI chose: "go A"): one line per box in the summary
+    (`_summary`), and in the editor below it every box and each section's New color… panel, each
+    `hidden` but the one the page opens (`_hidden`; `openSetting` in the script), with a
+    placeholder said while none is.
+
+    One box per `ParamRow` (`_box`, the console interface rework's Task 5: head, editor, one
+    status line and a *more* opened in place): value, unit, range, the ceiling flag, a staged
+    marker, and -- P4d-2b b2a -- the input and its − and + that set it and the last refusal of it
+    with its sentence (spec §5.2: "A refusal shows on the card and in the feed"), its gist on the
+    status line and the whole in *more*. *Last* is the word because a refusal carries no time: it
+    stays on the box beside whatever the value has since become, and says it is the last.
 
     **A setting holding a whole position** shows the rig's words for it, eccentricity and
     direction first with its (x, y) beside them, its unit in them (`ParamRow.position`; the PI,
@@ -2041,49 +2903,1023 @@ def _params(frame: Telemetry | None, view: View) -> str:
     spinner, with a field to set one value over them (`_over`); then, beneath its range, where
     its value comes from, the conditions that set or draw it, its draw, the numbers of that draw
     a person may change live, and *hand back* (`_whence`). A staged change on the card is led by
-    its kind and says what it leaves the setting with (`_becomes`)."""
+    its kind and says what it leaves the setting with (`_becomes`).
+
+    **A timing card is fixed or drawn** (`ParamRow.switch`; telemetry schema 22; the console
+    settings design's §3): its switch (`_switch`), then its fixed side -- the field above, `set` --
+    and its drawn side (`_drawn_side`), the side open drawn where a draw is in force
+    (`ParamRow.shape`), else fixed; where its value comes from stays above both."""
     if frame is None:
         return _NONE
     if not frame.params:
         return '<span class="nm">this task declares no parameters</span>'
     staged = {change.name: change for change in frame.staged}
     refused = {refusal.name: refusal for refusal in frame.refusals}
+    # The settings of each act waiting under a command id, in order (`_withdraw`: one act's
+    # *withdraw* takes back all of it).
+    acts: dict = {}
+    for change in frame.staged:
+        if change.cid:
+            acts.setdefault(change.cid, []).append(change.name)
+    entries = [entry for entry in _entries(frame) if _training(entry[0]) == training]
     cards = []
-    for row in frame.params:
+    for section, row, group, members in entries:
+        if group is not None:
+            cards.append((section, _group_box(group, members, frame, view, staged, acts)))
+            continue
         change = staged.get(row.name)
-        flag = '<span class="ceil">ceiling</span>' if row.bounded else ""
-        lead = None if change is None else _STAGED_KINDS.get(change.kind)
-        mark = (
-            ""
-            if change is None
-            else f'<span class="stg">staged{"" if lead is None else " " + lead} → '
-            f"{_becomes(change)} by {_who(change.by)}</span>"
-        )
         refusal = refused.get(row.name)
-        said = (
-            ""
-            if refusal is None
-            else f'<span class="rfs">last refused: {_e(refusal.why)}</span>'
-        )
-        cls = "param staged" if change is not None else "param"
-        settable = row.value is None or isinstance(row.value, str) or (
-            isinstance(row.value, (int, float)) and not isinstance(row.value, bool))
-        per_trial = _PER_TRIAL.get(row.source)
-        if per_trial is not None:
-            shown = f'<span class="pv">{per_trial[0]}</span>' + (
-                _over(row, per_trial[1], view) if settable and row.position is None else "")
-        elif row.position is not None:
-            shown = f'<span class="pv">{_e(row.position)}</span>'
-        else:
-            shown = (f'<span class="pv">{_e(_num(row.value))} '
-                     f'<span class="unit">{_e(row.unit)}</span></span>'
-                     + (_field(row, view) if settable else ""))
-        cards.append(
-            f'<div class="{cls}"><div class="pn"><span>{_e(row.name)}</span>{flag}</div>'
-            f"{shown}"
-            f'<span class="range">{_range(row)}</span>{_whence(row, view)}{mark}{said}</div>'
-        )
-    return "".join(cards)
+        together = tuple(acts.get(change.cid, ())) if change is not None and change.cid else ()
+        label, editor = _editor(row, frame, view)
+        cards.append((section, _box(row, frame, view, label, editor, change, refusal, together)))
+    panels = _new_colors([(section, row) for section, row, group, _ in entries if group is None],
+                         view)
+    # **The editor** (the summary and editor design's goal 2): every box, and each section's New
+    # color… panel after its boxes, in the summary's order, each `hidden` until the page's script
+    # opens it (`openSetting`), so drafts, `patchCards` and `judge` keep every box; the
+    # placeholder said while none is opened.
+    shown = []
+    for top, node in _in_order(cards):
+        for section, found in [(top, node["own"])] + [
+                (f"{top}/{sub}", subs) for sub, subs in node["subs"].items()]:
+            shown.extend(_hidden(html) for _, html in found)
+            if section in panels and found:
+                shown.append(_hidden(panels[section]))
+    # **A withdrawal the rig refused** (`Refused` named `withdraw`, its `cid` the act's; the
+    # console interface rework's Task 4), its reason in short, for the script to say on the act's
+    # boxes ("not withdrawn · it is already in force from trial 41 ..."): no box is named
+    # `withdraw`, so none carries it.
+    declined = "".join(f'<span class="wdr" data-cid="{_e(refusal.cid)}">{_e(_gist(refusal.why))}'
+                       f"</span>" for refusal in frame.refusals
+                       if refusal.name == "withdraw" and refusal.cid)
+    # **And a withdrawal the rig did** (`Telemetry.withdrawals`; the whole-build review's I1): the
+    # act's id, the rig's word that it was taken back, which alone lets the script say "withdrawn"
+    # -- a change waiting no more may have applied.
+    declined += "".join(f'<span class="wdn" data-cid="{_e(cid)}"></span>'
+                        for cid in frame.withdrawals)
+    return (_summary(frame, view, training)
+            + f'<div class="legend">{_e(SUMMARY_LEGEND)}</div>'
+            + f'<div class="editing"><div class="placeholder">{_e(EDITOR_EMPTY)}</div>'
+            + f'<div class="findhid" hidden>{_e(FIND_HIDES_OPENED)}</div>'
+            + "".join(shown) + "</div>"
+            + f'<div class="wdrs" hidden>{declined}</div>')
+
+
+#: **What each mark on a summary line means** (the summary and editor design's goal 3; the page's own
+#: marks, … and ?, since that build's Task 2), said once under the summary.
+SUMMARY_LEGEND = ("● not sent · … sending · ? not confirmed by the rig · ◷ waiting for the next trial · "
+                  "◆ drawn each trial · ! refused or cannot send · ⚠ with a warning")
+
+#: **What the editor says with no setting opened** (the summary and editor design's goal 5).
+EDITOR_EMPTY = "click a setting above to change it"
+
+#: **A section's line that opens its New color… panel** (the summary and editor design's call:
+#: "the *New color…* panel opens from the Colors section's header in the summary, into the
+#: editor"), and the prefix of its `data-open`, the section after it.
+NEW_COLOR_LINE, NEW_COLOR_OPEN = "New color…", "new-color:"
+
+
+def _hidden(markup: str) -> str:
+    """A box's or a panel's markup with `hidden` on its own tag, for the editor (`_params`): the
+    page's script shows the one opened (`openSetting`), last among its attributes. Every value
+    this module writes in an attribute is escaped (`_e`), so its tag's first `>` closes it."""
+    tag, close, rest = markup.partition(">")
+    if not tag.startswith("<") or not close:
+        raise ValueError("the editor hides an element")
+    return f"{tag} hidden>{rest}"
+
+
+def _entries(frame) -> list:
+    """**Each box a frame's settings make, in the frame's order** (`_params`, `_summary`):
+    `(section, row, None, (row,))` for a setting's own box, `(section, None, group, members)` for
+    a group's (`Telemetry.groups`; the console interface rework's Task 7), which stands where its
+    first setting would, by the first group naming each setting, a ceiling never (`check`'s
+    `bad-group` refuses one at load); a group's settings have no box of their own. A row naming no
+    section is under Other."""
+    rows = {row.name: row for row in frame.params}
+    grouped: dict = {}
+    for group in frame.groups:
+        for setting in group.settings:
+            if setting in rows and not rows[setting].bounded:
+                grouped.setdefault(setting, group)
+    drawn: set = set()
+    found = []
+    for row in frame.params:
+        section = row.section or OTHER
+        group = grouped.get(row.name)
+        if group is None:
+            found.append((section, row, None, (row,)))
+        elif group.name not in drawn:
+            drawn.add(group.name)
+            found.append((section, None, group,
+                          [rows[name] for name in group.settings if grouped.get(name) is group]))
+    return found
+
+
+def _in_order(items: list) -> list:
+    """**`(section, ...)` items in their sections' order** (the console settings design's §7; the
+    PI, 2026-11-16: "The task file names it"; the summary and editor design's call: "the Ceilings
+    section comes last"): each section in the order its first item comes, a subsection
+    (`"Stimuli/fixation point"`) under its parent, which keeps its own items first, and Ceilings
+    (`task.CEILINGS`) last. `[(top, {"own": [...], "subs": {sub: [...]}})]`."""
+    tree: dict = {}
+    for item in items:
+        top, _, sub = item[0].partition("/")
+        node = tree.setdefault(top, {"own": [], "subs": {}})
+        (node["subs"].setdefault(sub, []) if sub else node["own"]).append(item)
+    return ([(top, node) for top, node in tree.items() if top != CEILINGS]
+            + [(top, node) for top, node in tree.items() if top == CEILINGS])
+
+
+#: **A unit a summary line says short** (the ledger's ruling for the summary and editor build's
+#: Task 2: "pick the columns and the summary's short units ('°', 'cd/m²') so that every line
+#: still fits"): degrees as the sign, against the number ("2.0°"), and cd/m² with its square. The
+#: box, its editor and *more* keep the setting's own unit.
+_SHORT_UNITS = {"deg": "°", "cd/m2": "cd/m²"}
+
+
+def _line_unit(row) -> str:
+    """**What a summary line writes after a number of a setting** (`_number_said`, `_drawn_said`,
+    and `data-unit` for the page's draft text, `_line`): a percent's `%` and a degree's `°`
+    against it, a whole number's nothing ("4", the mock-up the PI chose: "Number of discs 4"),
+    any other unit after a space, short where `_SHORT_UNITS` has it. **A special kind's share**
+    (`task.SPECIAL_UNIT`, a whole percent) writes `%` too (the pop-out revision's whole-build
+    review, M9: "0% · 0% · 0% · 0% · 0.50 s")."""
+    if row.percent or row.unit == SPECIAL_UNIT:
+        return "%"
+    if row.whole or not row.unit:
+        return ""
+    unit = _SHORT_UNITS.get(row.unit, row.unit)
+    return unit if unit == "°" else f" {unit}"
+
+
+def _number_said(row, value: object) -> str:
+    """**A number as a summary line says it** (`_summary_value`): at its box's decimals
+    (`_figure`), a percent's ×100, with what the line writes after it (`_line_unit`)."""
+    return f"{_figure(row, value)}{_line_unit(row)}"
+
+
+#: **The numbers of a draw a summary line says as its range** (`ParamRow.shape`'s, by shape):
+#: shortest to longest, low to high; a list's values from least to most.
+_DRAW_ENDS = {"non_aging": ("shortest", "longest"), "uniform": ("low", "high"),
+              "normal": ("low", "high")}
+
+#: **What a summary line says in a value's place** where each trial has one of its own and no
+#: shape says its range (the sources of `_PER_TRIAL`), in short; the line's title says it whole.
+_PER_TRIAL_SHORT = {
+    "conditions": "from conditions", "pool": "from pairings", "staircase": "by its staircase",
+    "draw": "drawn each trial", "range": "drawn each trial", "form": "drawn each trial",
+}
+
+
+def _drawn_said(row) -> str | None:
+    """**A draw in force as a summary line says it** (`ParamRow.shape`): its range, "0.5–1.25 s",
+    each end every digit it holds (`_significant`), a percent's ×100; a scaling, its factor
+    against `SCALED_UNIT`; with no shape, the range of the draw's live numbers a person may change
+    (`ParamRow.numbers`, its `low` and `high`); `None` where none names a range."""
+    shape = row.shape or {}
+    kind = shape.get("shape")
+    numbers = shape.get("numbers") or {}
+    if not shape and row.source in ("draw", "range") and isinstance(row.numbers, dict):
+        kind, numbers = "uniform", row.numbers
+    if kind == "scaled":
+        factor = numbers.get("factor")
+        return None if factor is None else f"{_significant(float(factor))} {SCALED_UNIT}"
+    if kind in _DRAW_ENDS:
+        ends = [numbers.get(name) for name in _DRAW_ENDS[kind]]
+    elif kind in ("list", "weights") and shape.get("values"):
+        ends = [min(shape["values"]), max(shape["values"])]
+    else:
+        return None
+    if not all(isinstance(end, (int, float)) and not isinstance(end, bool) for end in ends):
+        return None
+    if row.percent:
+        return f"{_significant(_hundred(ends[0]))}–{_significant(_hundred(ends[1]))}%"
+    return f"{_significant(float(ends[0]))}–{_significant(float(ends[1]))}{_line_unit(row)}"
+
+
+def _summary_value(row, level: object = None) -> str:
+    """**The value in force as a summary line says it** (the summary and editor design's call:
+    "the summary's value is the rig's: rendered in Python from the same row the box uses"), plain
+    text: a pool's "2 of 12"; a color's hue, or "from pairings" where its pool draws it; a value
+    the training switch holds, in its words ("frozen at 0.60 s"); a position or an appearance in
+    the rig's words, a choice among segments as its segment says it (`_choice_label`); a draw in
+    force as its range, "0.5–1.25 s" (`_drawn_said`); a value each
+    trial gives its own, in short (`_PER_TRIAL_SHORT`); else the number at its box's decimals with
+    its unit (`_number_said`), a ceiling's too, or the value as written."""
+    if row.members is not None:
+        whole = _whole(row.value)
+        total = len(row.members)
+        if whole is None or not 1 <= whole < 1 << total:
+            return _figure(row, row.value)
+        return f"{sum(1 for member in row.members if whole & member.bit)} of {total}"
+    if row.color is not None:
+        hue = row.color.get("hue") if isinstance(row.color, dict) else None
+        if hue:
+            return str(hue)
+        if row.source == "pool":
+            return _PER_TRIAL_SHORT["pool"]
+        return row.words if row.words is not None else _figure(row, row.value)
+    held = _HELD_BY.get(row.source)
+    if held is not None:
+        return f"{held[0]} {_number_said(row, row.value)}"
+    if row.position is not None:
+        return row.position
+    if row.words is not None and row.words in row.choices:
+        # A look picked among its segments says what its segment says, "Ring" for "Ring:
+        # inner fix_act_hole, outer ...", its words whole in the line's title (the pop-out
+        # revision's Amendments, item 6: the summary still fits).
+        return _choice_label(row.words, row.choices)
+    if row.words is not None:
+        return row.words
+    drawn = _drawn_said(row)
+    if drawn is not None:
+        return drawn
+    if (row.source == "staircase" and isinstance(level, (int, float))
+            and not isinstance(level, bool)):
+        # **A staircase's level in force after its words** (the pop-out revision's whole-build
+        # review, M8, and its re-review, N1: "by its staircase · 9"): `level`, the value at the
+        # level the frame's own staircase row is at (`Telemetry.staircase`, `_stepped`), never the
+        # row's value, which is the run's start; a condition's or a pool's each trial's own, which
+        # no frame carries, says its words alone.
+        return f"{_PER_TRIAL_SHORT['staircase']} · {_number_said(row, level)}"
+    if row.source in _PER_TRIAL_SHORT:
+        return _PER_TRIAL_SHORT[row.source]
+    if isinstance(row.value, (int, float)) and not isinstance(row.value, bool):
+        return _number_said(row, row.value)
+    return _figure(row, row.value)
+
+
+def _widest(row) -> str:
+    """**The widest value a summary line of `row` can say** (the pop-out revision's whole-build
+    review, I1: turning special trials on reflowed the summary, its columns sized from the values
+    in force), so the columns never move with a value: the value in force, and beside it what its
+    setting can come to show -- a number at each declared bound (a share's "100%", a set size's
+    "36"), after the words of what gives it where a staircase or the training switch does ("by its
+    staircase · 36"); a pool's "12 of 12"; each hue its color card offers; each choice's segment.
+    A number with an open side is said at its value in force there, which no rig value changes
+    but a person's own. Formatting, not derivation."""
+    said = [_summary_value(row)]
+    if row.members is not None:
+        said.append(f"{len(row.members)} of {len(row.members)}")
+    elif row.color is not None:
+        sets = row.color.get("sets") if isinstance(row.color, dict) else None
+        for entry in (sets.values() if isinstance(sets, dict) else ()):
+            hues = entry.get("hues") if isinstance(entry, dict) else None
+            said += [str(hue) for hue in (hues or {})]
+        said.append(_PER_TRIAL_SHORT["pool"])
+    elif row.choices:
+        said += [_choice_label(words, row.choices) for words in row.choices]
+    elif row.position is None and not isinstance(row.value, str):
+        for end in (row.low, row.high):
+            if isinstance(end, (int, float)) and not isinstance(end, bool) and math.isfinite(end):
+                number = _number_said(row, end)
+                said.append(number)
+                if row.source == "staircase":
+                    said.append(f"{_PER_TRIAL_SHORT['staircase']} · {number}")
+                if row.source in _HELD_BY:
+                    said.append(f"{_HELD_BY[row.source][0]} {number}")
+    return max(said, key=len)
+
+
+def _stepped(frame) -> tuple:
+    """**The setting the frame's staircase steps and the value at its level in force**
+    (`Telemetry.staircase`: its setting, its levels and the level it is at), or `("", None)` with
+    none, for `_summary_value`. Formatting, not derivation."""
+    row = getattr(frame, "staircase", None)
+    if row is None:
+        return "", None
+    try:
+        return row.setting, row.levels[row.level]
+    except (IndexError, TypeError):
+        return "", None
+
+
+def _drawn(row) -> bool:
+    """**Whether a summary line marks its value ◆, drawn each trial** (the summary and editor
+    design's goal 3): a value its conditions, its draw, its pool or its staircase gives each trial
+    (`_PER_TRIAL`), a person's draw among them -- not a size scaled by eccentricity, whose objects
+    each have their own but no trial draws."""
+    if row.source not in _PER_TRIAL:
+        return False
+    return not (row.shape is not None and row.shape.get("shape") == "scaled")
+
+
+def _waits(row, change, now: str) -> str:
+    """**A line's value with what waits for the next trial after an arrow** (the summary and
+    editor design's goal 3: "in force → waiting"): a number's unit once, after what waits ("0.30 →
+    0.50 s"), anything else as it is, then the arrow; `now` alone where nothing waits."""
+    if change is None:
+        return now
+    becomes = _plain(_becomes(change, row))
+    if not change.hands_back and becomes in row.choices:
+        # A choice picked among segments, as its segment says it (`_summary_value`).
+        becomes = _choice_label(becomes, row.choices)
+    if (not change.hands_back and isinstance(change.now, (int, float))
+            and not isinstance(change.now, bool) and row.members is None
+            and now == _number_said(row, row.value)):
+        return f"{_figure(row, row.value)} → {_number_said(row, change.now)}"
+    return f"{now} → {becomes}"
+
+
+def _line(name: str, label: str, codes: str, now: str, shown: str, state: str, said: str,
+          drawn: bool, changed: bool, bounded: bool, words: str, unit: str | None = None,
+          whole: str = "") -> str:
+    """**One summary line** (the summary and editor design's goal 1), a button that opens its
+    setting in the editor (`data-open`, its box's `data-card`): its marks (`span.mk`), its plain
+    name (`span.ln`) and its value in force (`span.lv`, the in force alone in `data-now`), with
+    what waits after an arrow. The marks the rig knows (the design's call on combined states):
+    ◷ a change waiting (`waiting`), else ! a refusal (`refused`), else ⚠ a warning (`warned`), as
+    the box's status line ranks them (`_status`), then ◆ a value drawn each trial (`drawn`); and
+    the classes `changed` (it differs from the task's start) and `ceiling`. Its `title` says
+    every state in words: the whole name, the value -- and a choice's words whole (`whole`) where
+    the line says it in short -- the status line whole, how it is drawn, changed, a ceiling.
+
+    **What the page reads to add what it alone knows** (the summary and editor build's Task 2,
+    `markLine` in the script): `data-now`, the value in force alone, for "in force → draft";
+    `data-said`, the status said in the title, where there is one, which the page's own words
+    replace or join; and `data-unit`, on a number's line, what the line writes after a number
+    (`_line_unit`: "%", "°", " s", nothing for a whole number), so a draft is said as the value in
+    force is, its typed text read from the box's own field."""
+    mark, kind = {"staged": ("◷", "waiting"), "refused": ("!", "refused"),
+                  "warned": ("⚠", "warned")}.get(state, ("", ""))
+    classes = " ".join(word for word in ("line", kind, "drawn" if drawn else "",
+                                         "changed" if changed else "",
+                                         "ceiling" if bounded else "") if word)
+    named = label if label == codes else f"{label} ({codes})"
+    told = [named, shown] + ([whole] if whole and whole != shown else [])
+    status = _whole_say(state, said) if state else ""
+    if status:
+        told.append(status)
+    if drawn:
+        told.append(words)
+    if changed:
+        told.append("changed from the task's start")
+    if bounded:
+        told.append("a welfare ceiling: sent alone, by its own Apply")
+    extra = f' data-said="{_e(status)}"' if status else ""
+    if unit is not None:
+        extra += f' data-unit="{_e(unit)}"'
+    return (f'<button type="button" class="{classes}" data-open="{_e(name)}"{extra} '
+            f'title="{_e(" · ".join(told))}"><span class="mk">{mark}{"◆" if drawn else ""}</span>'
+            f'<span class="ln">{_e(label)}</span><span class="lv" data-now="{_e(now)}">'
+            f"{_e(shown)}</span></button>")
+
+
+def _summary(frame, view: View, training: bool) -> str:
+    """**The summary of a settings tab** (the summary and editor design's goal 1; the PI,
+    2026-11-19: "perhaps some way to visualize all params at top and clicking opens the ability to
+    change it below", mock-up A): one line per box `_params` draws (`_line`), a group's one
+    (its title, its settings' values joined by " · "; special trials' shares only those on,
+    `_shares_said`), in its sections (`_sections`), the Ceilings section last; a section holding a
+    color card ends with a *New color…* line that opens its panel. Each line's value is the rig's
+    (`_summary_value`); the page's script adds what it alone knows. `view` is the boxes' (nothing
+    here is gated: a line sends nothing)."""
+    staged = {change.name: change for change in frame.staged}
+    refused = {refusal.name: refusal for refusal in frame.refusals}
+    peers = _percents(frame)
+    entries = [entry for entry in _entries(frame) if _training(entry[0]) == training]
+    lines = []
+    widths = [_line_width(NEW_COLOR_LINE, "")]
+    stepped, level = _stepped(frame)
+    for section, row, group, members in entries:
+        if group is None:
+            change = staged.get(row.name)
+            state, said = _status(row, change, refused.get(row.name), peers)
+            now = _summary_value(row, level if row.name == stepped else None)
+            drawn = _drawn(row)
+            words = _plain(_PER_TRIAL[row.source][0]) if drawn else ""
+            number = (row.members is None and row.color is None and row.position is None
+                      and not isinstance(row.value, str))
+            shown = _waits(row, change, now)
+            widths.append(_line_width(row.label or row.name, _widest(row)))
+            lines.append((section, 1 if row.changed else 0, _line(
+                row.name, row.label or row.name, row.name, now, shown,
+                state, said, drawn, row.changed, row.bounded, words,
+                _line_unit(row) if number else None,
+                row.words if row.words is not None and row.words in row.choices else ""), 1))
+            continue
+        state, said = _group_state(members, frame, staged)
+        values = [_summary_value(member, level if member.name == stepped else None)
+                  for member in members]
+        now = " · ".join(values)
+        shown = " · ".join(_waits(member, staged.get(member.name), value)
+                           for member, value in zip(members, values))
+        drawn = [member for member in members if _drawn(member)]
+        words = "; ".join(f"{member.label or member.name} {_plain(_PER_TRIAL[member.source][0])}"
+                          for member in drawn)
+        changed = sum(1 for member in members if member.changed)
+        whole = ""
+        if any(member.unit == SPECIAL_UNIT for member in members):
+            # **A group of special trials' shares says only the shares that are on** (the PI,
+            # 2026-11-20, from his try-out: "Shorter line, no cut"), each in short words, or
+            # "none", or where that would not fit, how many kinds and their sum
+            # (`_shares_said`), judged once the columns' width is known, below; every setting
+            # of the group whole in its title.
+            whole = " · ".join(
+                f"{member.label or member.name} {_waits(member, staged.get(member.name), value)}"
+                for member, value in zip(members, values))
+        # **A group's line is not sized by its values** (I1): its name shows whole; a group's
+        # values may cut with an ellipsis, whole in its title, but special trials' never do.
+        widths.append(_line_width(group.name, ""))
+        lines.append((section, changed, (
+            group.name, group.name, ", ".join(member.name for member in members), now, shown,
+            state, said, bool(drawn), bool(changed), False, words, None, whole, members),
+            len(members)))
+    colored = {section for section, row, group, _ in entries
+               if group is None and isinstance(row.color, dict) and row.color.get("sets")}
+    panels = {section: f'<button type="button" class="line newcolor" '
+                       f'data-open="{_e(NEW_COLOR_OPEN + section)}" title="{_e(NEW_COLOR_LINE)} '
+                       f'{_e(section)}: define a color and save it as a proposal"><span class="mk">'
+                       f'</span><span class="ln">{_e(NEW_COLOR_LINE)}</span><span class="lv">'
+                       f"</span></button>" for section in colored}
+    run = f"{frame.session_id}/{frame.run_index}" if frame.phase == "running" else ""
+    width = max(widths)
+    for at, (section, changed, made, counted) in enumerate(lines):
+        if isinstance(made, tuple):
+            *fields, whole, members = made
+            if whole:
+                fields[3], fields[4] = _shares_said(fields[0], members, staged,
+                                                    max(width, SUMMARY_FLOOR_CH))
+            lines[at] = (section, changed, _line(*fields, whole), counted)
+    return _sections(frame.task, lines, run, panels, width)
+
+
+#: **The most of its line a value takes** (`.line > .lv`'s `max-width` in the page's CSS), so a
+#: special trials' line is judged to fit as the page lays it out (`_shares_said`).
+LINE_VALUE_SHARE = 0.62
+#: **A value's character as wide as it is drawn**, in the summary's `ch`: IBM Plex Mono at 12 px,
+#: 7.2 px each, every character alike (measured in Chromium and WebKit on 2026-11-19, the build's
+#: `task-3-report.md`, and again on 2026-11-20: "4 kinds · 400% of trials", 24 characters, is
+#: 172.8 px in both; layout, not timing), where `_VALUE_CH` takes it as 0.9 to spare. A special
+#: trials' line is judged with it (`_shares_said`), its name and padding still by the estimate that
+#: is never short, and the browser test holds the line uncut at three widths in both engines.
+_MONO_CH = 7.2 / 8.4
+
+
+def _share_words(members: list) -> dict:
+    """**Each special trials' share by its short words** (`_shares_said`): its plain name, less a
+    closing "trials", lower case, cut to its last words that tell it from every other share of the
+    group -- the pop-out's "absent", "empty", "distractor alone" and "disc alone". Formatting, not
+    derivation."""
+    named = {}
+    for member in members:
+        if member.unit != SPECIAL_UNIT:
+            continue
+        words = (member.label or member.name.removesuffix("_percent").replace("_", " ")).split()
+        if len(words) > 1 and words[-1].lower() in ("trials", "trial"):
+            words = words[:-1]
+        named[member.name] = [word.lower() for word in words]
+    short = {}
+    for name, words in named.items():
+        for count in range(1, len(words) + 1):
+            tail = words[-count:]
+            if all(other[-count:] != tail for key, other in named.items() if key != name):
+                break
+        short[name] = " ".join(tail)
+    return short
+
+
+def _shares_said(name: str, members: list, staged: dict, width: float) -> tuple[str, str]:
+    """**A special trials group's summary line, in force and with what waits** (the PI,
+    2026-11-20, from his try-out: "Shorter line, no cut"; the controller's ruling for the form that
+    does not fit): only the shares that are on, each in short words (`_share_words`), "absent 10% ·
+    distractor alone 5%", one waiting to change said with its arrow ("absent 0% → 10%"); "none"
+    with every share at 0. **Where that would not fit its column** -- `width`, the summary's
+    columns in `ch` at their narrowest, the name and padding by the estimate that is never short
+    (`_line_width`), the value as drawn (`_MONO_CH`) and at most `LINE_VALUE_SHARE` of the line --
+    how many kinds are on and their sum, "4 kinds · 400% of trials",
+    from the values in force; its title says every setting of the group whole (`_summary`). The
+    group's other settings, a catch's hold, are left off the line: they matter only while a
+    share is on, and the editor and the title say them. Formatting, not derivation."""
+    short = _share_words(members)
+    shares = [member for member in members if member.name in short]
+
+    def on(value) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+    def said(items) -> str:
+        return " · ".join(items) if items else "none"
+
+    now = [f"{short[member.name]} {_summary_value(member)}" for member in shares
+           if on(member.value)]
+    shown = []
+    for member in shares:
+        change = staged.get(member.name)
+        waiting = change is not None and not change.hands_back and on(change.now)
+        if on(member.value) or waiting:
+            shown.append(f"{short[member.name]} "
+                         f"{_waits(member, change, _summary_value(member))}")
+
+    def fits(text: str) -> bool:
+        value = len(text) * _MONO_CH
+        return _line_width(name, "") + value <= width and value <= LINE_VALUE_SHARE * width
+
+    if fits(said(now)) and fits(said(shown)):
+        return said(now), said(shown)
+    kinds = len(now)
+    total = sum(member.value for member in shares if on(member.value))
+    counted = (f"{kinds} kind{'' if kinds == 1 else 's'} · {_significant(float(total))}% of "
+               f"trials") if kinds else "none"
+    return counted, counted
+
+
+#: **How wide a summary line's characters are, in the summary's `ch`** (the ledger's ruling for the
+#: summary and editor build's Task 3: "size the summary's columns from the tab's own longest
+#: line"), measured in WebKit and Chromium on 2026-11-19 (layout, not timing; the build's
+#: `task-3-report.md`): the summary's `ch` is 8.4 px (IBM Plex Sans at 14 px); a plain name is
+#: IBM Plex Sans at 12.5 px, its characters 0.24 to 0.93 em wide, taken here by the widest of four
+#: kinds -- narrow (0.38 em: "i", "l", "t", "f", "r", a space, most punctuation), wide (0.93 em:
+#: "m", "w", "M", "W", "%", "@", "→", "…"), any other capital (0.72 em), anything else (0.6 em) --
+#: so an estimate is never short (over the pop-out's own names it is 13 to 20 % long); a value is
+#: IBM Plex Mono at 12 px, 7.2 px a character, taken as 0.9 ch; and a line's padding, its marks'
+#: 2 em and its gaps take 40 px, taken as 5.5 ch with 6 px to spare.
+_NARROW = frozenset(" 'ijlftr/,.!:;|[](){}·²\\")
+_WIDE = frozenset("mwMW%@→…")
+_NAME_CH = 12.5 / 8.4
+_VALUE_CH = 0.9
+_LINE_CH = 5.5
+#: **The narrowest a summary's columns are** (an engineering default: four columns of a 1280 wide
+#: window beside the demo screen, the summary and editor design's goal 1), in `ch`.
+SUMMARY_FLOOR_CH = 24.0
+
+
+def _line_width(label: str, shown: str) -> float:
+    """**How wide a summary line must be for its plain name and its value to show whole**, in the
+    summary's `ch` (`_NAME_CH`, `_VALUE_CH`, `_LINE_CH`), as the summary's columns take it from
+    its longest line (`_summary`, `_sections`): the widest value its setting can show
+    (`_widest`), never the value in force alone, nor what waits after an arrow or a draft, so a
+    change applied, waiting or typed never moves the columns and the editor under the pointer
+    (the design's anti-goal; the pop-out revision's whole-build review, I1); a group's line by
+    its name alone. Any may cut with an ellipsis, its whole in the line's title."""
+    name = sum(0.38 if char in _NARROW else 0.93 if char in _WIDE else 0.72 if char.isupper()
+               else 0.6 for char in label)
+    return name * _NAME_CH + len(shown) * _VALUE_CH + _LINE_CH
+
+
+def _group_state(members: list, frame, staged: dict) -> tuple[str, str]:
+    """**A group's state and status line, as its box ranks them** (`_group_box`): a change of it
+    waiting, the last refusal of any of its settings, the change in force latest, else
+    `GROUP_REST`; its marks on its summary line (`_line`)."""
+    by_name = {row.name: row for row in members}
+    change = next((staged[row.name] for row in members if row.name in staged), None)
+    if change is not None:
+        return "staged", f"{WAITING} · {_who(change.by)}"
+    refusal = None
+    for one in frame.refusals:
+        if one.name in by_name:
+            refusal = one
+    if refusal is not None:
+        row = by_name[refusal.name]
+        value = "" if refusal.value is None else f" {_e(_refused_value(row, refusal.value))}"
+        gist = _gist(_in_percent(row, refusal.why, _percents(frame)))
+        return "refused", f"refused {_e(row.label or row.name)}{value} · {_e(gist)}"
+    applied = [row for row in members if row.applied is not None]
+    if applied:
+        last = max(applied, key=lambda row: row.applied.trial)
+        if last.warned:
+            return "warned", f"in force, with a warning · from trial {_e(last.applied.trial)}"
+        return "applied", f"in force from trial {_e(last.applied.trial)}"
+    return "", _e(GROUP_REST)
+
+
+def _echoes(row) -> bool:
+    """**Whether a box's field shows the value its head would** (the ledger's density ruling for
+    the console interface rework's Task 8: "the head shows the value in force only when it differs
+    from the field (a draft or a waiting change, e.g. "2.0 → 1.5"), not twice"): a number or a word
+    in a field of its own, as `_entry`'s last branch draws it -- not a value held by the training
+    switch, given each trial, a position, an appearance, a color, a pool, or a setting picked among
+    its choices' segments, whose head is the only place the value in force is said. Its box carries `data-echo`, and the page's CSS hides the
+    head's value at rest while it does."""
+    settable = row.value is None or isinstance(row.value, str) or (
+        isinstance(row.value, (int, float)) and not isinstance(row.value, bool))
+    scaled = (row.switch == "scaled" and row.shape is not None
+              and row.shape.get("shape") == "scaled")
+    return (settable and row.members is None and row.color is None and not scaled
+            and _HELD_BY.get(row.source) is None and _PER_TRIAL.get(row.source) is None
+            and row.position is None and row.words is None and not row.choices)
+
+
+#: **What a box's *more* says on its ⋯** (the ledger's density ruling for Task 8: "*more* becomes a
+#: ⋯ in the box's head, not its own line"), for a screen reader and a pointer's tooltip.
+MORE_SAID = "more: what it is, its limits and why, where its value comes from"
+
+
+def _pin(name: str) -> str:
+    """**A box's pin**, `name` its `data-card` as escaped there (the console interface design's goal 9; the PI, 2026-11-19: "Yes, you choose
+    only"), the first thing in its *more*: it puts a working copy of the box in Runtime's Pinned
+    strip, or takes it away, kept per task in this browser (the page's script); nothing is
+    pinned until a person pins it. It sends nothing, so no gate grays it."""
+    return (f'<button type="button" class="btn small pin" data-pin-toggle="{name}" '
+            f'aria-pressed="false">pin to Runtime</button>')
+
+
+def _entry(row, view: View, unit: bool = True) -> tuple[str, str]:
+    """**A setting's value in force and its field**, as its box's head and editor show them
+    (`_params`): a value held by the training switch, given by its conditions, its draw, its pool
+    or its scaling in those words with a field to set one value over them (`_over`); a position or
+    an appearance in the rig's words, with none; else the value and its unit, with its field
+    (`_field`; `unit`, as there) where it is a number or a word. **A setting whose row gives its
+    choices by their words** (`ParamRow.choices`) has its segments in place of any field
+    (`_choice_segments`; the pop-out revision's Task 5b). Escaped markup, both."""
+    settable = row.value is None or isinstance(row.value, str) or (
+        isinstance(row.value, (int, float)) and not isinstance(row.value, bool))
+    per_trial = _PER_TRIAL.get(row.source)
+    scaled = (row.switch == "scaled" and row.shape is not None
+              and row.shape.get("shape") == "scaled")
+    if scaled and row.source == "form":
+        per_trial = _SCALED
+    held_by = _HELD_BY.get(row.source)
+    if held_by is not None:
+        label = (f'<span class="pv">{held_by[0]} {_e(_figure(row, row.value))} '
+                 f'<span class="unit">{_e(_unit_of(row))}</span></span>')
+        entry = _over(row, held_by[1], view) if settable and row.position is None else ""
+    elif per_trial is not None:
+        label = f'<span class="pv">{per_trial[0]}</span>'
+        entry = _over(row, per_trial[1], view) if settable and row.position is None else ""
+    elif row.position is not None:
+        label, entry = f'<span class="pv">{_e(row.position)}</span>', ""
+    elif row.words is not None:
+        # An appearance or a color in the rig's words (`ParamRow.words`; XC-420), no field:
+        # a color setting's is picked on its color card, below.
+        label, entry = f'<span class="pv">{_e(row.words)}</span>', ""
+    else:
+        label = (f'<span class="pv">{_e(_figure(row, row.value))} '
+                 f'<span class="unit">{_e(_unit_of(row))}</span></span>')
+        entry = _field(row, view, unit) if settable else ""
+    if row.choices and row.members is None and row.color is None:
+        # Its declared choices by their words, as segments (`ParamRow.choices`; the pop-out
+        # revision's Task 5b), in place of a field: a look, or a word, is picked, never typed.
+        entry = _choice_segments(row, view)
+    return label, entry
+
+
+def _choice_label(words: str, choices: tuple) -> str:
+    """**What a choice's segment says** (`_choice_segments`): `link.choice_label`, which the
+    changes feed and the moments say a choice by too. Formatting, not derivation."""
+    return choice_label(words, choices)
+
+
+def _choice_segments(row, view: View) -> str:
+    """**A setting's declared choices as segments** (`ParamRow.choices`, each choice by its words;
+    the pop-out revision's design §2, a look's shape "a setting on the console"; its plan's Task
+    5b): one button for each, in the order declared, saying it in short (`_choice_label`) and
+    whole in its title, the choice in force pressed -- the value's words, or the word it is, none
+    where each trial gives its own. Pressing one is a draft of its box, as a hue's swatch is,
+    which the box's Apply sends as `choice`, `link.SetChoice`, by the words, staged until the next
+    trial. Greyed away from the box."""
+    name, off = _e(row.name), _gate(view)
+    held = (None if _PER_TRIAL.get(row.source) is not None
+            else row.words if row.words is not None else row.value)
+    buttons = []
+    for words in row.choices:
+        on = words == held
+        # The title rides on a span: the sign-in takes a gated button's own (`applySignIn`).
+        buttons.append(
+            f'<span class="chw" title="{_e(words)}">'
+            f'<button type="button" class="btn small seg ch{" on" if on else ""}" '
+            f'data-name="{name}" data-choice="{_e(words)}" '
+            f'aria-pressed="{"true" if on else "false"}"{off}>'
+            f"{_e(_choice_label(words, row.choices))}</button></span>")
+    return (f'<div class="sw chs" role="group" data-choices="{name}" '
+            f'aria-label="{name}: its choices">{"".join(buttons)}</div>')
+
+
+def _editor(row, frame, view: View) -> tuple[str, str]:
+    """**A box's head value and its editor** (`_params`): a timing card's switch and its fixed and
+    drawn sides, a size's fixed and scaled sides, a color's set and swatches, a pool's grid of
+    pairs (`_pairings`, its head how many it holds), else its field (`_entry`)."""
+    label, entry = _entry(row, view)
+    if row.members is not None:
+        # A pool's pairings as a grid (the console interface design's goal 7), whatever gives it.
+        return (f'<span class="pv">{_e(_pooled(row, row.value))}</span>',
+                _pairings(row, view))
+    if row.switch == "drawn":
+        drawn = row.shape is not None
+        return label, (_switch(row, view, drawn)
+                       + f'<div class="side fixed" data-side="fixed"{" hidden" if drawn else ""}>'
+                       f"{entry}</div>"
+                       + f'<div class="side drawn" data-side="drawn"{"" if drawn else " hidden"}>'
+                       f"{_drawn_side(row, view)}</div>")
+    if row.switch == "scaled":
+        scaled = row.shape is not None and row.shape.get("shape") == "scaled"
+        return label, (_switch(row, view, scaled, "scaled")
+                       + f'<div class="side fixed" data-side="fixed"{" hidden" if scaled else ""}>'
+                       f"{entry}</div>"
+                       + f'<div class="side scaled" data-side="scaled"{"" if scaled else " hidden"}>'
+                       f"{_scaled_side(row, view)}</div>")
+    if row.color is not None:
+        # A color setting: its set, its hues as swatches, its two levels (the design's §6).
+        return label, _color_card(row, frame, view)
+    return label, entry
+
+
+#: **What a group's box says at rest** (the console interface design's goal 8), its status line.
+GROUP_REST = "applied together, by one Apply"
+#: **The trials a special trials group leaves normal**, said after its sentence (the console
+#: interface design's goal 8: "the remainder shown as "normal search""; the pop-out revision's
+#: Amendments, item 4). The words are the pop-out's, the one task that declares special trials:
+#: a frame names no task's default structure, and a second task's words wait for a field that
+#: carries them (XC-544).
+NORMAL_REST = "normal search"
+
+
+def _rest_said(total: float) -> str:
+    """**A special trials group's remainder**, from its shares' sum (`check.special_share` each,
+    as the draw reads them): "N normal search" below 100, "none normal search" at 100, and past it
+    the `specials-over-100` warning's words after it (`check.IN_PROPORTION`). The script says the
+    same from the box's fields while a draft is open (`restOf`)."""
+    from wl_xcon.check import IN_PROPORTION
+
+    if total < 100:
+        return f"{100 - total:g} {NORMAL_REST}"
+    return f"none {NORMAL_REST}" + (f": {IN_PROPORTION}" if total > 100 else "")
+
+
+def _sentence_unit(row, sentence: str) -> bool:
+    """**Whether a group's sentence shows a setting's unit beside its field** (the pop-out
+    revision's whole-build review: "a catch is held [0.50] s"): a setting of a unit the sentence
+    does not name -- not a whole count, which the sentence counts in words, nor a percent or a
+    share, whose `%` the field shows -- where the sentence does not write it after the field."""
+    if row.whole or row.percent or row.unit == SPECIAL_UNIT or not row.unit:
+        return False
+    for literal, field, _, _ in string.Formatter().parse(sentence):
+        if field == row.name:
+            after = sentence.partition("{" + field + "}")[2].lstrip()
+            unit = _SHORT_UNITS.get(row.unit, row.unit)
+            return not (after.startswith(unit) or after.startswith(row.unit))
+    return True
+
+
+def _rest(rows: list) -> str:
+    """**The remainder a group holding special trials' shares says after its sentence**
+    (`_rest_said`), on a line of its own naming the shares (`data-shares`) and carrying the words
+    the script needs (`data-words`, `data-over`); "" for a group holding no share. A share is a
+    setting in `task.SPECIAL_UNIT`, the unit `check`'s `bad-special` holds every special kind's
+    share to."""
+    from wl_xcon.check import IN_PROPORTION, special_share
+
+    shares = [row for row in rows if row.unit == SPECIAL_UNIT]
+    if not shares:
+        return ""
+    total = sum(special_share(row.value) for row in shares)
+    names = " ".join(row.name for row in shares)
+    return (f'<div class="gr" data-shares="{_e(names)}" data-words="{_e(NORMAL_REST)}" '
+            f'data-over="{_e(IN_PROPORTION)}">{_e(_rest_said(total))}</div>')
+
+
+def _group_box(group, rows: list, frame, view: View, staged: dict, acts: dict) -> str:
+    """**A group's one box** (`Telemetry.groups`, a `link.GroupRow`; the console interface design's
+    goal 8; the PI, 2026-11-19: "One box after Timing"), laid out as `_box`'s, its markup the
+    script's too, `data-card` the group's title and `group` among its classes:
+
+    - its head: the title, its settings' code names small, and each one's value in force with what
+      waits for the next trial after an arrow;
+    - its editor: the group's sentence with each setting's field in its place, the unit left to
+      the sentence but a percent's `%` (`_field`'s `unit`) -- "Move up when at least [80] % of the
+      last [50] answers are right" -- or, where it declares none, each setting's field under its
+      plain name;
+    - its status: one line for the whole box -- a change of it waiting, the last refusal of any of
+      its settings (named), the change in force latest, else `GROUP_REST` -- *withdraw* for a change
+      waiting under a command id, which takes back the whole act ("withdraw all 2"), then Discard
+      and Apply. **Its Apply is one act**: the script sends every setting it changed as one
+      `apply_many` under one command id, judged and staged together, or refused whole;
+    - its *more*: each setting's plain name, what it is, its limits and why, where its value comes
+      from and *hand back*, what waits, its warnings and its last refusal whole. A draw's live
+      numbers are not offered here: the box's one Apply sends its fields' values (`_whence`'s
+      `ranges`).
+
+    A ceiling is never in one (`check`'s `bad-group`: "a reward size is sent alone, by its own
+    Apply"); `_params` leaves any a frame names out."""
+    title, off = _e(group.name), _gate(view)
+    by_name = {row.name: row for row in rows}
+    peers = _percents(frame)
+    codes = ", ".join(row.name for row in rows)
+    names = (f'<span class="names"><span class="lbl" title="{title}">{title}</span>'
+             f'<span class="code" title="{_e(codes)}">{_e(codes)}</span></span>')
+    entries = {row.name: _entry(row, view, unit=not group.sentence
+                                or _sentence_unit(row, group.sentence)) for row in rows}
+    shown = []
+    for row in rows:
+        shown.append(_awaited(entries[row.name][0], staged.get(row.name), row))
+    now = " · ".join(shown)
+    if group.sentence:
+        pieces = []
+        for literal, field, _, _ in string.Formatter().parse(group.sentence):
+            if literal:
+                pieces.append(f'<span class="gs">{_e(literal)}</span>')
+            if field is not None:
+                pieces.append(entries[field][1] if field in by_name
+                              else f'<span class="gs code">{_e(field)}</span>')
+        editor = f'<div class="sentence">{"".join(pieces)}</div>{_rest(rows)}'
+    else:
+        editor = "".join(f'<div class="gm"><span class="gl">{_e(row.label or row.name)}</span>'
+                         f"{entries[row.name][1]}</div>" for row in rows)
+    changes = [staged[row.name] for row in rows if row.name in staged]
+    change = changes[0] if changes else None
+    refusal = None
+    for one in frame.refusals:
+        if one.name in by_name:
+            refusal = one
+    applied = [row for row in rows if row.applied is not None]
+    last = max(applied, key=lambda row: row.applied.trial) if applied else None
+
+    def line(refused) -> tuple[str, str]:
+        if change is not None:
+            return "staged", f"{WAITING} · {_who(change.by)}"
+        if refused is not None:
+            row = by_name[refused.name]
+            value = ("" if refused.value is None
+                     else f" {_e(_refused_value(row, refused.value))}")
+            gist = _gist(_in_percent(row, refused.why, peers))
+            return "refused", f"refused {_e(row.label or row.name)}{value} · {_e(gist)}"
+        if last is not None:
+            if last.warned:
+                return "warned", f"in force, with a warning · from trial {_e(last.applied.trial)}"
+            return "applied", f"in force from trial {_e(last.applied.trial)}"
+        return "", _e(GROUP_REST)
+
+    state, said = line(refusal)
+    more = [_pin(title)]
+    for row in rows:
+        bits = [f'<span class="gn">{_e(row.label or row.name)}</span>']
+        if row.help:
+            bits.append(f'<span class="what">{_e(row.help)}</span>')
+        bits.append(f'<span class="range">{_range(row)}</span>')
+        bits.append(_whence(row, view, _beneath(row, frame), ranges=False))
+        if row.gives is not None:
+            bits.append(f'<span class="src gives">gives {_e(row.gives)}</span>')
+        waiting = staged.get(row.name)
+        if waiting is not None:
+            bits.append(f'<span class="stg">staged → {_becomes(waiting, row)} by '
+                        f"{_who(waiting.by)}</span>")
+        bits.extend(f'<span class="wrn">warning: {_e(_in_percent(row, warned, peers))}</span>'
+                    for warned in row.warned)
+        if refusal is not None and refusal.name == row.name:
+            bits.append(f'<span class="rfs">last refused: '
+                        f'{_e(_in_percent(row, refusal.why, peers))}</span>')
+        more.append(f'<div class="gmore" data-member="{_e(row.name)}">{"".join(bits)}</div>')
+    marks = []
+    if change is not None and change.cid:
+        marks.append(f' data-staged-cid="{_e(change.cid)}"')
+    if refusal is not None:
+        marks.append(f' data-refusal="{_e(refusal.cid or refusal.why)}"')
+        if refusal.cid:
+            marks.append(f' data-refusal-cid="{_e(refusal.cid)}"')
+    if last is not None:
+        marks.append(f' data-applied="{_e(last.applied.trial)}"')
+    under = next((said for said in (_under(row, staged.get(row.name)) for row in rows) if said), "")
+    if under:
+        marks.append(f' data-under="{_e(under)}"')
+    if all(_echoes(row) for row in rows):
+        marks.append(" data-echo")
+    rest = ""
+    if state == "refused":
+        rest_state, rest_said = line(None)
+        rest = f' data-rest="{_e(_plain(rest_said))}" data-rest-state="{rest_state}"'
+    together = tuple(acts.get(change.cid, ())) if change is not None and change.cid else ()
+    classes = " ".join(word for word in ("box", "group", "wide", state) if word)
+    return (
+        f'<div class="{classes}" data-card="{title}"{"".join(marks)}>'
+        f'<div class="head">{names}<span class="now" title="{_e(_plain(now))}">{now}</span></div>'
+        f'<div class="editor">{editor}</div>'
+        f'<div class="status"><span class="say" title="{_e(_whole_say(state, said))}"{rest}>'
+        f'{said}</span><span class="acts">{_withdraw(change, together, view)}'
+        f'<button type="button" class="btn small" data-discard="{title}" tabindex="0"{off}>'
+        f'Discard</button><button type="button" class="btn small primary" '
+        f'data-apply="{title}" tabindex="0"{off}>Apply</button></span></div>'
+        f'<details class="more"><summary aria-label="{_e(MORE_SAID)}" title="{_e(MORE_SAID)}">⋯'
+        f'</summary><div class="detail">{"".join(more)}</div></details></div>'
+    )
+
+
+def _training(section: str) -> bool:
+    """**Whether a section is the Training tab's** (`task.TRAINING_SECTION`, or one under it; the
+    console settings design's §8: "the tab gathers everything a task declares as training"), and
+    so not the Task parameters tab's."""
+    return section.partition("/")[0] == TRAINING_SECTION
+
+
+def _training_params(frame: Telemetry | None, view: View) -> str:
+    """**The settings of every section under Training** (`_training`; the console settings
+    design's §8), as the Task parameters tab lays its own out (`_params`: the summary, in its
+    sections, and the editor), each box as `_params` makes it; a line saying none where the task
+    declares none."""
+    if frame is None:
+        return _NONE
+    if not any(_training(row.section or OTHER) for row in frame.params):
+        return '<span class="nm">this task declares no Training section</span>'
+    whole = _params(dataclasses.replace(frame, params=tuple(
+        row for row in frame.params if _training(row.section or OTHER))), view, training=True)
+    return whole
+
+
+#: **The training switch's positions as the Training tab offers them** (`link.Shaping`;
+#: `task.SHAPING`), each with its label.
+_SWITCHES = (("on", "on"), ("frozen", "frozen"), ("full", "full task"))
+
+#: **Why *full task* is grayed** where the run's plan declares none (`Telemetry.full_task`; the
+#: console settings design's §8).
+NO_FULL_TASK = "this run's plan declares no full task, so there is none to play"
+
+
+def _shaping(frame: Telemetry | None, view: View) -> str:
+    """**The training switch** (`Telemetry.shaping`; the console settings design's §8; the PI,
+    2026-11-16: "both, a freeze training option and a full task option"): *on · frozen · full
+    task*, the position in force pressed, each sending `shaping` with its position (`link.Shaping`),
+    staged to the next trial; *full task* grayed, saying why, where the plan declares none
+    (`Telemetry.full_task`); a switch staged said beside it. A line saying why there is none for a
+    run with no training progression, staircase or pool, and between runs."""
+    if frame is None:
+        return _NONE
+    if frame.phase != "running":
+        return '<span class="nm">no run in progress: no training to switch</span>'
+    if not frame.shaping:
+        return ('<span class="nm">this run has no training progression, no staircase and no pool, '
+                'so there is no training to switch</span>')
+    buttons = []
+    for position, label in _SWITCHES:
+        other = ""
+        if position == "full" and not frame.full_task:
+            other = f' disabled title="{_e(NO_FULL_TASK)}"'
+        pressed = "true" if position == frame.shaping else "false"
+        buttons.append(f'<button type="button" class="btn small" data-cmd="shaping" '
+                       f'data-position="{position}" aria-pressed="{pressed}"'
+                       f'{_gate(view, other)}>{label}</button>')
+    staged = next((change for change in frame.staged if change.name == "shaping"), None)
+    said = ("" if staged is None else
+            f'<span class="stg">staged → {_e(dict(_SWITCHES).get(staged.now, staged.now))} by '
+            f'{_who(staged.by)}</span>')
+    why = ("" if frame.full_task
+           else f'<span class="nm">full task: {_e(NO_FULL_TASK)}</span>')
+    return (f'<div class="kv"><span>training</span><span class="selrow" role="group" '
+            f'aria-label="training switch">{"".join(buttons)}</span></div>{said}{why}')
+
+
+def _runtime_shaping(frame: Telemetry | None) -> str:
+    """**The Runtime tab's one line for the training switch** (`rt-shaping`; the console settings
+    design's §8), so nothing the Training tab holds is hidden: `training frozen · stage Crowd ·
+    Training tab`; empty where the run has no switch, and between runs."""
+    if frame is None or frame.phase != "running" or not frame.shaping:
+        return ""
+    state = {"on": "training on", "frozen": "training frozen", "full": "full task"}.get(
+        frame.shaping, frame.shaping)
+    return (f'<span class="nm">{_e(state)} · stage <b>{_e(frame.block)}</b> · '
+            f'<label for="t-training" class="lnk">Training tab</label></span>')
+
+
+def _count(settings: int, changed: int) -> str:
+    """A section header's counts whole (`7 settings · 2 changed`; the console settings design's §7:
+    "each header counts its settings and how many differ from the task's start"), its `title`
+    in the summary, whose line says the settings alone (`_sections`)."""
+    return f"{settings} setting{'' if settings == 1 else 's'} · {changed} changed"
+
+
+def _sections(task: str, cards: list, run: str = "", panels: dict | None = None,
+              width: float | None = None) -> str:
+    """**The summary's lines in their sections** (the console settings design's §7; the PI,
+    2026-11-16: "The task file names it"; the summary and editor design's goal 1): each `(section,
+    changed, html, settings)` under the section its row names (`ParamRow.section`; a row naming
+    none, one made by hand, under Other), **in the order each section's first setting is
+    declared**, Ceilings last (`_in_order`), a subsection (`"Stimuli/fixation point"`) nested in
+    its parent, which keeps its own lines first. Each is a `<div class="ssec" data-section=…>`
+    headed by its name and how many settings it holds (`<h4>Timing · 6 settings</h4>`, a parent's
+    taking in its subsections', a group's box counting each of its settings), on one line, the
+    whole with how many changed from the task's start in its `title` (`_count`); sections no
+    longer fold (the design's call: "the summary is short enough"). A section with no setting is
+    not made. `panels` gives a section's *New color…* line, after its lines. `task` names the task
+    (`data-task`: what the page keeps the opened setting and the pins under), and `run` the run in
+    progress (`data-run`; "" between runs): the script drops every draft when it changes (the
+    console interface design's call: "drafts ... dropped at the run's end"). `width`, in `ch`, is
+    its columns' (`_line_width` of its longest line, never under `SUMMARY_FLOOR_CH`; the ledger's
+    ruling for the build's Task 3), so a task of short names gets more columns than one of long."""
+    panels = panels or {}
+
+    def block(name: str, own: list, counted: list, inside: tuple = ()) -> str:
+        settings = sum(item[3] for item in counted)
+        whole = _count(settings, sum(item[1] for item in counted))
+        label = name.rpartition("/")[2]
+        said = f"{settings} setting{'' if settings == 1 else 's'}"
+        lines = "".join(item[2] for item in own) + (panels.get(name, "") if own else "")
+        head = f'<h4 title="{_e(label)} · {whole}">{_e(label)} · {said}</h4>'
+        if inside and not own:
+            # **A section of subsections alone keeps its header with its first** (the pop-out
+            # revision's whole-build review, I1: WebKit honors no `break-after: avoid` on a header
+            # whose section holds only sections, and left "Stimuli · 16 settings" alone at a
+            # column's foot): the two in one block no column breaks (`.skeep`).
+            head, inside = f'<div class="skeep">{head}{inside[0]}</div>', inside[1:]
+        return (f'<div class="ssec" data-section="{_e(name)}">{head}{lines}'
+                f'{"".join(inside)}</div>')
+
+    parts = []
+    for top, node in _in_order(cards):
+        subs = tuple(block(f"{top}/{sub}", found, found) for sub, found in node["subs"].items())
+        every = node["own"] + [one for found in node["subs"].values() for one in found]
+        parts.append(block(top, node["own"], every, subs))
+    wide = "" if width is None else (
+        f' style="column-width: {math.ceil(max(width, SUMMARY_FLOOR_CH) * 10) / 10:g}ch"')
+    return (f'<div class="summary" data-task="{_e(task)}" data-run="{_e(run)}"{wide}>'
+            f'{"".join(parts)}</div>')
 
 
 def _reverting(changes: tuple) -> str:
@@ -2534,6 +4370,7 @@ def fragments(frame: Telemetry | Idle | None, view: View) -> dict[str, str]:
     return {
         "demo-tag": _demo_tag(frame),
         "state": _state(frame),
+        "bar-nums": _bar_nums(frame),
         "head-id": _head(frame),
         "presence": _presence(view),
         "strip": _strip(frame, view),
@@ -2544,13 +4381,16 @@ def fragments(frame: Telemetry | Idle | None, view: View) -> dict[str, str]:
         "controls": _controls(frame, view),
         "rt-trials": _trials(frame),
         "rt-work": _work(frame),
-        "rt-train": _trainer(frame, view),
+        "rt-shaping": _runtime_shaping(frame),
         "rt-need": _need(frame, view),
         "rt-wrong": _wrong(frame),
         "rt-health": _health_pane(frame, view),
         "rt-changes": _changes(frame),
         "params": _params(frame, view),
         "moments": _moments(frame, view),
+        "shaping": _shaping(frame, view),
+        "rt-train": _trainer(frame, view),
+        "training-params": _training_params(frame, view),
         "pf-sum": _pf_sum(frame),
         "preflight": _preflight_pane(frame, view),
         "setup": _setup(frame),
@@ -2671,7 +4511,7 @@ _CSS = """
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 14px; line-height: 1.4; padding: 12px 16px 28px; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 14px; line-height: 1.4; padding: 0 12px 28px; }
 .wrap { max-width: 1520px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .num, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 h2 { font-family: var(--cond); font-weight: 700; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 0; }
@@ -2681,7 +4521,25 @@ h3 { margin: 0; font-family: var(--cond); font-weight: 600; font-size: 11.5px; l
 .who-b { font-style: italic; }
 .later { font-size: 11px; color: var(--mock); font-family: var(--cond); letter-spacing: 0.05em; text-transform: uppercase; font-weight: 600; }
 .glass { background: var(--surface); border: 1px solid var(--edge); border-radius: 8px; box-shadow: var(--shadow); }
-.head { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; padding: 8px 14px; }
+.head { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; padding: 6px 12px; }
+.topbar { position: sticky; top: 0; z-index: 15; display: grid; gap: 4px; padding: 4px 10px; border-top: 0; border-radius: 0 0 8px 8px; }
+.barline { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
+.topbar .logo svg { height: 22px; }
+.topbar .logo .app { padding-left: 8px; }
+.topbar .nums { display: flex; flex-wrap: wrap; gap: 2px 12px; align-items: baseline; font-size: 13.5px; }
+.topbar .bn { white-space: nowrap; }
+.topbar .bn .k { font-family: var(--cond); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-right: 4px; }
+.topbar .bn b { font-family: var(--mono); font-weight: 600; font-variant-numeric: tabular-nums; }
+.topbar .bn .u { color: var(--muted); font-weight: 400; }
+.topbar .bn.warn b { color: var(--warn); } .topbar .bn.crit b { color: var(--crit); }
+.topbar .spacer { flex: 1; }
+.topbar .ctlrow .btn { padding: 3px 10px; font-size: 13px; }
+.topbar .ctlrow .nm { font-size: 12px; }
+.topbar .sent { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session { display: grid; gap: 8px; }
+body:has(#t-task:checked) .session, body:has(#t-training:checked) .session { display: none; }
+body.session-open .session { display: grid !important; }
+body.session-shut .session { display: none !important; }
 .logo { display: flex; align-items: center; gap: 10px; color: var(--ink); }
 .logo svg { height: 34px; width: auto; display: block; }
 .logo .app { font-family: var(--cond); font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; font-size: 12px; color: var(--muted); border-left: 1px solid var(--rule); padding-left: 10px; }
@@ -2718,16 +4576,17 @@ h3 { margin: 0; font-family: var(--cond); font-weight: 600; font-size: 11.5px; l
 .banner.crit { background: var(--crit-soft); border-left: 4px solid var(--crit); }
 .banner.info { background: var(--accent-soft); border-left: 4px solid var(--accent); }
 .banner .tag { font-family: var(--cond); font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; font-size: 12px; }
-.shell { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) minmax(260px, 330px); align-items: stretch; }
+.shell { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) 250px; align-items: stretch; }
+@media (max-width: 1100px) { .shell { grid-template-columns: minmax(0, 1fr) 200px; } }
 @media (max-width: 900px) { .shell { grid-template-columns: minmax(0, 1fr); } }
 .main { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .main > input { position: absolute; opacity: 0; pointer-events: none; }
 .tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid var(--rule); }
 .tab { border: 1px solid transparent; border-bottom: 0; padding: 7px 12px 6px; cursor: pointer; font-family: var(--cond); font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; font-size: 12.5px; color: var(--muted); border-radius: 6px 6px 0 0; margin-bottom: -1px; }
-#t-runtime:checked ~ .tabs [for="t-runtime"], #t-task:checked ~ .tabs [for="t-task"], #t-setup:checked ~ .tabs [for="t-setup"], #t-warn:checked ~ .tabs [for="t-warn"], #t-end:checked ~ .tabs [for="t-end"] { background: var(--surface); border-color: var(--edge); color: var(--ink); }
-#t-runtime:focus-visible ~ .tabs [for="t-runtime"], #t-task:focus-visible ~ .tabs [for="t-task"], #t-setup:focus-visible ~ .tabs [for="t-setup"], #t-warn:focus-visible ~ .tabs [for="t-warn"], #t-end:focus-visible ~ .tabs [for="t-end"] { outline: 2px solid var(--accent); outline-offset: 2px; }
+#t-runtime:checked ~ .tabs [for="t-runtime"], #t-task:checked ~ .tabs [for="t-task"], #t-training:checked ~ .tabs [for="t-training"], #t-setup:checked ~ .tabs [for="t-setup"], #t-warn:checked ~ .tabs [for="t-warn"], #t-end:checked ~ .tabs [for="t-end"] { background: var(--surface); border-color: var(--edge); color: var(--ink); }
+#t-runtime:focus-visible ~ .tabs [for="t-runtime"], #t-task:focus-visible ~ .tabs [for="t-task"], #t-training:focus-visible ~ .tabs [for="t-training"], #t-setup:focus-visible ~ .tabs [for="t-setup"], #t-warn:focus-visible ~ .tabs [for="t-warn"], #t-end:focus-visible ~ .tabs [for="t-end"] { outline: 2px solid var(--accent); outline-offset: 2px; }
 .tabpanel { display: none; flex-direction: column; gap: 10px; }
-#t-runtime:checked ~ .panels #tp-runtime, #t-task:checked ~ .panels #tp-task, #t-setup:checked ~ .panels #tp-setup, #t-warn:checked ~ .panels #tp-warn, #t-end:checked ~ .panels #tp-end { display: flex; }
+#t-runtime:checked ~ .panels #tp-runtime, #t-task:checked ~ .panels #tp-task, #t-training:checked ~ .panels #tp-training, #t-setup:checked ~ .panels #tp-setup, #t-warn:checked ~ .panels #tp-warn, #t-end:checked ~ .panels #tp-end { display: flex; }
 .cols { display: grid; gap: 10px; align-items: stretch; }
 .cols.c3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 @media (max-width: 1100px) { .cols.c3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
@@ -2750,15 +4609,108 @@ h3 { margin: 0; font-family: var(--cond); font-weight: 600; font-size: 11.5px; l
 .kv > span { min-width: 0; overflow-wrap: anywhere; }
 .kv > .keep { overflow-wrap: normal; white-space: nowrap; flex-shrink: 0; }
 .kv > .btn { flex-shrink: 0; }
+.kv.wrap { flex-wrap: wrap; align-items: baseline; row-gap: 4px; }
+.kv.wrap > span { flex: 1 1 12em; }
+.kv.wrap > .btn { flex-shrink: 1; max-width: 100%; }
 .owe { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; background: var(--accent-soft); border-radius: 6px; padding: 8px 10px; }
-.params { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
-.param { border: 1px solid var(--rule); border-radius: 5px; padding: 6px 8px; display: grid; gap: 2px; background: var(--surface-2); }
-.param .pn { font-family: var(--mono); font-size: 12.5px; font-weight: 500; display: flex; justify-content: space-between; gap: 6px; overflow-wrap: anywhere; }
-.param .ceil { font-family: var(--cond); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--warn); font-weight: 700; }
-.param .pv { font-family: var(--mono); font-size: 13px; }
-.param .range, .param .stg { font-size: 11.5px; color: var(--muted); }
-.param.staged { border-color: var(--accent); }
-.param.staged .stg { color: var(--accent); }
+.params { display: grid; gap: 8px; }
+/* Columns as wide as the tab's own longest line, its plain name and its value whole (`_line_width`;
+   the ledger's ruling for the summary and editor build's Task 3), set on the summary by Python;
+   330 px, a line of the longest plain name a task may declare (`task.LABEL_LIMIT`), where none is
+   (Task 2's ruling). Runtime's Pinned lines take their tabs' widest. */
+.summary { columns: auto 330px; column-gap: 20px; min-width: 0; }
+.ssec { break-inside: avoid; -webkit-column-break-inside: avoid; page-break-inside: avoid; margin: 0 0 6px; min-width: 0; }
+.ssec .ssec { margin: 3px 0 0; }
+/* A section holding subsections breaks between them across columns, so the Training tab, one
+   section of several, has columns too (the summary and editor build's Task 3); its header never
+   stands alone at a column's foot. */
+.ssec:has(> .ssec), .ssec:has(> .skeep) { break-inside: auto; -webkit-column-break-inside: auto; page-break-inside: auto; }
+.skeep { break-inside: avoid; -webkit-column-break-inside: avoid; page-break-inside: avoid; }
+.ssec > h4, .skeep > h4 { break-after: avoid; -webkit-column-break-after: avoid; page-break-after: avoid; }
+.ssec > h4, .skeep > h4 { margin: 0 0 1px; height: 17px; line-height: 16px; font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--rule); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ssec .ssec > h4 { text-transform: none; letter-spacing: 0; font-weight: 500; border-bottom: 0; }
+.ssec > h4 .ns, .skeep > h4 .ns, .tab .tns { color: var(--accent); font-weight: 600; }
+.line { display: flex; align-items: center; gap: 5px; box-sizing: border-box; width: 100%; height: 20px; margin: 0; padding: 0 4px; border: 0; border-radius: 3px; background: transparent; color: var(--ink); font: inherit; font-size: 12.5px; line-height: 20px; text-align: left; cursor: pointer; min-width: 0; }
+.line:hover { background: var(--surface-2); }
+.line:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.line[aria-pressed="true"] { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.line > .mk { flex: none; min-width: 2em; font-size: 11px; color: var(--accent); white-space: nowrap; text-align: center; }
+.line > .ln { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.line > .lv { flex: 0 1 auto; max-width: 62%; min-width: 0; font-family: var(--mono); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+.line.waiting > .lv { color: var(--accent); }
+.line.refused > .mk, .line.refused > .lv { color: var(--crit); }
+.line.warned > .mk { color: var(--warn); }
+.line.changed > .ln { font-weight: 600; }
+.line.ceiling > .ln { color: var(--warn); font-weight: 600; }
+.line.newcolor > .ln { color: var(--accent); }
+.summary .line.nofind { display: flex !important; opacity: 0.35; }
+.summary .line.found { box-shadow: inset 3px 0 0 var(--accent); background: var(--surface-2); }
+.line.draft > .lv, .line.sending > .lv { color: var(--accent); font-style: italic; }
+.line.unconfirmed > .mk { color: var(--warn); }
+.top > .nomatch { font-size: 12.5px; font-weight: 600; color: var(--crit); }
+.params > .legend { font-size: 11px; color: var(--muted); }
+.params > .editing { border-top: 2px solid var(--ink); padding-top: 8px; min-width: 0; }
+.params > .editing > .placeholder, .params > .editing > .findhid { color: var(--muted); font-size: 13px; padding: 4px 0; }
+.cards { display: grid; gap: 5px; grid-template-columns: repeat(auto-fill, minmax(186px, 1fr)); align-items: start; }
+.nofind { display: none !important; }
+.panel .top.tools { justify-content: flex-start; }
+.top > .field.find { width: 220px; max-width: 100%; font-size: 13px; padding: 2px 6px; }
+.box { position: relative; border: 1px solid var(--rule); border-radius: 5px; padding: 3px 6px 2px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; align-content: start; background: var(--surface-2); min-width: 0; }
+.box.wide { grid-column: span 2; }
+@media (max-width: 520px) { .box.wide { grid-column: auto; } }
+.box:has(> details.more[open]) { grid-column: 1 / -1; background: var(--surface); }
+.box > .head { display: grid; grid-template-columns: minmax(0, max-content) auto minmax(4.5em, 1fr); align-items: center; gap: 0 6px; padding: 0 18px 0 0; min-width: 0; line-height: 16px; }
+.box > .head > *, .box > .head .code, .box > .head .now * { line-height: 16px; }
+.box > .head > .now, .box > .head > .ceil, .box > .head .code { height: 16px; }
+.box .names { display: contents; }
+.box .lbl { grid-column: 1 / -1; font-size: 13px; font-weight: 600; line-height: 1.25; overflow-wrap: anywhere; min-width: 0; }
+.box .names .code { grid-column: 1; }
+.box > .head > .ceil { grid-column: 2; }
+.box > .head > .now { grid-column: 3; text-align: right; }
+.box[data-echo]:not(.draft):not(.staged):not(.sending) > .head > .now { display: none; }
+.box[data-echo]:not(.draft):not(.staged):not(.sending) > .head { grid-template-columns: minmax(0, 1fr) auto 0; }
+/* A waiting box's head gives what waits the room it needs (the whole-build review's I4): the code
+   name under a plain name goes (it is in the title and in *more*), a code name alone gives way to
+   "0.30 → 0.50 s", cut first; the head keeps its rows, so the box keeps its height. */
+.box.staged > .head { grid-template-columns: minmax(2.5em, 1fr) auto max-content; }
+.box.staged > .head .lbl ~ .code { display: none; }
+/* Who sent it, by name on the line: "(box, unverified)" and "(wl.works)" ride in its title. */
+.box.staged > .status .say .nm { display: none; }
+.box > .more:not([open]) { margin-top: -2px; }
+.box .code { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.box .code.only { font-size: 12.5px; color: var(--ink); font-weight: 500; }
+.box .ceil { font-family: var(--cond); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--warn); font-weight: 700; }
+.box .now { max-width: 100%; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.box .pv { font-family: var(--mono); font-size: 13px; }
+.box .now .to { font-family: var(--mono); font-size: 13px; color: var(--accent); }
+.box > .editor { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; min-width: 0; }
+.box > .editor > * { min-width: 0; max-width: 100%; }
+.box > .status { position: relative; display: flex; align-items: center; min-height: 22px; min-width: 0; font-size: 12px; color: var(--muted); }
+.box .btn.small { padding: 1px 8px; }
+.box .status .say { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.box .status .acts { position: absolute; right: 0; top: 0; bottom: 0; display: flex; gap: 4px; align-items: center; padding-left: 6px; background: inherit; visibility: hidden; }
+.box.draft .status .acts, .box.sending .status .acts, .box.staged .status .acts:has([data-withdraw]) { position: static; flex: none; visibility: visible; }
+.box:not(.draft):not(.sending) .status .acts [data-apply], .box:not(.draft):not(.sending) .status .acts [data-discard] { display: none; }
+.box.draft { border-color: var(--accent); border-style: dashed; }
+.box.draft .status .say, .box.sending .status .say { color: var(--accent); }
+.box.cannot .status .say { color: var(--crit); }
+.box.staged { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.box.staged .status .say { color: var(--accent); }
+.box.refused { border-color: var(--crit); box-shadow: inset 3px 0 0 var(--crit); }
+.box.refused .status .say { color: var(--crit); }
+.box.warned .status .say { color: var(--warn); }
+.box.ceiling:not(.staged):not(.refused) { box-shadow: inset 3px 0 0 var(--warn); }
+.box > .more > summary { position: absolute; top: 1px; right: 2px; list-style: none; cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px; border-radius: 3px; color: var(--muted); }
+.box > .more > summary::-webkit-details-marker { display: none; }
+.box > .more > summary::marker { content: ""; }
+.box > .more > summary:hover, .box > .more[open] > summary { background: var(--surface); color: var(--ink); }
+.box .detail .pin[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+.box .detail { display: grid; gap: 3px; margin-top: 4px; padding-top: 5px; border-top: 1px solid var(--rule); font-size: 12.5px; min-width: 0; }
+.box .detail > * { min-width: 0; overflow-wrap: anywhere; }
+.box .detail .what { color: var(--ink); }
+.box .range, .box .stg { font-size: 12px; color: var(--muted); }
+.box .stg { color: var(--accent); }
+.box .wrn { font-size: 12px; color: var(--warn); }
 .feed { display: grid; align-content: start; max-height: 300px; overflow-y: auto; overscroll-behavior: contain; padding-right: 4px; }
 .ev { display: grid; grid-template-columns: 5.5em minmax(0, 1fr); gap: 6px; padding: 4px 0; border-top: 1px solid var(--rule); font-size: 12.5px; }
 .ev:first-child { border-top: 0; }
@@ -2792,33 +4744,95 @@ h3 { margin: 0; font-family: var(--cond); font-weight: 600; font-size: 11.5px; l
 .controlbar .spacer { flex: 1; }
 .btn.small { padding: 2px 8px; font-size: 12.5px; }
 .btn.danger { border-color: var(--crit); color: var(--crit); }
-.btn:disabled, .field:disabled, .arrows button:disabled, select:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled, .field:disabled, .stp:disabled, select:disabled { opacity: 0.45; cursor: not-allowed; }
 .who { font-size: 12.5px; color: var(--muted); }
 .who b { color: var(--ink); font-weight: 600; }
 body:not([data-signed-in="1"]) .si{display:none} body[data-signed-in="1"] .so{display:none}
 .sent { font-size: 12.5px; }
+.drafts { position: fixed; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 20; display: flex; gap: 8px; align-items: center; max-width: min(960px, calc(100vw - 32px)); padding: 6px 10px; font-size: 13px; }
+.drafts[hidden] { display: none; }
+.drafts .say { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.drafts .btn { flex: none; }
+body.drafted > .wrap { padding-bottom: 56px; }
 .sent.ok { color: var(--ok); } .sent.crit { color: var(--crit); }
 .inline { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 6px 12px; border-radius: 6px; font-size: 13px; background: var(--surface-2); }
 .inline.crit { background: var(--crit-soft); } .inline.info { background: var(--accent-soft); }
 .inline input, .inline select { font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--rule); border-radius: 3px; padding: 1px 4px; }
 #mark-note { width: min(34em, 60vw); }
 #sched-value { width: 7em; }
+.fu { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; min-width: 0; max-width: 100%; }
+.fu .unit, .box .rn .unit { margin-left: 0; font-size: 12px; overflow-wrap: anywhere; min-width: 0; }
 .spin { display: inline-flex; align-items: stretch; }
-.field { width: 6em; border: 1px solid var(--rule); border-radius: 3px 0 0 3px; padding: 1px 4px; background: var(--surface); color: inherit; font-size: 12.5px; }
-.field[data-kind="word"] { border-radius: 3px; }
+.field { width: 6em; border: 1px solid var(--rule); border-radius: 3px; padding: 1px 4px; background: var(--surface); color: inherit; font-size: 12.5px; }
 .field.pending { border-color: var(--accent); }
-.arrows { display: flex; flex-direction: column; border: 1px solid var(--rule); border-left: 0; border-radius: 0 3px 3px 0; overflow: hidden; }
-.arrows button { flex: 1; width: 18px; border: 0; padding: 0; background: var(--surface-2); color: var(--muted); cursor: pointer; font-size: 8px; line-height: 1; }
-.arrows button + button { border-top: 1px solid var(--rule); }
-.param .rfs { font-size: 11.5px; color: var(--crit); }
-.param { align-content: start; }
-.param .src, .param .rn { font-size: 11.5px; color: var(--muted); }
-.param .src { overflow-wrap: anywhere; }
-.param .rng { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-.param .rn { display: inline-flex; gap: 3px; align-items: center; }
-.param .rn .field { width: 4.5em; border-radius: 3px; }
-.param > .btn { justify-self: start; }
-.field.over { width: 100%; border-radius: 3px; }
+.spin .stp { width: 22px; min-height: 22px; border: 1px solid var(--rule); background: var(--surface); color: var(--muted); cursor: pointer; padding: 0; font-family: var(--sans); font-size: 14px; line-height: 1; }
+.spin .stp:first-child { border-radius: 3px 0 0 3px; border-right: 0; }
+.spin .stp:last-child { border-radius: 0 3px 3px 0; border-left: 0; }
+.spin .stp + .field { border-radius: 0; width: 5em; text-align: right; font-size: 14px; font-weight: 600; }
+.box .rfs { font-size: 12px; color: var(--crit); }
+.box .src, .box .rn { font-size: 12px; color: var(--muted); }
+.box .src { overflow-wrap: anywhere; }
+.box .rng { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-width: 0; }
+.box .rn { display: inline-flex; flex-wrap: wrap; gap: 3px; align-items: center; min-width: 0; max-width: 100%; }
+.box .rn .field { width: 4.5em; }
+.box .sw { display: inline-flex; gap: 0; }
+.box .sw .seg { border-radius: 0; }
+.box .sw .seg:first-child { border-radius: 4px 0 0 4px; }
+.box .sw .seg:last-child { border-radius: 0 4px 4px 0; }
+.box .sw .seg.on { background: var(--ink); color: var(--bg); }
+.box .chs { flex-wrap: wrap; gap: 4px; }
+.box .chs .chw .seg { border-radius: 4px; }
+.box .side { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; flex: 1 1 100%; min-width: 0; }
+.box .side[hidden], .box .shp[hidden] { display: none; }
+.box .prof { display: block; width: 100%; max-width: 280px; height: auto; margin-top: 6px; }
+.box .prof .bar { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 0.6; }
+.box .prof .base { stroke: var(--rule); stroke-width: 1; }
+.box .prof .haz { fill: none; stroke: var(--warn); stroke-width: 1.6; stroke-linejoin: round; }
+.box .prof .flat { stroke: var(--muted); stroke-width: 1; }
+.box .prof .ax { fill: var(--muted); font: 8px sans-serif; }
+.box .shp .rn .field[data-form="values"], .box .shp .rn .field[data-form="weights"] { width: 9em; }
+.box .detail .btn { justify-self: start; }
+.box .clr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; min-width: 0; flex: 1 1 100%; }
+.box .clr .hues { display: flex; flex-wrap: wrap; gap: 4px; }
+.box .clr .hues[hidden] { display: none; }
+.box .clr .hue { display: inline-flex; gap: 4px; align-items: center; }
+.box .clr .hue.on { background: var(--ink); color: var(--bg); }
+.box .clr .chip { display: inline-block; width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--rule); }
+.box .clr .chip.none { background: repeating-linear-gradient(45deg, var(--surface-2), var(--surface-2) 3px, var(--rule) 3px, var(--rule) 4px); }
+.box .clr .lvls { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; min-width: 0; }
+.box .clr .lvl .field { width: 4.5em; }
+.box .clr .src { overflow-wrap: anywhere; }
+.sec > .newc { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; min-width: 0; margin-top: 6px; border: 1px solid var(--rule); border-radius: 5px; padding: 5px 7px; background: var(--surface-2); font-size: 12.5px; }
+.sec > .newc > summary { cursor: pointer; font-size: 12.5px; font-weight: 600; width: max-content; max-width: 100%; }
+.newc .rn { display: inline-flex; flex-wrap: wrap; gap: 3px; align-items: center; min-width: 0; max-width: 100%; font-size: 12px; color: var(--muted); }
+.newc .rn .unit { font-size: 12px; overflow-wrap: anywhere; min-width: 0; }
+.newc .src { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.newc select.field { width: auto; max-width: 100%; }
+.newc .nf { display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.newc .nf[hidden], .newc [data-newset-only][hidden], .newc [data-newc-set][hidden] { display: none; }
+.newc .nf .field { width: 4.5em; }
+.newc .newc-do { display: flex; flex-wrap: wrap; gap: 6px; }
+.newc .newc-out { overflow-wrap: anywhere; }
+.newc .chip, .pairs .chip { display: inline-block; width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--rule); vertical-align: -2px; margin-right: 4px; }
+.pairs .chip.none { background: repeating-linear-gradient(45deg, var(--surface-2), var(--surface-2) 3px, var(--rule) 3px, var(--rule) 4px); }
+.box .pairs { border-collapse: collapse; font-size: 12px; max-width: 100%; table-layout: fixed; }
+.box .pairs th { font-weight: 500; text-align: left; padding: 2px 6px 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.box .pairs thead th { text-align: center; padding: 2px 3px; }
+.box .pairs .corner { display: grid; color: var(--muted); font-size: 11px; line-height: 1.2; text-align: left; }
+.box .pairs td { text-align: center; padding: 2px 3px; border: 1px solid var(--rule); }
+.box .pairs td.diag { background: repeating-linear-gradient(45deg, transparent, transparent 3px, var(--rule) 3px, var(--rule) 4px); }
+.box .pairs .tick { width: 16px; height: 16px; margin: 0; cursor: pointer; }
+.box.group .sentence { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 5px; min-width: 0; font-size: 13px; }
+.box.group .sentence .gs { overflow-wrap: anywhere; min-width: 0; }
+.box.group .gr { margin-top: 4px; overflow-wrap: anywhere; min-width: 0; font-size: 13px; }
+.box.group .gm { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; flex: 1 1 100%; min-width: 0; }
+.box.group .gl { font-size: 12.5px; min-width: 0; overflow-wrap: anywhere; }
+.box .gmore { display: grid; gap: 2px; min-width: 0; }
+.box .gmore + .gmore { margin-top: 4px; padding-top: 4px; border-top: 1px dotted var(--rule); }
+.box .gmore .gn { font-weight: 600; }
+.fu:has(> .over) { display: flex; flex-wrap: nowrap; width: 100%; }
+.field.over { flex: 1 1 auto; width: auto; min-width: 0; max-width: 100%; }
+.box select.field, .box .rn select.field { width: auto; max-width: 100%; }
 #moments .rv { font-size: 11.5px; color: var(--muted); margin: -2px 0 6px; overflow-wrap: anywhere; }
 .ev.ctl .kind { color: var(--accent); }
 .controlbar .sep { width: 1px; align-self: stretch; background: var(--rule); margin: 0 4px; }
@@ -2838,6 +4852,8 @@ button.pill { border: 0; cursor: pointer; }
 .st.pass { background: var(--ok); } .st.warn { background: var(--warn); } .st.fail { background: var(--crit); } .st.untested { box-shadow: inset 0 0 0 1.5px var(--muted); }
 .chk { display: flex; gap: 8px; align-items: center; font-size: 13px; }
 #rt-train:empty { display: none; }
+#rt-shaping:empty { display: none; }
+[data-cmd="shaping"][aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--ink); }
 .prompt { border-radius: 6px; padding: 8px 12px; background: var(--ok-soft); border-left: 4px solid var(--ok); display: grid; gap: 6px; font-size: 13.5px; }
 .prompt.back { background: var(--warn-soft); border-left-color: var(--warn); }
 .prompt .acts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -2860,7 +4876,9 @@ body.stale .strip, body.stale .panels { filter: grayscale(1); opacity: 0.55; }
 .demo-keylist kbd { font-family: var(--mono); font-size: 11.5px; border: 1px solid var(--rule); border-radius: 3px; padding: 0 4px; background: var(--surface-2); white-space: nowrap; }
 .demo-limits { margin: 0; padding-left: 16px; font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
 .demo-pane.full { position: fixed; inset: 0; z-index: 25; border-radius: 0; padding: 0; gap: 0; background: #000000; color: #e8eaed; grid-template-rows: minmax(0, 1fr) auto; }
-.demo-pane.full > .top, .demo-pane.full > .demo-keys, .demo-pane.full > #demo-who { display: none; }
+.demo-pane.full > .top, .demo-pane.full > .demo-fold, .demo-pane.full > #demo-who { display: none; }
+.demo-fold > summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+.demo-fold[open] > summary { margin-bottom: 4px; }
 .demo-pane.full .demo-screen { border-radius: 0; min-height: 0; background: #000000; }
 .demo-pane.full .demo-drawing { position: absolute; inset: 0; }
 .demo-pane.full .demo-drawing svg { width: 100%; height: 100%; }
@@ -2920,10 +4938,12 @@ _LOGO = (
 #: wl.works member is signed in there (`data-signin`, the sign-in's block below);
 #: everywhere else every control is disabled in the HTML and `post` sends nothing. The
 #: name is asked once, kept in `localStorage` -- inside `try`, since a private window
-#: may refuse it -- and a prompt refused or cleared sends nothing. An arrow steps its
-#: input and the change is sent `debounceMs` after the last click; while an input has
-#: focus or a change is pending, a new parameters fragment is held and swapped in
-#: afterwards, so a frame never replaces an input under a person's hands. P and M do
+#: may refuse it -- and a prompt refused or cleared sends nothing. **A setting's box sends
+#: nothing until its Apply** (the console interface rework's Task 6): an edit is a draft, Enter
+#: in a field is Apply, Esc is Discard, Apply all sends every box's draft as one act, a waiting
+#: act can be withdrawn; each box is patched alone, and one with a draft, a focused field or its
+#: act out keeps its editor's nodes, so a frame never replaces an input under a person's hands;
+#: a frame for a root a pointer is down in waits for the press to end. P and M do
 #: nothing in a text box or when held. A mark sends its signal at once with
 #: `pressed_at` -- the browser's clock, and the only `Date.now()` outside the sign-in's
 #: block, which reads it for its tokens' expiry -- then opens the note box: Enter
@@ -2943,7 +4963,6 @@ _SCRIPT = """
   var body = document.body;
   var staleMs = Number(body.getAttribute("data-stale-after")) * 1000;
   var canWrite = body.getAttribute("data-can-write") === "1";
-  var debounceMs = Number(body.getAttribute("data-debounce-ms"));
   var NAME_KEY = "wlx-console-name";
   // P4d-2b b2b (spec §4): signing a member in on the rig's https page. The tokens live
   // in this tab's sessionStorage only; Python renders every word a person reads.
@@ -3409,12 +5428,86 @@ _SCRIPT = """
   var live = false;
   var lost = false;
   var closed = false;
-  var timers = {};
-  var heldParams = null;
   var heldMoments = null;
+  // **The two tabs of setting boxes**, which every patch and every box lookup reads alike.
+  var CARDS = ["#params", "#training-params"];
+  function inCards(selector) {
+    return CARDS.map(function (root) { return root + " " + selector; }).join(", ");
+  }
   var pressedAt = null;
   var PRESS_MS = 10000;
-  var rangeOut = {};
+  // **A frame held while a pointer is down in its root** (fix round 2 of the C3 plan's Task 18: a
+  // frame landing between the mouse going down and up replaced the button under it, in WebKit
+  // above all), by root id, patched in once the press ends (`release`). The newest only.
+  var heldCards = {};
+  // **Drafts, Apply, Apply all and withdraw** (the console interface rework's Task 6; the PI,
+  // 2026-11-19: "i prefer an apply button in each box for making a change"; the controls
+  // review's §2 and §3). Nothing a box holds is sent until its Apply, Enter in one of its fields,
+  // or Apply all. Each box is patched alone (`patchCards`): a box with a draft, a field or select
+  // focused in it, or its act out keeps its editor's nodes, and only its head and status line --
+  // and *more*, but for a draft's range numbers -- take the frame's news, so a press lands on a
+  // node no frame replaced. By setting name:
+  // - `served`, each box as the latest frame drew it, never shown: what a draft is judged against
+  //   and what Discard puts back;
+  // - `drafts`, each box's draft, `{changes, error}` (`draftOf`), kept across frames and tab
+  //   switches, dropped at the run's end (`data-run`) and on a reload;
+  // - `out`, each box whose act this page sent and the rig has not yet answered in a frame,
+  //   `{cid, state, snapshot, phase: "sending" | "waiting", answered}`: what was sent, which a draft
+  //   is judged against meanwhile;
+  // - `refusedAt`, the act of the box the rig refused and the draft it refused, so the box says
+  //   *refused* while that draft stands; `notes`, a line the page says on a box until its news
+  //   changes (a send not delivered, a withdrawal's answer); `refusals`, each box's refusal as
+  //   first seen and whether a later change of the setting has been accepted since (the design's
+  //   goal 4); `since`, the trial in force when each draft began, so a change made under it is said.
+  // And by command id: `acts`, the settings of each act this page sent; `mine`, every id it made;
+  // `withdrawing`, each act whose withdrawal is out.
+  var served = {};
+  var drafts = {};
+  var out = {};
+  var refusedAt = {};
+  var notes = {};
+  var refusals = {};
+  var since = {};
+  var kept = {};
+  var acts = {};
+  var mine = {};
+  var withdrawing = {};
+  var runKey = null;
+  // The page's own command ids: a random prefix per page and a count, printable, at most 64
+  // characters (`link.CID_LIMIT`).
+  var pageId = random(6);
+  var cidCount = 0;
+  var APPLY_ALL_LIMIT = Number(body.getAttribute("data-apply-all-limit")) || 50;
+  // The box's words (the console interface design's goal 4; the plan's "Words on the page").
+  var NOT_SENT = "not sent";
+  var SENDING = "sending…";
+  var CANNOT = "cannot send · ";
+  var ALONE = "sent alone · cannot be withdrawn";
+  var TOGETHER = "refused · with the changes applied together";
+  var WITHDRAWN = "withdrawn · it never applied";
+  // Short beside *withdraw*, its whole in the line's title (the whole-build review's I4; `web
+  // .WAITING`): `WHOLE_OF` gives a line's title where it is not the line itself.
+  var WAITING_YOU = "waiting · you";
+  var WHOLE_OF = {};
+  WHOLE_OF[WAITING_YOU] = "waiting for the next trial · you";
+  var WHOLE = "whole numbers only";
+  var WITHDRAWING = "withdrawing…";
+  var NO_WORD = "not confirmed by the rig · check the value in force";
+  // **How many frames an act answered *sent* waits for the rig's word** (the whole-build review's
+  // I2) -- housekeeping, not a measurement: the rig answers a command on the first frame after the
+  // drain that reads it, the frame this page's answer races or the next, and a refusal or a
+  // withdrawal stays on every frame after; a third frame without it is a word lost (a frame
+  // missed while the change came and went, a refusal no box is named for). Counted by frames, so
+  // a paused rig's, which come every housekeeping pass, count alike. `framesSeen` counts them.
+  var ANSWER_FRAMES = 3;
+  var framesSeen = 0;
+  // A color card's set a person chose to see the hues of (the design's §6), by setting, kept
+  // across the frames that replace the cards until a hue of it is picked.
+  var colorSets = {};
+  // A color card's New color panel (the console settings build's Task 8; the design's §6), by
+  // setting: open or not, its method, its set, what is typed and the last preview, kept across the
+  // frames that replace the cards.
+  var newColors = {};
   var markNo = null;
   var rewarding = false;
   var REWARD_LOST = "unknown: this page lost wlx serve's answer, so whether the reward was given is not known, and it was not sent again; check the session's fluid total before pressing again";
@@ -3470,58 +5563,1916 @@ _SCRIPT = """
       say("");
     }
   }
-  // A range's number typed and not yet sent (fix round 1 of the C3 plan's Task 18): its field
-  // differs from the number in force, **read as `sendRange` reads it** (fix round 2): a text that
-  // is no finite number, or a different number -- "1.250" over 1.25 is the same number, which
-  // *change the range* would refuse as unchanged, so it holds nothing. It keeps the cards held
-  // as a field with focus does, since WebKit (Safari) takes focus off the field as the mouse
-  // goes down on *change the range*, and a frame swapped in then would put the old number back
-  // and the clicked button out from under the click.
-  function rangeChanged(input) {
-    var raw = input.value.trim();
-    var value = Number(raw);
-    return raw === "" || !isFinite(value) || value !== Number(input.defaultValue);
+  function cardOf(name) {
+    return document.querySelector(inCards('.box[data-card="' + CSS.escape(name) + '"]'));
   }
-  function rangeEdited() {
-    var fields = document.querySelectorAll("#params input[data-number]");
-    return Array.prototype.some.call(fields, rangeChanged);
-  }
-  // A number typed and not sent is marked pending, and, while a frame is held because of it,
-  // its card says so under the editor: never a silent freeze of the cards (fix round 2).
-  function markRanges() {
-    Array.prototype.forEach.call(document.querySelectorAll("#params .param"), function (card) {
-      var fields = card.querySelectorAll("input[data-number]");
-      var edited = false;
-      Array.prototype.forEach.call(fields, function (input) {
-        var changed = rangeChanged(input);
-        input.classList.toggle("pending", changed);
-        edited = edited || changed;
-      });
-      var line = card.querySelector(".rhold");
-      if (line) { line.hidden = !(edited && heldParams !== null); }
+  function showSide(card, which) {
+    Array.prototype.forEach.call(card.querySelectorAll("[data-side]"), function (side) {
+      side.hidden = side.getAttribute("data-side") !== which;
+    });
+    Array.prototype.forEach.call(card.querySelectorAll("[data-switch]"), function (button) {
+      var on = button.getAttribute("data-switch") === which;
+      button.classList.toggle("on", on);
+      button.setAttribute("aria-pressed", on ? "true" : "false");
     });
   }
-  // A pointer down inside the cards or the moments pane holds them until it is up (fix round 2:
-  // a frame landing between the mouse going down and up replaced the button under it, so the
-  // press was lost -- in WebKit, which never focuses a clicked button, and now in Chromium). A
-  // release the page never sees ends the hold after ten seconds.
+  function showShape(card, shape) {
+    var select = card.querySelector("select[data-shape]");
+    if (select) { select.value = shape; }
+    Array.prototype.forEach.call(card.querySelectorAll("[data-fields]"), function (group) {
+      group.hidden = group.getAttribute("data-fields") !== shape;
+    });
+  }
+  // **The setting opened in each settings tab's editor** (the summary and editor design's goals 2
+  // and 5; the PI, 2026-11-19: "clicking opens the ability to change it below"): a click on a
+  // summary line (`.line[data-open]`) shows that setting's box -- or its section's New color…
+  // panel, `new-color:SECTION` -- in the editor below, every other hidden and the placeholder with
+  // them, its line `aria-pressed`; nothing above the editor moves. Kept per task and per tab, the
+  // last opened, in the browser's own storage under `wlx.opened.<task>` for the Task parameters
+  // tab and `wlx.training-opened.<task>` for the Training tab, every access inside `try`, and held
+  // for the page as well, so a store that throws keeps it while the page is shown; shown again on
+  // a reload and after every frame (`applyOpened`). One no longer among the tab's settings -- a
+  // new task or run without it, a group regrouped -- is dropped, and the placeholder said (the
+  // plan's Review Focus 2). Sections no longer fold: the summary is short enough (the design's
+  // call), so `wlx.sections.<task>` is no longer read or written.
+  var OPENED_KEY = "wlx.opened.";
+  var TRAINING_OPENED_KEY = "wlx.training-opened.";
+  var NEW_COLOR_OPEN = "new-color:";
+  var openedHeld = {};
+  function openedKey(root) {
+    var summary = root.querySelector(":scope > .summary");
+    if (!summary) { return null; }
+    return (root.id === "training-params" ? TRAINING_OPENED_KEY : OPENED_KEY) +
+      (summary.getAttribute("data-task") || "");
+  }
+  function readOpened(key) {
+    if (!Object.prototype.hasOwnProperty.call(openedHeld, key)) {
+      var name = null;
+      try {
+        var raw = window.localStorage.getItem(key);
+        name = typeof raw === "string" && raw !== "" ? raw : null;
+      } catch (e) { name = null; }
+      openedHeld[key] = name;
+    }
+    return openedHeld[key];
+  }
+  function writeOpened(key, name) {
+    openedHeld[key] = name;
+    try {
+      if (name === null) { window.localStorage.removeItem(key); }
+      else { window.localStorage.setItem(key, name); }
+    } catch (e) { /* kept for this page only */ }
+  }
+  // What `name` opens in `editor`: its box, or its section's New color… panel.
+  function openable(editor, name) {
+    if (name.indexOf(NEW_COLOR_OPEN) === 0) {
+      return editor.querySelector(':scope > [data-newc="' + CSS.escape(name.slice(NEW_COLOR_OPEN.length)) + '"]');
+    }
+    return editor.querySelector(':scope > .box[data-card="' + CSS.escape(name) + '"]');
+  }
+  // `id` the tab's root (`params` by default): the name opened in its editor, else null.
+  function openedName(id) {
+    var root = el(id || "params");
+    var key = root ? openedKey(root) : null;
+    return key === null ? null : readOpened(key);
+  }
+  function applyOpened(root) {
+    var key = openedKey(root);
+    var editor = root.querySelector(":scope > .editing");
+    if (key === null || !editor) { return; }
+    var name = readOpened(key);
+    var shown = name === null ? null : openable(editor, name);
+    var line = name === null ? null : root.querySelector(':scope > .summary .line[data-open="' + CSS.escape(name) + '"]');
+    if (name !== null && (!shown || !line)) {
+      writeOpened(key, null);
+      name = null;
+      shown = null;
+    }
+    // The words find's hiding says are said after, by `sayFindHides`.
+    Array.prototype.forEach.call(editor.children, function (child) {
+      var hide = child.classList.contains("placeholder") ? shown !== null : child !== shown;
+      if (child.hidden !== hide) { child.hidden = hide; }
+    });
+    Array.prototype.forEach.call(root.querySelectorAll(":scope > .summary .line[data-open]"), function (one) {
+      var on = one.getAttribute("data-open") === name ? "true" : "false";
+      if (one.getAttribute("aria-pressed") !== on) { one.setAttribute("aria-pressed", on); }
+    });
+    sayFindHides(root);
+  }
+  // **Where the find box hides the setting opened** (the ledger's ruling for the summary and
+  // editor build's Task 3), the editor says so -- "the opened setting is hidden by find · clear
+  // find to see it" -- in place of going blank; the box stays hidden, as find leaves it.
+  function sayFindHides(root) {
+    var editor = root.querySelector(":scope > .editing");
+    var note = editor ? editor.querySelector(":scope > .findhid") : null;
+    if (!note) { return; }
+    var shown = Array.prototype.filter.call(editor.children, function (child) {
+      return !child.hidden && child !== note && !child.classList.contains("placeholder");
+    })[0];
+    var hide = !(shown && shown.classList.contains("nofind"));
+    if (note.hidden !== hide) { note.hidden = hide; }
+  }
+  function openSetting(name) {
+    var root = null;
+    CARDS.forEach(function (id) {
+      var found = document.querySelector(id + ' > .summary .line[data-open="' + CSS.escape(name) + '"]');
+      if (found && !root) { root = found.closest(CARDS.join(", ")); }
+    });
+    if (!root) { return; }
+    var key = openedKey(root);
+    var editor = root.querySelector(":scope > .editing");
+    if (key === null || !editor || !openable(editor, name)) { return; }
+    writeOpened(key, name);
+    applyOpened(root);
+    // A section's New color… panel opens unfolded, and is kept so across frames (`newColors`).
+    var panel = name.indexOf(NEW_COLOR_OPEN) === 0 ? openable(editor, name) : null;
+    if (panel && !panel.open) {
+      panel.open = true;
+      newColorRead(panel);
+    }
+  }
+  // **The find box, on both settings tabs** (the console interface design's goal 5; the ledger's
+  // find ruling for the rework's Task 8): a box is found by its code name, its plain name, a
+  // group's settings' code names and plain names, or the name of a section it stands in -- a
+  // parent's name finds its subsections' boxes too; each summary line takes its box's mark, the
+  // lines found left as they are and the rest dimmed (the summary and editor design's goal 8), a
+  // New color… line found by its words or its section's name.
+  function findIn(root) {
+    var box = root.closest("#params") ? el("pfind") : root.closest("#training-params") ? el("tfind") : null;
+    return box ? box.value.trim().toLowerCase() : "";
+  }
+  function findText(card) {
+    var said = [card.getAttribute("data-card") || ""];
+    Array.prototype.forEach.call(card.querySelectorAll(
+        ":scope > .head .lbl, :scope > .head .code, :scope > details.more .gmore > .gn"), function (node) {
+      said.push(node.textContent);
+    });
+    return said.join(" ").toLowerCase();
+  }
+  function markFind(root) {
+    var find = findIn(root);
+    var found = 0;
+    Array.prototype.forEach.call(root.querySelectorAll(":scope > .summary .line[data-open]"), function (line) {
+      var name = line.getAttribute("data-open");
+      var section = line.closest(".ssec");
+      var where = section ? (section.getAttribute("data-section") || "").toLowerCase() : "";
+      var card = name.indexOf(NEW_COLOR_OPEN) === 0 ? null :
+        root.querySelector(':scope > .editing > .box[data-card="' + CSS.escape(name) + '"]');
+      var said = card ? findText(card) : line.textContent.toLowerCase();
+      var unfound = find !== "" && said.indexOf(find) === -1 && where.indexOf(find) === -1;
+      line.classList.toggle("nofind", unfound);
+      // Found: highlighted while a find stands (the summary and editor design's goal 8).
+      line.classList.toggle("found", find !== "" && !unfound);
+      if (find !== "" && !unfound) { found += 1; }
+      if (card) { card.classList.toggle("nofind", unfound); }
+    });
+    // Nothing found says so (the plan's Review Focus 4: "no setting matches").
+    var none = el(root.id === "training-params" ? "tfind-none" : "pfind-none");
+    if (none) { none.hidden = find === "" || found > 0; }
+    sayFindHides(root);
+    return find;
+  }
+  function applyFind() {
+    CARDS.forEach(function (id) { if (document.querySelector(id)) { markFind(document.querySelector(id)); } });
+  }
+  // **Enter in a find box opens the first line found** (the summary and editor design's goal 8),
+  // in the summary's order; with nothing found, nothing (the plan's Review Focus 4).
+  function openFound(id) {
+    var root = el(id === "tfind" ? "training-params" : "params");
+    if (!root || findIn(root) === "") { return; }
+    var first = root.querySelector(":scope > .summary .line.found[data-open]");
+    if (first) { openSetting(first.getAttribute("data-open")); }
+  }
+  ["pfind", "tfind"].forEach(function (id) {
+    if (!el(id)) { return; }
+    el(id).addEventListener("input", applyFind);
+    el(id).addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); applyFind(); openFound(id); }
+    });
+  });
+  applyFind();
+  // **A box's *more* a person opened** (the console interface design's goal 1: "everything else
+  // opens inside the box on a click"), by setting, kept open across the frames that replace the
+  // boxes until it is closed. The click is on its summary, before it toggles.
+  var mores = {};
+  function keepMore(e) {
+    var summary = e.target.closest(inCards(".box > details.more > summary"));
+    if (!summary) { return; }
+    var name = summary.closest(".box").getAttribute("data-card");
+    if (summary.parentNode.open) { delete mores[name]; } else { mores[name] = true; }
+  }
+  // **What a box shows that is the page's own**, put back after a frame replaces it: its *more*
+  // open, the color set a person chose to see the hues of, its New color panel as left.
+  function restoreBox(box) {
+    var name = box.getAttribute("data-card");
+    var more = box.querySelector(":scope > details.more");
+    if (more && mores[name]) { more.open = true; }
+    Array.prototype.forEach.call(box.querySelectorAll("select[data-colorset]"), function (select) {
+      var named = colorSets[select.getAttribute("data-colorset")];
+      if (named !== undefined) { showHues(select, named); }
+    });
+  }
+  function newColorKey(input) {
+    if (input.hasAttribute("data-newc-num")) {
+      return input.closest("[data-newc-fields]").getAttribute("data-newc-fields") + "/" +
+        input.getAttribute("data-newc-num");
+    }
+    return input.hasAttribute("data-newc-name") ? "name" : "set";
+  }
+  function newColorRead(panel) {
+    var kept = newColors[panel.getAttribute("data-newc")] || {};
+    var state = { open: panel.open, method: panel.querySelector("[data-newc-method]").value,
+                  into: panel.querySelector("[data-newc-into]").value, fields: {},
+                  out: kept.out || null };
+    Array.prototype.forEach.call(panel.querySelectorAll("input"), function (input) {
+      state.fields[newColorKey(input)] = input.value;
+    });
+    newColors[panel.getAttribute("data-newc")] = state;
+  }
+  function newColorShow(panel) {
+    var method = panel.querySelector("[data-newc-method]").value;
+    var into = panel.querySelector("[data-newc-into]").value;
+    var fresh = panel.querySelector("[data-newc-set]");
+    Array.prototype.forEach.call(panel.querySelectorAll("[data-newc-fields]"), function (group) {
+      group.hidden = group.getAttribute("data-newc-fields") !== method;
+    });
+    Array.prototype.forEach.call(panel.querySelectorAll("[data-newset-only]"), function (label) {
+      label.hidden = into !== "";
+    });
+    fresh.hidden = into !== "";
+    panel.querySelector("[data-newc-path]").textContent = into !== "" ? into : fresh.value.trim();
+  }
+  function newColorOut(panel, answer) {
+    var out = panel.querySelector(".newc-out");
+    out.textContent = "";
+    if (!answer) { return; }
+    if (typeof answer.srgb === "string" && /^#[0-9a-f]{6}$/.test(answer.srgb)) {
+      var chip = document.createElement("span");
+      chip.className = "chip";
+      chip.style.background = answer.srgb;
+      out.appendChild(chip);
+      out.appendChild(document.createTextNode(" "));
+    }
+    out.appendChild(document.createTextNode(String(answer.said || "")));
+  }
+  function restoreNewColors() {
+    Object.keys(newColors).forEach(function (setting) {
+      var panel = document.querySelector('#params [data-newc="' + CSS.escape(setting) + '"]');
+      if (!panel) { return; }
+      var state = newColors[setting];
+      panel.open = state.open;
+      panel.querySelector("[data-newc-method]").value = state.method;
+      choose(panel.querySelector("[data-newc-into]"), state.into);
+      Array.prototype.forEach.call(panel.querySelectorAll("input"), function (input) {
+        var typed = state.fields[newColorKey(input)];
+        if (typed !== undefined) { input.value = typed; }
+      });
+      newColorOut(panel, state.out);
+      newColorShow(panel);
+    });
+  }
+  // The New color panel's command as typed, or null with the page told what is missing: the set
+  // chosen, or a new one by its name; the method's fields, a new set's frame only for a new set, a
+  // blank contrast left to the set's mean radius.
+  function newColorCommand(panel) {
+    var method = panel.querySelector("[data-newc-method]").value;
+    var into = panel.querySelector("[data-newc-into]").value;
+    var fresh = into === "";
+    var colorset = fresh ? panel.querySelector("[data-newc-set]").value.trim() : into;
+    var numbers = {};
+    var bad = null;
+    var group = panel.querySelector('[data-newc-fields="' + CSS.escape(method) + '"]');
+    Array.prototype.forEach.call(group.querySelectorAll("input[data-newc-num]"), function (input) {
+      var field = input.getAttribute("data-newc-num");
+      var raw = input.value.trim();
+      if (input.closest("[data-newset-only]") && !fresh) { return; }
+      if (field === "contrast" && raw === "") { return; }
+      var value = Number(raw);
+      if (raw === "" || !isFinite(value)) { bad = bad || field; }
+      numbers[field] = value;
+    });
+    if (bad !== null) { tell("not sent: the new color's " + bad + " needs a number", "crit"); return null; }
+    if (!colorset) { tell("not sent: a new set needs its name", "crit"); return null; }
+    return { colorset: colorset, new_set: fresh, method: method, numbers: numbers,
+             name: panel.querySelector("[data-newc-name]").value.trim() };
+  }
+  function previewColor(button) {
+    var panel = button.closest("[data-newc]");
+    var asked = newColorCommand(panel);
+    if (!asked) { return; }
+    var query = new URLSearchParams();
+    query.set("set", asked.colorset);
+    query.set("method", asked.method);
+    Object.keys(asked.numbers).forEach(function (field) {
+      query.set(field, String(asked.numbers[field]));
+    });
+    fetch("/color-preview?" + query.toString(), { cache: "no-store" }).then(function (response) {
+      return response.json();
+    }).then(function (answer) {
+      var shown = document.querySelector('#params [data-newc="' + CSS.escape(panel.getAttribute("data-newc")) + '"]') || panel;
+      newColorRead(shown);
+      newColors[shown.getAttribute("data-newc")].out = { said: answer.said, srgb: answer.srgb };
+      newColorOut(shown, newColors[shown.getAttribute("data-newc")].out);
+    }).catch(function () {
+      newColorOut(panel, { said: "not previewed: this page could not reach wlx serve", srgb: null });
+    });
+  }
+  function showHues(select, named) {
+    select.value = named;
+    var card = select.closest(".clr");
+    Array.prototype.forEach.call(card.querySelectorAll("[data-hues]"), function (group) {
+      group.hidden = group.getAttribute("data-hues") !== named;
+    });
+  }
+  // A pointer down inside the boxes or the moments pane holds their frames until it is up (fix
+  // round 2: a frame landing between the mouse going down and up replaced the button under it,
+  // so the press was lost -- in WebKit, which never focuses a clicked button, and in Chromium),
+  // so nothing moves under the pointer, a neighbor growing above it included. A release the page
+  // never sees ends the hold after ten seconds.
   function pressing() {
     return pressedAt !== null && performance.now() - pressedAt < PRESS_MS;
   }
-  // Only a field being typed in holds the cards, not a button clicked: Chromium focuses the
-  // button a person pressed (*hand back*, *change the range*), and the cards then never showed
-  // what the press did.
-  function busy() {
+  function boxes() { return document.querySelectorAll(inCards(".box")); }
+  function nameOf(box) { return box.getAttribute("data-card"); }
+  // **A box's controls as they stand**, keyed by what each sends: the side open (`side`), each
+  // value field shown (`p:` and the setting it sets), the shape chosen and its fields (`shape`,
+  // `f:`), the hue pressed (`hue`), each setting's choice pressed among its segments (`c:` and the
+  // setting), and a draw's live numbers in its *more* (`n:`). A number is
+  // compared as a number -- `0.50` is `0.5`, as `1.250` is `1.25` -- a list as its numbers, and
+  // what is no number as typed.
+  function numberOf(raw) {
+    var value = Number(raw);
+    return raw === "" ? "" : isFinite(value) ? "#" + value : raw;
+  }
+  function listOf(raw) {
+    return raw.split(/[\\s,]+/).filter(Boolean).map(numberOf).join(",");
+  }
+  function shownIn(box, node) {
+    for (var at = node; at && at !== box; at = at.parentElement) {
+      if (at.hidden) { return false; }
+    }
+    return true;
+  }
+  function paneOf(box, side) {
+    return box.querySelector(':scope > .editor [data-side="' + CSS.escape(side) + '"]');
+  }
+  function shapeOf(pane) {
+    var select = pane ? pane.querySelector("select[data-shape]") : null;
+    return select ? select.value : "scaled";
+  }
+  function formFields(box, side) {
+    var pane = paneOf(box, side);
+    var group = pane ? pane.querySelector('[data-fields="' + CSS.escape(shapeOf(pane)) + '"]') : null;
+    return group ? group.querySelectorAll("input[data-form]") : [];
+  }
+  // **A pool's grid's ticks as the pool's number** (the console interface rework's Task 7): each
+  // ticked pair's bit (`data-bit`, the rig's `PoolMember.bit`) summed, the value a `set` of the
+  // pool sends and the record keeps.
+  function poolSum(grid) {
+    var sum = 0;
+    Array.prototype.forEach.call(grid.querySelectorAll("input.tick[data-bit]"), function (tick) {
+      if (tick.checked) { sum += Number(tick.getAttribute("data-bit")); }
+    });
+    return sum;
+  }
+  // **What a percent field holds, as the fraction it sends** (`data-percent`; the console
+  // interface design's call: "the setting, the command and the record keep the fraction"): the
+  // typed decimal's point moved two places (`80` is read as `80e-2`, so 0.8, never
+  // 0.8000000000000002), else divided by 100.
+  function fromPercent(raw) {
+    return /^[-+]?(\\d+\\.?\\d*|\\.\\d+)$/.test(raw) ? Number(raw + "e-2") : Number(raw) / 100;
+  }
+  // **One choice pressed among a setting's segments** (`web._choice_segments`), `words` its words,
+  // or none pressed for `null`; nothing sent.
+  function pressChoice(group, words) {
+    Array.prototype.forEach.call(group.querySelectorAll(".ch[data-choice]"), function (segment) {
+      var on = words !== null && segment.getAttribute("data-choice") === words;
+      segment.classList.toggle("on", on);
+      segment.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+  }
+  function stateOf(box) {
+    var state = {};
+    var side = box.querySelector(":scope > .editor [data-switch].on");
+    if (side) { state.side = side.getAttribute("data-switch"); }
+    Array.prototype.forEach.call(box.querySelectorAll(":scope > .editor input[data-param]"), function (input) {
+      if (!shownIn(box, input)) { return; }
+      var raw = input.value.trim();
+      state["p:" + input.getAttribute("data-param")] =
+        input.getAttribute("data-kind") === "word" ? raw : numberOf(raw);
+    });
+    // A pool's ticks, keyed as the setting's value they send (`draftOf`: one `set`).
+    Array.prototype.forEach.call(box.querySelectorAll(":scope > .editor [data-pool]"), function (grid) {
+      if (!shownIn(box, grid)) { return; }
+      state["p:" + grid.getAttribute("data-pool")] = "#" + poolSum(grid);
+    });
+    if (state.side && state.side !== "fixed") {
+      state.shape = shapeOf(paneOf(box, state.side));
+      Array.prototype.forEach.call(formFields(box, state.side), function (input) {
+        var field = input.getAttribute("data-form");
+        var raw = input.value.trim();
+        state["f:" + field] = field === "values" || field === "weights" ? listOf(raw) : numberOf(raw);
+      });
+    }
+    var hue = box.querySelector(":scope > .editor .hue.on[data-color]");
+    if (hue) { state.hue = hue.getAttribute("data-colorset") + "/" + hue.getAttribute("data-color"); }
+    // A setting's choices as segments, keyed by the setting (`c:`), the words of the one pressed.
+    Array.prototype.forEach.call(box.querySelectorAll(":scope > .editor [data-choices]"), function (group) {
+      var on = group.querySelector(".ch.on[data-choice]");
+      if (on) { state["c:" + group.getAttribute("data-choices")] = on.getAttribute("data-choice"); }
+    });
+    Array.prototype.forEach.call(box.querySelectorAll(".detail > .rng input[data-number]"), function (input) {
+      state["n:" + input.getAttribute("data-number")] = numberOf(input.value.trim());
+    });
+    return state;
+  }
+  function same(a, b) {
+    var keys = Object.keys(a);
+    return keys.length === Object.keys(b).length &&
+      keys.every(function (key) { return a[key] === b[key]; });
+  }
+  // **A box's draft** (the controls review's §2, rules 1, 2 and 4): what its Apply would send, as
+  // changes -- each `{kind, name, ...}` by its own kind's fields, `set`, `range`, `form`, `color`
+  // or `choice` (`link.APPLY_KINDS`) -- and why it cannot be sent (`error`, the page's own checks: a
+  // number that is not one, a fraction for a whole setting); `null` where the box holds what it
+  // is headed to, the value in force or what this page sent and the rig has not yet applied ("a
+  // draft equal to what is in force is no draft"). A range sends the numbers that differ from
+  // those in force, which the rig lays over them.
+  function draftOf(box) {
+    var name = nameOf(box);
+    var now = stateOf(box);
+    var given = served[name] ? stateOf(served[name]) : now;
+    var base = out[name] ? out[name].state : given;
+    if (same(now, base)) { return null; }
+    var changes = [];
+    var error = "";
+    function wrong(why) { if (!error) { error = why; } }
+    Object.keys(now).forEach(function (key) {
+      if (key.indexOf("p:") !== 0 || now[key] === base[key]) { return; }
+      var setting = key.slice(2);
+      var field = null;
+      Array.prototype.forEach.call(box.querySelectorAll(":scope > .editor input[data-param]"), function (input) {
+        if (input.getAttribute("data-param") === setting && shownIn(box, input)) { field = input; }
+      });
+      if (!field) {
+        // A pool's grid: its ticks are one `set` of the pool's number, a pair added or taken
+        // away alike; none ticked is no pool, which the rig refuses (`task.Pool`).
+        var grid = box.querySelector(':scope > .editor [data-pool="' + CSS.escape(setting) + '"]');
+        var sum = grid ? poolSum(grid) : 0;
+        if (!sum) { wrong("tick at least one pair"); return; }
+        changes.push({ kind: "set", name: setting, value: sum });
+        return;
+      }
+      var raw = field.value.trim();
+      if (field.getAttribute("data-kind") === "word") {
+        if (raw === "") { wrong(setting + " needs a word"); }
+        changes.push({ kind: "set", name: setting, value: raw });
+        return;
+      }
+      var value = Number(raw);
+      if (raw === "" || !isFinite(value)) { wrong(setting + " needs a number"); return; }
+      if (field.hasAttribute("data-whole") && Math.floor(value) !== value) { wrong(WHOLE); return; }
+      if (field.hasAttribute("data-percent")) { value = fromPercent(raw); }
+      changes.push({ kind: "set", name: setting, value: value });
+    });
+    var drawn = now.side !== undefined && now.side !== "fixed";
+    var reshaped = drawn && (now.side !== base.side || now.shape !== base.shape ||
+      Object.keys(now).some(function (key) { return key.indexOf("f:") === 0 && now[key] !== base[key]; }));
+    if (reshaped) {
+      var command = { kind: "form", name: name, shape: now.shape };
+      var numbers = {};
+      Array.prototype.forEach.call(formFields(box, now.side), function (input) {
+        var field = input.getAttribute("data-form");
+        var raw = input.value.trim();
+        if (field === "values" || field === "weights") {
+          var items = raw.split(/[\\s,]+/).filter(Boolean).map(Number);
+          if (!items.length || items.some(function (item) { return !isFinite(item); })) {
+            wrong(name + "'s " + field + " needs a number");
+          }
+          command[field] = items;
+          return;
+        }
+        var value = Number(raw);
+        if (raw === "" || !isFinite(value)) { wrong(name + "'s " + field + " needs a number"); }
+        numbers[field] = value;
+      });
+      if (Object.keys(numbers).length) { command.numbers = numbers; }
+      changes.push(command);
+    }
+    if (now.hue !== undefined && now.hue !== base.hue) {
+      var hue = box.querySelector(":scope > .editor .hue.on[data-color]");
+      changes.push({ kind: "color", name: name, colorset: hue.getAttribute("data-colorset"),
+                     color: hue.getAttribute("data-color") });
+    }
+    // A choice pressed among a setting's segments: a `choice` by its words (`link.SetChoice`).
+    Object.keys(now).forEach(function (key) {
+      if (key.indexOf("c:") !== 0 || now[key] === base[key]) { return; }
+      changes.push({ kind: "choice", name: key.slice(2), choice: now[key] });
+    });
+    var ranged = {};
+    var moved = Object.keys(now).some(function (key) {
+      return key.indexOf("n:") === 0 && now[key] !== base[key];
+    });
+    if (moved) {
+      Object.keys(now).forEach(function (key) {
+        if (key.indexOf("n:") !== 0 || now[key] === given[key]) { return; }
+        var number = key.slice(2);
+        var raw = box.querySelector('.detail > .rng input[data-number="' + CSS.escape(number) + '"]').value.trim();
+        var value = Number(raw);
+        if (raw === "" || !isFinite(value)) { wrong(name + "'s " + number + " needs a number"); return; }
+        ranged[number] = value;
+      });
+      if (Object.keys(ranged).length) { changes.push({ kind: "range", name: name, numbers: ranged }); }
+    }
+    var named = {};
+    changes.forEach(function (change) {
+      if (named[change.name]) { wrong("a value over " + change.name + "'s draw and its range go one at a time"); }
+      named[change.name] = true;
+    });
+    if (changes.length && fractions[name]) { wrong(WHOLE); }
+    if (!changes.length && !error) { return null; }
+    return { changes: changes, error: error };
+  }
+  // What a frame says of a box that the page tells news by: the change waiting, the refusal, the
+  // change in force.
+  function newsOf(box) {
+    return [box.classList.contains("staged") ? "staged" : "", box.getAttribute("data-staged-cid"),
+            box.getAttribute("data-refusal"), box.getAttribute("data-applied")].join("|");
+  }
+  function noted(box, said) {
+    notes[nameOf(box)] = { said: said, news: newsOf(box), state: stateOf(box) };
+  }
+  // A button the page holds off for a reason of its own (no draft, a draft it cannot send, an
+  // act out), or lets go to what this page may do: `data-held`, which the sign-in leaves alone.
+  function hold(button, off) {
+    if (!button) { return; }
+    if (off) {
+      button.disabled = true;
+      button.setAttribute("data-held", "");
+      return;
+    }
+    button.removeAttribute("data-held");
+    button.disabled = signinPage ? !(signedIn() && confirmed) : !canWrite;
+  }
+  // **A box's one status line**, where the page has its own word to say (the plan's "Words on
+  // the page"): *sending…* while its act is out; *cannot send · why* for a draft its checks
+  // refuse; a line kept until the box's news changes (a send not delivered, a withdrawal's
+  // answer); *refused* for the draft the rig refused, by its own reason or, for an act refused
+  // whole, as applied together; *not sent* for a draft, saying a reward size is sent alone and
+  // never withdrawn, and who changed the box under it (the plan's Review Focus 4); *waiting for
+  // the next trial · you* for a change this page sent. `null`: the rig's own line.
+  function withdrawalOf(name) {
+    return Object.keys(withdrawing).some(function (cid) {
+      return withdrawing[cid].names.indexOf(name) !== -1;
+    });
+  }
+  function lineOf(box, draft) {
+    var name = nameOf(box);
+    var sent = out[name];
+    if (sent && sent.phase === "sending") { return SENDING; }
+    // A withdrawal out is said until the rig answers it, whatever the frames meanwhile show: a
+    // change waiting no more may have applied (the whole-build review's I1).
+    if (withdrawalOf(name)) { return WITHDRAWING; }
+    if (draft && draft.error) { return CANNOT + draft.error; }
+    var note = notes[name];
+    if (note && note.news === newsOf(box) && same(note.state, stateOf(box))) { return note.said; }
+    delete notes[name];
+    var refused = refusedAt[name];
+    if (refused && draft && same(refused.state, stateOf(box))) {
+      return box.getAttribute("data-refusal-cid") === refused.cid ? null : TOGETHER;
+    }
+    var waiting = box.getAttribute("data-staged-cid");
+    var under = box.getAttribute("data-under");
+    if (draft) {
+      var said = NOT_SENT;
+      if (box.classList.contains("ceiling")) { said += " · " + ALONE; }
+      if (box.classList.contains("staged")) {
+        if (waiting && mine[waiting]) {
+          var to = box.querySelector(".head .to");
+          said += " · " + (to ? to.textContent.replace(/^→\\s*/, "") : "a change") + " is waiting";
+        } else if (under) { said += " · " + under; }
+      } else if (under && (box.getAttribute("data-applied") || "") !== (since[name] || "")) {
+        said += " · " + under;
+      }
+      return said;
+    }
+    if (box.classList.contains("staged") && waiting && mine[waiting]) { return WAITING_YOU; }
+    return null;
+  }
+  // **A box brought up to date with the page's own state**: its draft judged, its marks
+  // (`draft`, `sending`, `cannot`), its status line, and Apply and Discard live only where they
+  // would do something. The rig's line and state come from `served`; a refusal a later accepted
+  // change has cleared says what the line would say without it.
+  function refresh(box) {
+    var name = nameOf(box);
+    var fresh = served[name];
+    var draft = draftOf(box);
+    if (draft) {
+      if (!drafts[name]) { since[name] = box.getAttribute("data-applied") || ""; }
+      drafts[name] = draft;
+    } else {
+      delete drafts[name];
+      delete since[name];
+    }
+    var sending = Boolean(out[name] && out[name].phase === "sending");
+    // The rig's state from the frame, the find box's mark kept (a box brought up to date between
+    // two `settle`s -- an act sent, a step -- stays found or not as the find box left it).
+    if (fresh) {
+      var unfound = box.classList.contains("nofind");
+      box.className = fresh.className;
+      if (unfound) { box.classList.add("nofind"); }
+    }
+    var said = lineOf(box, draft);
+    var say = box.querySelector(":scope > .status > .say");
+    var given = fresh ? fresh.querySelector(":scope > .status > .say") : null;
+    if (say && given) {
+      var copy = given.cloneNode(true);
+      say.replaceWith(copy);
+      say = copy;
+    }
+    var seen = refusals[name];
+    if (said === null && seen && seen.cleared && box.classList.contains("refused") && say &&
+        say.hasAttribute("data-rest")) {
+      box.classList.remove("refused");
+      if (say.getAttribute("data-rest-state")) { box.classList.add(say.getAttribute("data-rest-state")); }
+      said = say.getAttribute("data-rest");
+    }
+    if (said === TOGETHER) { box.classList.add("refused"); }
+    if (said !== null && say) {
+      say.textContent = said;
+      say.title = WHOLE_OF[said] || said;
+    }
+    box.classList.toggle("draft", Boolean(draft) && !sending);
+    box.classList.toggle("sending", sending);
+    box.classList.toggle("cannot", Boolean(draft && draft.error) && !sending);
+    hold(box.querySelector("[data-apply]"), !draft || Boolean(draft.error) || sending);
+    hold(box.querySelector("[data-discard]"), sending ? !answeredLong(out[name]) : !draft);
+    restOf(box);
+    mirrorOne(name);
+    markLine(name);
+  }
+  // **A special trials group's remainder, from its fields** (`web._rest`; the pop-out revision's
+  // Amendments, item 4): the shares its span names, as typed, each one counted as the draw counts
+  // it -- a number above 0, anything else none -- so a draft says what it leaves normal before it
+  // is applied; with no draft the fields hold the values in force, and it says what the rig drew.
+  function restOf(box) {
+    var rest = box.querySelector(":scope > .editor > .gr[data-shares]");
+    if (!rest) { return; }
+    var total = 0;
+    rest.getAttribute("data-shares").split(" ").forEach(function (name) {
+      var field = box.querySelector(':scope > .editor input[data-param="' + CSS.escape(name) + '"]');
+      var typed = field ? field.value.trim() : "";
+      var value = typed === "" ? NaN : Number(typed);
+      if (isFinite(value) && value > 0) { total += value; }
+    });
+    var words = rest.getAttribute("data-words");
+    rest.textContent = total < 100 ? String(Math.round((100 - total) * 1e9) / 1e9) + " " + words
+      : "none " + words + (total > 100 ? ": " + rest.getAttribute("data-over") : "");
+  }
+  // **What only the page knows, on a summary line** (the summary and editor design's goal 3 and
+  // its call "when states combine"; the plan's Global Constraints): the rig's line (`_line`) is
+  // kept as the frame drew it (`wlxRig`, taken again after every `patchLine`), and where the page
+  // knows more -- a draft, a draft that cannot send, an act sending or a withdrawal out, an act the
+  // rig never confirmed, a refusal of an act applied together, a refusal a later change cleared --
+  // the line says it: at most two marks after the name, in precedence (`LINE_MARKS`), then ◆ where
+  // the value is drawn each trial; the value "in force → draft" (`draftText`); and in its title
+  // every state present in words, the rig's among them.
+  var EDITED = "edited";
+  var LINE_MARKS = ["!", "●", "…", "?", "◷", "⚠"];
+  var DRAW_ENDS = { non_aging: ["shortest", "longest"], uniform: ["low", "high"], normal: ["low", "high"] };
+  function linesOf(name) {
+    return document.querySelectorAll(inCards('.summary .line[data-open="' + CSS.escape(name) + '"]'));
+  }
+  function rigOf(line) {
+    var mk = line.querySelector(":scope > .mk");
+    var lv = line.querySelector(":scope > .lv");
+    var state = ["waiting", "refused", "warned"].filter(function (kind) {
+      return line.classList.contains(kind);
+    })[0] || "";
+    return { title: line.getAttribute("title") || "", mk: mk ? mk.textContent : "",
+             lv: lv ? lv.textContent : "", state: state, said: line.getAttribute("data-said") || "" };
+  }
+  // A typed number as its line says it: after it what the line writes after a number (`data-unit`,
+  // `web._line_unit`: "%", "°", " s"), else the unit beside the box's field.
+  function unitOf(box, field) {
+    var line = linesOf(nameOf(box))[0];
+    if (line && line.hasAttribute("data-unit")) { return line.getAttribute("data-unit"); }
+    var holder = field ? field.closest(".fu, label") : null;
+    var unit = holder ? holder.querySelector(".unit") : null;
+    return unit && unit.textContent ? " " + unit.textContent : "";
+  }
+  function endsOf(box, fields, kind, ends) {
+    var typed = ends.map(function (end) {
+      var found = Array.prototype.filter.call(fields, function (input) {
+        return input.getAttribute(kind) === end;
+      })[0];
+      return found ? found.value.trim() : "";
+    });
+    if (typed[0] === "" || typed[1] === "") { return EDITED; }
+    return typed[0] + "–" + typed[1] + unitOf(box, null);
+  }
+  // **A box's draft as its summary line says it** (the plan's Global Constraints), read from the
+  // box's own fields, never formatted again: one field, as typed with its unit -- a percent's `%`,
+  // a whole number as typed -- or as typed alone where the draft cannot send; a draw, its two ends
+  // as typed, "0.5–1.25 s"; a pool, "N of 12" from its ticks; a choice pressed among its segments,
+  // its words; a color, a group, a shape or a switch alone, or more than one kind of change,
+  // "edited". What differs from the frame's box (`served`),
+  // so an act still sending says what it sent; "" where nothing does.
+  function draftText(box) {
+    var name = nameOf(box);
+    var now = stateOf(box);
+    var given = served[name] ? stateOf(served[name]) : now;
+    var moved = Object.keys(now).concat(Object.keys(given)).filter(function (key, at, all) {
+      return all.indexOf(key) === at && now[key] !== given[key];
+    });
+    if (!moved.length) { return ""; }
+    if (box.classList.contains("group")) { return EDITED; }
+    var values = moved.filter(function (key) {
+      return key.indexOf("p:") === 0 && Object.prototype.hasOwnProperty.call(now, key);
+    });
+    var drawn = now.side !== undefined && now.side !== "fixed";
+    var formed = drawn && moved.some(function (key) {
+      return key === "side" || key === "shape" || key.indexOf("f:") === 0;
+    });
+    var ranged = moved.some(function (key) { return key.indexOf("n:") === 0; });
+    var chosen = moved.filter(function (key) {
+      return key.indexOf("c:") === 0 && Object.prototype.hasOwnProperty.call(now, key);
+    });
+    var kinds = values.length + (formed ? 1 : 0) + (ranged ? 1 : 0) + (moved.indexOf("hue") !== -1 ? 1 : 0) +
+      chosen.length;
+    if (kinds !== 1) { return EDITED; }
+    // A choice pressed among its segments: as its segment says it, "Ring" for a look's long
+    // words (`web._choice_label`), as the line says the choice in force; its words whole where
+    // no segment says them.
+    if (chosen.length) {
+      var words = now[chosen[0]];
+      var said = Array.prototype.filter.call(box.querySelectorAll(":scope > .editor [data-choice]"),
+        function (segment) { return segment.getAttribute("data-choice") === words; })[0];
+      return said ? said.textContent : words;
+    }
+    if (values.length) {
+      var setting = values[0].slice(2);
+      var field = null;
+      Array.prototype.forEach.call(box.querySelectorAll(":scope > .editor input[data-param]"), function (input) {
+        if (input.getAttribute("data-param") === setting && shownIn(box, input)) { field = input; }
+      });
+      if (field) {
+        var raw = field.value.trim();
+        var cannot = drafts[name] && drafts[name].error;
+        return field.getAttribute("data-kind") === "word" || cannot ? raw : raw + unitOf(box, field);
+      }
+      var grid = box.querySelector(':scope > .editor [data-pool="' + CSS.escape(setting) + '"]');
+      if (!grid) { return EDITED; }
+      return grid.querySelectorAll("input.tick[data-bit]:checked").length + " of " +
+        grid.querySelectorAll("input.tick[data-bit]").length;
+    }
+    if (formed && DRAW_ENDS[now.shape]) {
+      return endsOf(box, formFields(box, now.side), "data-form", DRAW_ENDS[now.shape]);
+    }
+    if (formed && now.shape === "scaled") {
+      var factor = formFields(box, now.side)[0];
+      var unit = factor ? factor.parentElement.querySelector(":scope > .unit") : null;
+      return factor && factor.value.trim() ? factor.value.trim() + (unit ? " " + unit.textContent : "") : EDITED;
+    }
+    if (ranged) {
+      var numbers = box.querySelectorAll(".detail > .rng input[data-number]");
+      var named = Array.prototype.map.call(numbers, function (input) { return input.getAttribute("data-number"); });
+      var ends = named.indexOf("shortest") !== -1 ? ["shortest", "longest"] : ["low", "high"];
+      if (named.indexOf(ends[0]) !== -1 && named.indexOf(ends[1]) !== -1) {
+        return endsOf(box, numbers, "data-number", ends);
+      }
+    }
+    return EDITED;
+  }
+  // "in force → draft": a number's unit said once, after the draft ("1.00 → 1.50 s"), as the rig's
+  // line says what waits (`web._waits`); anything else as it is, then the arrow.
+  function arrowed(line, typed) {
+    var now = line.querySelector(":scope > .lv").getAttribute("data-now") || "";
+    var unit = line.getAttribute("data-unit");
+    var number = /^-?\\d+(\\.\\d+)?$/;
+    if (unit !== null && now.slice(now.length - unit.length) === unit &&
+        typed.slice(typed.length - unit.length) === unit &&
+        number.test(now.slice(0, now.length - unit.length)) &&
+        number.test(typed.slice(0, typed.length - unit.length))) {
+      return now.slice(0, now.length - unit.length) + " → " + typed;
+    }
+    return now + " → " + typed;
+  }
+  // Each state of a box present, `{mark, said, page}` in precedence: `page` where it is the page's
+  // own, which the rig's line does not say.
+  function lineStates(box, rig) {
+    var name = nameOf(box);
+    var draft = drafts[name] || null;
+    var sending = Boolean(out[name] && out[name].phase === "sending");
+    var say = box.querySelector(":scope > .status > .say");
+    var text = say ? say.textContent : "";
+    var given = served[name] ? served[name].querySelector(":scope > .status > .say") : null;
+    var cleared = rig.state === "refused" && !box.classList.contains("refused");
+    var rest = cleared && given ? given.getAttribute("data-rest-state") || "" : "";
+    var restSaid = cleared && given ? given.getAttribute("data-rest") || "" : "";
+    var states = [];
+    function add(mark, said, page) { states.push({ mark: mark, said: said, page: page }); }
+    if (draft && draft.error && !sending) { add("!", CANNOT + draft.error, true); }
+    if (text === TOGETHER) { add("!", TOGETHER, true); }
+    else if (rig.state === "refused" && !cleared) { add("!", rig.said, false); }
+    if (draft && !sending) { add("●", text.indexOf(NOT_SENT) === 0 ? (say.title || text) : NOT_SENT, true); }
+    if (sending) { add("…", SENDING, true); }
+    else if (withdrawalOf(name)) { add("…", WITHDRAWING, true); }
+    if (text.indexOf(NO_WORD) !== -1) { add("?", text, true); }
+    if (rig.state === "waiting") { add("◷", rig.said, false); }
+    if (rig.state === "warned") { add("⚠", rig.said, false); }
+    if (cleared) { add(rest === "warned" ? "⚠" : "", rest === "" ? "" : restSaid, true); }
+    else if (!rig.state && rig.said) { add("", rig.said, false); }
+    return states;
+  }
+  function markLine(name) {
+    var box = cardOf(name);
+    Array.prototype.forEach.call(linesOf(name), function (line) {
+      if (!line.wlxRig) { line.wlxRig = rigOf(line); }
+      var rig = line.wlxRig;
+      var states = box ? lineStates(box, rig) : [];
+      var own = states.some(function (one) { return one.page; });
+      var marks = [];
+      states.forEach(function (one) {
+        if (one.mark && marks.indexOf(one.mark) === -1 && marks.length < 2) { marks.push(one.mark); }
+      });
+      marks.sort(function (a, b) { return LINE_MARKS.indexOf(a) - LINE_MARKS.indexOf(b); });
+      var shown = rig.lv;
+      var typed = box && (drafts[name] || (out[name] && out[name].phase === "sending")) ? draftText(box) : "";
+      if (typed) { shown = arrowed(line, typed); }
+      var title = rig.title;
+      if (own || shown !== rig.lv) {
+        var saids = states.map(function (one) { return one.said; }).filter(Boolean);
+        var at = rig.title.indexOf(" · " + rig.lv);
+        if (at === -1) { title = [rig.title].concat(saids).join(" · "); }
+        else {
+          var tail = rig.title.slice(at + 3 + rig.lv.length);
+          if (rig.said && tail.indexOf(" · " + rig.said) === 0) { tail = tail.slice(3 + rig.said.length); }
+          title = [rig.title.slice(0, at), shown].concat(saids).join(" · ") + tail;
+        }
+      }
+      var mark = own ? marks.join("") + (line.classList.contains("drawn") ? "◆" : "") : rig.mk;
+      var mk = line.querySelector(":scope > .mk");
+      var lv = line.querySelector(":scope > .lv");
+      if (mk && mk.textContent !== mark) { mk.textContent = mark; }
+      if (lv && lv.textContent !== shown) { lv.textContent = shown; }
+      if (line.getAttribute("title") !== title) { line.setAttribute("title", title); }
+      var has = function (mark) { return states.some(function (one) { return one.mark === mark; }); };
+      line.classList.toggle("refused", has("!"));
+      line.classList.toggle("draft", has("●"));
+      line.classList.toggle("sending", has("…"));
+      line.classList.toggle("unconfirmed", has("?"));
+      line.classList.toggle("warned", has("⚠"));
+    });
+    mirrorLine(name);
+  }
+  // **A box that keeps its editor**: one with a draft, its act out, or a field or select focused
+  // in it (the controls review's §3, rule 2); a button focused is not one, Chromium focusing
+  // the button it pressed (*hand back*).
+  function dirty(box) {
+    var name = nameOf(box);
     var focused = document.activeElement;
-    return Boolean(focused && focused.matches && focused.matches("#params input")) ||
-      rangeEdited() || pressing() || Object.keys(timers).length > 0;
+    var copy = focused ? pinOf(focused) : null;
+    return Boolean(drafts[name] || out[name] ||
+      (focused && (box.contains(focused) || (copy && copy.getAttribute("data-pin") === name)) &&
+       focused.matches && focused.matches("input, select")));
+  }
+  // A refusal as first seen on a box, and whether a change of the setting has been accepted since
+  // (the design's goal 4: "a refusal is cleared by a later accepted change of that setting"): a
+  // change waiting that was not when it was first seen, or the change in force moving on.
+  function track(box) {
+    var name = nameOf(box);
+    var fresh = served[name] || box;
+    var key = fresh.getAttribute("data-refusal") || "";
+    var staged = fresh.classList.contains("staged") ? (fresh.getAttribute("data-staged-cid") || "staged") : "";
+    var applied = fresh.getAttribute("data-applied") || "";
+    var seen = refusals[name];
+    if (!key) { delete refusals[name]; return; }
+    if (!seen || seen.key !== key) {
+      refusals[name] = { key: key, staged: staged, applied: applied, cleared: false };
+      return;
+    }
+    if (!seen.cleared && ((staged && staged !== seen.staged) || (!seen.staged && applied !== seen.applied))) {
+      seen.cleared = true;
+    }
+  }
+  // **A kept editor's controls a person has not touched follow the frame**: each that still holds
+  // what the last frame drew moves to what this one draws, its node kept -- its value set, never
+  // replaced -- so a box kept only for a field focused, or kept for one edit, never shows a value
+  // the rig no longer holds as a draft of its own; one a person changed stays.
+  function controlsOf(node) {
+    var found = {};
+    Array.prototype.forEach.call(node.querySelectorAll(
+        ":scope > .editor input[data-param], :scope > .editor input[data-form], " +
+        ":scope > .editor select[data-shape], :scope > .editor input.tick[data-bit], " +
+        ":scope > details.more > .detail > .rng input[data-number]"), function (control) {
+      var key = control.hasAttribute("data-param") ? "p:" + control.getAttribute("data-param")
+        : control.hasAttribute("data-bit") ? "t:" + control.getAttribute("data-bit")
+        : control.hasAttribute("data-number") ? "n:" + control.getAttribute("data-number")
+        : control.hasAttribute("data-form") ? "f:" + control.closest("[data-fields]").getAttribute("data-fields") +
+          "/" + control.getAttribute("data-form")
+        : "shape";
+      found[key] = control;
+    });
+    return found;
+  }
+  function valueOf(control) {
+    if (control.type === "checkbox") { return control.checked ? "1" : ""; }
+    var raw = control.value.trim();
+    return control.tagName === "SELECT" || control.getAttribute("data-kind") === "word" ? raw
+      : control.getAttribute("data-form") === "values" || control.getAttribute("data-form") === "weights"
+      ? listOf(raw) : numberOf(raw);
+  }
+  function follow(box, before, given) {
+    var have = controlsOf(box);
+    var was = controlsOf(before);
+    var now = controlsOf(given);
+    Object.keys(have).forEach(function (key) {
+      var control = have[key];
+      if (!was[key] || !now[key] || valueOf(control) !== valueOf(was[key]) ||
+          valueOf(now[key]) === valueOf(was[key])) { return; }
+      if (control.type === "checkbox") { control.checked = now[key].checked; return; }
+      control.value = now[key].value;
+      if (key === "shape") { showShape(box, control.value); }
+    });
+    var sideOf = function (node) {
+      var on = node.querySelector(":scope > .editor [data-switch].on");
+      return on ? on.getAttribute("data-switch") : null;
+    };
+    if (sideOf(box) !== null && sideOf(box) === sideOf(before) && sideOf(given) !== sideOf(before)) {
+      showSide(box, sideOf(given));
+    }
+    var hueOf = function (node) {
+      var on = node.querySelector(":scope > .editor .hue.on[data-color]");
+      return on ? on.getAttribute("data-colorset") + "/" + on.getAttribute("data-color") : "";
+    };
+    if (hueOf(box) === hueOf(before) && hueOf(given) !== hueOf(before)) {
+      Array.prototype.forEach.call(box.querySelectorAll(":scope > .editor .hue[data-color]"), function (hue) {
+        var on = hue.getAttribute("data-colorset") + "/" + hue.getAttribute("data-color") === hueOf(given);
+        hue.classList.toggle("on", on);
+        hue.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+    }
+    // Each setting's segments, as its hue's swatches: one a person has not pressed follows the frame.
+    var choiceOf = function (node, setting) {
+      var on = node.querySelector(':scope > .editor [data-choices="' + CSS.escape(setting) + '"] .ch.on[data-choice]');
+      return on ? on.getAttribute("data-choice") : null;
+    };
+    Array.prototype.forEach.call(box.querySelectorAll(":scope > .editor [data-choices]"), function (group) {
+      var setting = group.getAttribute("data-choices");
+      var then = choiceOf(before, setting);
+      var told = choiceOf(given, setting);
+      if (choiceOf(box, setting) !== then || told === then) { return; }
+      pressChoice(group, told);
+    });
+  }
+  // **A dirty box patched by zone** (the controls review's §3): its head and its status line's
+  // news from the frame, its *withdraw* as the frame has it, its *more* -- but a draft's or a
+  // sent act's live range numbers, and not while a field in it is focused -- and its marks; its
+  // editor's nodes, and Apply and Discard, never replaced.
+  function patchDirty(box, given, before) {
+    // Not while its act is out: what it sent is judged against the editor as sent.
+    if (before && !out[nameOf(box)]) { follow(box, before, given); }
+    box.querySelector(":scope > .head").replaceWith(given.querySelector(":scope > .head"));
+    var acts = box.querySelector(":scope > .status > .acts");
+    var gone = acts.querySelector(":scope > .wd");
+    var come = given.querySelector(":scope > .status > .acts > .wd");
+    if (gone && come) { gone.replaceWith(come); }
+    else if (gone) { gone.remove(); }
+    else if (come) { acts.insertBefore(come, acts.firstChild); }
+    var detail = box.querySelector(":scope > details.more > .detail");
+    var news = given.querySelector(":scope > details.more > .detail");
+    var focused = document.activeElement;
+    if (detail && news && !(focused && detail.contains(focused))) {
+      var range = detail.querySelector(":scope > .rng");
+      var fresh = news.querySelector(":scope > .rng");
+      var now = stateOf(box);
+      var was = before ? stateOf(before) : now;
+      var ranged = Boolean(out[nameOf(box)]) || Object.keys(now).some(function (key) {
+        return key.indexOf("n:") === 0 && now[key] !== was[key];
+      });
+      if (range && fresh && ranged) { fresh.replaceWith(range); }
+      detail.replaceWith(news);
+    }
+    ["data-staged-cid", "data-refusal", "data-refusal-cid", "data-applied", "data-under"].forEach(function (attr) {
+      if (given.hasAttribute(attr)) { box.setAttribute(attr, given.getAttribute(attr)); }
+      else { box.removeAttribute(attr); }
+    });
+    box.className = given.className;
+  }
+  // A tab's layout: its summary's sections and their lines, then its editor's boxes and panels,
+  // in order; null for a tab that lays out none. `root` is the tab's root or a frame's fragment,
+  // whose own children are read (`:scope` names no element in a fragment).
+  function skeletonOf(root) {
+    var own = function (name) {
+      return Array.prototype.filter.call(root.children, function (child) {
+        return child.classList.contains(name);
+      })[0] || null;
+    };
+    var summary = own("summary");
+    var editor = own("editing");
+    if (!summary || !editor) { return null; }
+    return Array.prototype.map.call(summary.querySelectorAll(".ssec"), function (section) {
+      return section.getAttribute("data-section") + ":" + Array.prototype.map.call(
+        section.querySelectorAll(":scope > .line"), function (line) {
+          return line.getAttribute("data-open");
+        }).join(",");
+    }).join("|") + "||" + Array.prototype.map.call(editor.children, function (child) {
+      return child.getAttribute("data-card") || child.getAttribute("data-newc") || child.className;
+    }).join(",");
+  }
+  // **A summary line brought up to the frame's in place** (the summary and editor design's
+  // anti-goal: "the page jumping under the pointer"), its node kept, so a focused line keeps its
+  // focus: its classes, title and value, and each mark; `aria-pressed` is the page's own
+  // (`applyOpened`).
+  function patchLine(line, given) {
+    Array.prototype.slice.call(line.attributes).forEach(function (attr) {
+      if (attr.name !== "aria-pressed" && !given.hasAttribute(attr.name)) { line.removeAttribute(attr.name); }
+    });
+    Array.prototype.forEach.call(given.attributes, function (attr) {
+      if (line.getAttribute(attr.name) !== attr.value) { line.setAttribute(attr.name, attr.value); }
+    });
+    Array.prototype.forEach.call(given.children, function (part, at) {
+      var have = line.children[at];
+      if (!have) { line.appendChild(part.cloneNode(true)); return; }
+      if (have.textContent !== part.textContent) { have.textContent = part.textContent; }
+      Array.prototype.forEach.call(part.attributes, function (attr) {
+        if (have.getAttribute(attr.name) !== attr.value) { have.setAttribute(attr.name, attr.value); }
+      });
+    });
+    // As the frame drew it again: what the page adds is said anew from it (`markLine`).
+    line.wlxRig = null;
+  }
+  // Every draft dropped (the console interface design's call: "dropped at the run's end"), and a
+  // field focused in a box left, so no box keeps an editor of a run that is over.
+  function dropDrafts() {
+    drafts = {};
+    out = {};
+    refusedAt = {};
+    notes = {};
+    since = {};
+    withdrawing = {};
+    var focused = document.activeElement;
+    if (focused && focused.closest && focused.closest(CARDS.join(", "))) { focused.blur(); }
+    // Every box is put back as the frame draws it, an unchanged one too: its editor may hold a
+    // draft just dropped.
+    Array.prototype.forEach.call(boxes(), function (box) { kept[nameOf(box)] = true; });
+  }
+  // **A frame's boxes, patched box by box** (the console interface design's goal 10; the controls
+  // review's §3): held whole while a pointer is down (`pressing`); else each box the frame
+  // changed is replaced whole where it is clean, and patched by zone where it is dirty
+  // (`patchDirty`), its editor's nodes kept, so a press or a field being typed in is never under a
+  // node a frame replaced. The sections' headers are rewritten in place. Where the frame lays the
+  // boxes out anew (a setting come or gone, a section moved), the tab is rebuilt around the dirty
+  // boxes' own nodes, the field that had focus focused again.
+  function patchCards(id, html) {
+    var root = el(id);
+    if (!root) { return; }
+    if (pressing()) { heldCards[id] = html; return; }
+    delete heldCards[id];
+    var made = document.createElement("template");
+    made.innerHTML = html;
+    var next = made.content;
+    var secs = next.querySelector(".summary");
+    // Only a tab that lays out boxes names the run: the Training tab of a task with no Training
+    // section names none.
+    if (secs) {
+      var run = secs.getAttribute("data-run") || "";
+      if (runKey !== null && run !== runKey) { dropDrafts(); }
+      runKey = run;
+    }
+    var given = {};
+    var before = {};
+    Array.prototype.forEach.call(next.querySelectorAll(".box"), function (box) {
+      var name = nameOf(box);
+      given[name] = box;
+      before[name] = served[name] || null;
+      served[name] = box.cloneNode(true);
+    });
+    var held = {};
+    Array.prototype.forEach.call(root.querySelectorAll(".box"), function (box) {
+      var name = nameOf(box);
+      if (!given[name]) {
+        delete drafts[name];
+        delete out[name];
+        delete kept[name];
+      } else if (dirty(box)) { held[name] = true; }
+    });
+    var layout = skeletonOf(root);
+    if (layout !== null && layout === skeletonOf(next)) {
+      var live = root.querySelector(":scope > .summary");
+      ["data-task", "data-run"].forEach(function (attr) {
+        live.setAttribute(attr, secs.getAttribute(attr) || "");
+      });
+      // Its columns' width, from its longest line (`web._line_width`).
+      if ((live.getAttribute("style") || "") !== (secs.getAttribute("style") || "")) {
+        if (secs.hasAttribute("style")) { live.setAttribute("style", secs.getAttribute("style")); }
+        else { live.removeAttribute("style"); }
+      }
+      Array.prototype.forEach.call(live.querySelectorAll(".ssec"), function (section) {
+        var other = secs.querySelector('.ssec[data-section="' + CSS.escape(section.getAttribute("data-section")) + '"]');
+        var header = headOf(section);
+        var fresh = headOf(other);
+        // The rig's counts; what is not sent is said after them again by `settle` (`countDrafts`).
+        if (header.textContent !== fresh.textContent) { header.textContent = fresh.textContent; }
+        if (header.title !== fresh.title) { header.title = fresh.title; }
+        Array.prototype.forEach.call(section.querySelectorAll(":scope > .line"), function (line, at) {
+          patchLine(line, other.querySelectorAll(":scope > .line")[at]);
+        });
+      });
+      var oldRefused = root.querySelector(":scope > .wdrs");
+      var newRefused = next.querySelector(".wdrs");
+      if (oldRefused && newRefused) { oldRefused.replaceWith(newRefused); }
+      else if (newRefused) { root.appendChild(newRefused); }
+      else if (oldRefused) { oldRefused.remove(); }
+      Array.prototype.forEach.call(root.querySelectorAll(".box"), function (box) {
+        var name = nameOf(box);
+        if (held[name]) {
+          patchDirty(box, given[name], before[name]);
+          kept[name] = true;
+        } else if (kept[name] || !before[name] || !before[name].isEqualNode(given[name])) {
+          // Shown or hidden in the editor as the box it replaces (`applyOpened`).
+          given[name].hidden = box.hidden;
+          box.replaceWith(given[name]);
+          delete kept[name];
+          restoreBox(given[name]);
+        }
+      });
+    } else {
+      var focused = document.activeElement;
+      var mark = null;
+      if (focused && root.contains(focused) && focused.matches("input")) {
+        try { mark = [focused.selectionStart, focused.selectionEnd]; } catch (e) { mark = null; }
+      }
+      Array.prototype.forEach.call(root.querySelectorAll(".box"), function (box) {
+        var name = nameOf(box);
+        if (held[name]) {
+          patchDirty(box, given[name], before[name]);
+          given[name].replaceWith(box);
+          kept[name] = true;
+        } else { delete kept[name]; }
+      });
+      root.replaceChildren(next);
+      Array.prototype.forEach.call(root.querySelectorAll(".box"), function (box) {
+        if (!kept[nameOf(box)]) { restoreBox(box); }
+      });
+      if (focused && root.contains(focused) && document.activeElement !== focused) {
+        focused.focus();
+        if (mark) { try { focused.setSelectionRange(mark[0], mark[1]); } catch (e) { /* not a text field */ } }
+      }
+    }
+    Array.prototype.forEach.call(root.querySelectorAll(".box"), track);
+    judge();
+    // The opened setting shown again (`applyOpened`), in `settle`.
+    settle();
+  }
+  // **The rig's answers to this page's acts, read off the frame**: an act whose id a box's
+  // refusal carries is refused whole, every box of it (the controls' ruling: a frame keeps only
+  // the last refusals, so not every box of a large act may carry its own); one a box's waiting
+  // change carries is waiting; one waiting no more, or answered *sent* with the boxes now holding
+  // what it sent, has applied or been replaced. A withdrawal the rig refused (`.wdr`, by the act's
+  // id) is said on its boxes; one the rig says it did (`.wdn`, `Telemetry.withdrawals`) has taken
+  // the act back, and its boxes go back to the value in force -- never one only waiting no more,
+  // which a change that applied is too (the whole-build review's I1). **An act or a withdrawal
+  // answered *sent* that `ANSWER_FRAMES` frames pass without the rig's word** says so on its
+  // boxes, and they are let go: a box never stays *sending…* or *withdrawing…* (its I2).
+  function judge() {
+    var staged = {};
+    var refused = {};
+    var declined = {};
+    var done = {};
+    Array.prototype.forEach.call(boxes(), function (box) {
+      var cid = box.getAttribute("data-staged-cid");
+      if (cid) { staged[cid] = true; }
+      var no = box.getAttribute("data-refusal-cid");
+      if (no) { refused[no] = true; }
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(inCards(".wdrs .wdr")), function (row) {
+      var cid = row.getAttribute("data-cid");
+      declined[cid] = { count: (declined[cid] ? declined[cid].count : 0) + 1, said: row.textContent };
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(inCards(".wdrs .wdn")), function (row) {
+      done[row.getAttribute("data-cid")] = true;
+    });
+    Object.keys(withdrawing).forEach(function (cid) {
+      var asked = withdrawing[cid];
+      var no = declined[cid];
+      if (no && no.count > asked.seen) {
+        asked.names.forEach(function (name) {
+          var box = cardOf(name);
+          if (box) { noted(box, "not withdrawn · " + no.said); }
+        });
+        delete withdrawing[cid];
+      } else if (!done[cid]) {
+        if (asked.answered && framesSeen - asked.at >= ANSWER_FRAMES) {
+          delete withdrawing[cid];
+          asked.names.forEach(function (name) {
+            var sent = out[name];
+            var box = cardOf(name);
+            if (sent && sent.cid === cid) {
+              delete out[name];
+              if (box && same(stateOf(box), sent.state) && served[name]) { putBack(box); }
+            }
+            if (served[name]) {
+              notes[name] = { said: "withdraw " + NO_WORD, news: newsOf(served[name]),
+                              state: stateOf(served[name]) };
+            }
+          });
+        }
+      } else {
+        asked.names.forEach(function (name) {
+          var sent = out[name];
+          var box = cardOf(name);
+          if (sent && sent.cid === cid) {
+            delete out[name];
+            if (box && same(stateOf(box), sent.state) && served[name]) { putBack(box); }
+          }
+          if (served[name]) {
+            notes[name] = { said: WITHDRAWN, news: newsOf(served[name]), state: stateOf(served[name]) };
+          }
+        });
+        delete withdrawing[cid];
+      }
+    });
+    Object.keys(out).forEach(function (name) {
+      var sent = out[name];
+      var box = cardOf(name);
+      if (!box) { delete out[name]; return; }
+      // An act whose withdrawal is out is judged by the withdrawal's answer, above: a frame that
+      // comes before that answer, the act waiting no more, has not applied it (found under the
+      // suite's load in the console interface rework's Task 7: the box then kept what it sent as
+      // a draft, "not sent", where it was withdrawn).
+      if (withdrawing[sent.cid] && !refused[sent.cid]) { return; }
+      if (refused[sent.cid]) {
+        refusedAt[name] = { cid: sent.cid, state: stateOf(box) };
+        delete out[name];
+      } else if (staged[sent.cid]) {
+        sent.phase = "waiting";
+      } else if (sent.phase === "waiting" ||
+                 (sent.answered && served[name] && same(sent.state, stateOf(served[name])))) {
+        delete out[name];
+      } else if (sent.answered && framesSeen - sent.at >= ANSWER_FRAMES) {
+        // Neither waiting, refused nor in force as sent: the edit is a draft again, said so.
+        delete out[name];
+        noted(box, NO_WORD);
+      }
+    });
+  }
+  // A box put back to the frame's, whole.
+  function putBack(box) {
+    var name = nameOf(box);
+    var back = served[name].cloneNode(true);
+    back.hidden = box.hidden;
+    box.replaceWith(back);
+    delete kept[name];
+    restoreBox(back);
+    return back;
+  }
+  // **Every box made current**: a kept box that is clean again replaced whole by the frame's
+  // (no merge logic for the common case: the controls review's §3, rule 4), every box's state
+  // and line refreshed, the sections, the sign-in's gray and the drafts bar after. Never while a
+  // pointer is down.
+  function settle() {
+    if (!pressing()) {
+      Array.prototype.forEach.call(boxes(), function (box) {
+        var name = nameOf(box);
+        // Its draft judged first: an act answered just now (refused, not delivered) leaves the
+        // box's edit a draft again, which a box put back would lose.
+        if (kept[name]) { refresh(box); }
+        if (kept[name] && served[name] && !dirty(box)) {
+          var fresh = served[name].cloneNode(true);
+          fresh.hidden = box.hidden;
+          box.replaceWith(fresh);
+          delete kept[name];
+          restoreBox(fresh);
+        }
+      });
+    }
+    CARDS.forEach(function (id) { if (document.querySelector(id)) { applyOpened(document.querySelector(id)); } });
+    Array.prototype.forEach.call(boxes(), refresh);
+    applyFind();
+    restoreNewColors();
+    applySignIn();
+    showBar();
+    mirrorPins();
+  }
+  // **The drafts bar** (the console interface design's goal 2): "N edits not sent: names ·
+  // Discard all · Apply all", in the order the boxes stand. A reward size is sent alone, by its
+  // own box's Apply, never in Apply all (the design's call; XC-527); Apply all is held off, saying
+  // why, for a draft that cannot be sent, a setting changed in two boxes, or more than
+  // `APPLY_ALL_LIMIT` changes.
+  function gathered() {
+    var every = [];
+    var named = [];
+    var alone = [];
+    var changes = [];
+    var why = "";
+    Array.prototype.forEach.call(boxes(), function (box) {
+      var name = nameOf(box);
+      var draft = drafts[name];
+      if (!draft || (out[name] && out[name].phase === "sending")) { return; }
+      every.push(name);
+      if (box.classList.contains("ceiling")) { alone.push(name); return; }
+      named.push(name);
+      if (draft.error && !why) { why = name + " cannot send: " + draft.error; }
+      draft.changes.forEach(function (change) { changes.push(change); });
+    });
+    var seen = {};
+    changes.forEach(function (change) {
+      if (seen[change.name] && !why) { why = change.name + " is changed in two boxes: apply one first"; }
+      seen[change.name] = true;
+    });
+    if (!why && changes.length > APPLY_ALL_LIMIT) {
+      why = "Apply all sends at most " + APPLY_ALL_LIMIT + " changes at once: apply some boxes alone first";
+    }
+    return { every: every, named: named, alone: alone, changes: changes, why: why };
+  }
+  function showBar() {
+    countDrafts();
+    var bar = el("drafts");
+    if (!bar) { return; }
+    var all = gathered();
+    bar.hidden = all.every.length === 0;
+    body.classList.toggle("drafted", all.every.length > 0);
+    if (!all.every.length) { return; }
+    var said = all.every.length + (all.every.length === 1 ? " edit" : " edits") + " not sent: " +
+      all.every.join(", ");
+    if (all.alone.length) {
+      said += " · " + all.alone.join(", ") + (all.alone.length === 1 ?
+        " is sent alone, by its own Apply" : " are sent alone, each by its own Apply");
+    }
+    if (all.why) { said += " · " + all.why; }
+    el("drafts-say").textContent = said;
+    el("drafts-say").title = said;
+    hold(el("drafts-apply"), !all.named.length || Boolean(all.why));
+    hold(el("drafts-discard"), false);
+  }
+  function nextCid() {
+    cidCount += 1;
+    var cid = pageId + "-" + cidCount;
+    mine[cid] = true;
+    return cid;
+  }
+  // **One act** (the console interface design's goal 2): the changes of `names`' boxes sent as one
+  // command under a fresh command id -- a box's one change as its own kind, several (a box's, or
+  // Apply all's) as `apply_many`, judged and staged together or refused whole
+  // (`Session._apply_many`). Each box says *sending…* until a frame answers the id; one the page
+  // could not deliver gets its draft back, saying why.
+  function sendAct(names, changes, together) {
+    var cid = nextCid();
+    var command;
+    if (changes.length === 1 && !together) {
+      command = {};
+      Object.keys(changes[0]).forEach(function (key) { command[key] = changes[0][key]; });
+      command.cid = cid;
+    } else {
+      command = { kind: "apply_many", cid: cid, changes: changes };
+    }
+    acts[cid] = names.slice();
+    names.forEach(function (name) {
+      var box = cardOf(name);
+      out[name] = { cid: cid, state: stateOf(box), snapshot: box.cloneNode(true), phase: "sending",
+                    answered: false };
+      delete notes[name];
+      delete refusedAt[name];
+      refresh(box);
+    });
+    showBar();
+    var answered = false;
+    function failed(said) {
+      names.forEach(function (name) {
+        if (!out[name] || out[name].cid !== cid) { return; }
+        delete out[name];
+        var box = cardOf(name);
+        if (box) { noted(box, NOT_SENT + " · " + said); }
+      });
+      settle();
+    }
+    post(command, function (answer) {
+      answered = true;
+      if (answer.status !== "sent") { failed(answer.said); return; }
+      names.forEach(function (name) {
+        if (out[name] && out[name].cid === cid) {
+          out[name].answered = true;
+          out[name].at = framesSeen;
+        }
+      });
+      judge();
+      settle();
+    }, function () { if (!answered) { failed(el("sent").textContent); } });
+  }
+  // **Apply** (and Enter in a box's field): the box's draft as one act.
+  // A group's box (the console interface rework's Task 7) is one act whatever it changed: one
+  // `apply_many` under one command id, which its *withdraw* takes back whole.
+  function applyBox(name) {
+    var box = cardOf(name);
+    if (!box || (out[name] && out[name].phase === "sending")) { return; }
+    refresh(box);
+    var draft = drafts[name];
+    if (!draft || draft.error) { return; }
+    sendAct([name], draft.changes, draft.changes.length > 1 || box.classList.contains("group"));
+  }
+  // **Apply all** (the console interface design's goal 2: "Apply all stages them together, on the
+  // same trial"): every box's draft but a reward size's, one `apply_many`.
+  function applyAll() {
+    var all = gathered();
+    if (!all.named.length || all.why) { showBar(); return; }
+    sendAct(all.named, all.changes, true);
+  }
+  // The selector of a box's field, to focus it again in a box put back.
+  function fieldOf(input) {
+    if (input.hasAttribute("data-param")) {
+      return 'input[data-param="' + CSS.escape(input.getAttribute("data-param")) + '"]';
+    }
+    if (input.hasAttribute("data-number")) {
+      return 'input[data-number="' + CSS.escape(input.getAttribute("data-number")) + '"]';
+    }
+    if (input.hasAttribute("data-bit")) {
+      return 'input.tick[data-bit="' + CSS.escape(input.getAttribute("data-bit")) + '"]';
+    }
+    var group = input.closest("[data-fields]");
+    if (group && input.hasAttribute("data-form")) {
+      return '[data-fields="' + CSS.escape(group.getAttribute("data-fields")) + '"] input[data-form="' +
+        CSS.escape(input.getAttribute("data-form")) + '"]';
+    }
+    return null;
+  }
+  // **Discard** (and Esc): the box back to what it is headed to -- what this page sent and the rig
+  // has not yet applied, else the value in force -- the field it was typed in focused again.
+  // **An act answered *sent* and not yet answered by a frame** is let go by Discard and Esc too (the
+  // whole-build review's I2: a box always has a way back), once a frame has come since without the
+  // rig's word on it (`answeredLong`): the box back to the value in force, saying the rig has not
+  // confirmed it -- a frame that then shows it waiting or in force says so.
+  function answeredLong(sent) {
+    // Not before (the fix wave's re-review, N1): Enter then Esc to leave the field, the design's
+    // keys, comes before the rig's next frame, and must leave the change on its way.
+    return Boolean(sent && sent.answered && framesSeen - sent.at >= 1);
+  }
+  function discard(name, field) {
+    var box = cardOf(name);
+    var sent = out[name];
+    if (!box || (sent && sent.phase === "sending" && !answeredLong(sent))) { return; }
+    var picked = field ? fieldOf(field) : null;
+    if (sent && sent.phase === "sending") {
+      delete out[name];
+      if (served[name]) { box = putBack(box); }
+      delete drafts[name];
+      delete refusedAt[name];
+      noted(box, NO_WORD);
+      applySignIn();
+      if (picked) {
+        var again = box.querySelector(picked);
+        if (again) { again.focus(); }
+      }
+      settle();
+      return;
+    }
+    if (out[name]) {
+      var sent = out[name].snapshot.cloneNode(true);
+      box.querySelector(":scope > .editor").replaceWith(sent.querySelector(":scope > .editor"));
+      var range = box.querySelector(".detail > .rng");
+      var back = sent.querySelector(".detail > .rng");
+      if (range && back) { range.replaceWith(back); }
+    } else if (served[name]) {
+      var fresh = served[name].cloneNode(true);
+      fresh.hidden = box.hidden;
+      box.replaceWith(fresh);
+      delete kept[name];
+      restoreBox(fresh);
+      box = fresh;
+    }
+    delete drafts[name];
+    delete refusedAt[name];
+    delete notes[name];
+    // The box put back comes grayed as served until the sign-in's script lets it go, and a
+    // disabled field takes no focus.
+    applySignIn();
+    if (picked) {
+      var again = box.querySelector(picked);
+      if (again) { again.focus(); }
+    }
+    settle();
+  }
+  function discardAll() {
+    gathered().every.forEach(function (name) { discard(name); });
+  }
+  // **Withdraw** (the console interface design's goal 3; the PI, 2026-11-19, "Yes, a withdraw
+  // button"): the act a box's waiting change was sent in, by its command id, taken back whole --
+  // its button said how many first. A double click is one withdrawal, as a clear's is.
+  function withdraw(cid, detail) {
+    if (!clearAllowed(detail, "withdraw/" + cid) || withdrawing[cid]) { return; }
+    var names = Array.prototype.filter.call(boxes(), function (box) {
+      return box.getAttribute("data-staged-cid") === cid;
+    }).map(nameOf);
+    var seen = document.querySelectorAll(inCards('.wdrs .wdr[data-cid="' + CSS.escape(cid) + '"]')).length;
+    withdrawing[cid] = { names: names, answered: false, seen: seen, at: framesSeen };
+    names.forEach(function (name) { noted(cardOf(name), WITHDRAWING); });
+    settle();
+    var answered = false;
+    function failed(said) {
+      if (!withdrawing[cid]) { return; }
+      delete withdrawing[cid];
+      names.forEach(function (name) {
+        var box = cardOf(name);
+        if (box) { noted(box, "not withdrawn · " + said); }
+      });
+      settle();
+    }
+    post({ kind: "withdraw", cid: cid }, function (answer) {
+      answered = true;
+      if (answer.status !== "sent") { failed(answer.said); return; }
+      if (withdrawing[cid]) {
+        withdrawing[cid].answered = true;
+        withdrawing[cid].at = framesSeen;
+      }
+      judge();
+      settle();
+    }, function () { if (!answered) { failed(el("sent").textContent); } });
+  }
+  // **What is not sent, counted where a person looks** (the console interface rework's Task 8):
+  // each section's header after the rig's counts ("Timing · 7 settings · 2 changed · 1 not sent", a
+  // group's settings each counted once, as the rig's counts take them, a parent's taking in its
+  // subsections'), and each settings tab's label while a box on it holds a draft.
+  function unsent(box) {
+    var draft = drafts[nameOf(box)];
+    if (!draft) { return 0; }
+    return box.classList.contains("group") ? Math.max(1, draft.changes.length) : 1;
+  }
+  function slotIn(holder, kind) {
+    var slot = holder.querySelector(":scope > ." + kind);
+    if (!slot) {
+      slot = document.createElement("span");
+      slot.className = kind;
+      holder.appendChild(slot);
+    }
+    return slot;
+  }
+  function sayIn(slot, count) {
+    var said = count ? " · " + count + " not sent" : "";
+    if (slot.textContent !== said) { slot.textContent = said; }
+  }
+  // **A summary section's header**: its own `h4`, or, for a section of subsections alone, the one
+  // it keeps with its first subsection (`web._sections`, `.skeep`).
+  function headOf(section) {
+    return section.querySelector(":scope > h4") || section.querySelector(":scope > .skeep > h4");
+  }
+  function countDrafts() {
+    [["params", "t-task"], ["training-params", "t-training"]].forEach(function (pair) {
+      var root = el(pair[0]);
+      var tab = document.querySelector('label.tab[for="' + pair[1] + '"]');
+      if (!root || !tab) { return; }
+      Array.prototype.forEach.call(root.querySelectorAll(":scope > .summary .ssec"), function (section) {
+        var header = headOf(section);
+        var count = 0;
+        Array.prototype.forEach.call(section.querySelectorAll(".line[data-open]"), function (line) {
+          var box = root.querySelector(':scope > .editing > .box[data-card="' + CSS.escape(line.getAttribute("data-open")) + '"]');
+          if (box) { count += unsent(box); }
+        });
+        if (header) { sayIn(slotIn(header, "ns"), count); }
+      });
+      var total = 0;
+      Array.prototype.forEach.call(root.querySelectorAll(".box"), function (box) { total += unsent(box); });
+      sayIn(slotIn(tab, "tns"), total);
+    });
+  }
+  // **Pins** (the console interface design's goal 9; the PI, 2026-11-19: "Yes, you choose only"): a
+  // box's *pin to Runtime*, in its *more*, puts its setting's summary line in Runtime's Pinned
+  // strip (`#pinned`), kept per task in this browser's storage under `wlx.pins.<task>` -- the
+  // names pinned, in the order pinned -- every access inside `try`, so a store that throws keeps
+  // them for this page alone; nothing is pinned until a person pins it. **A click on a pinned line
+  // opens it in Runtime's own editor below** (`#pinned-editing`; the summary and editor design's
+  // goal 9: "a click opens the same editor on Runtime (one editor per tab, the setting's one draft
+  // shared)"), kept as a tab's is, under `wlx.pinned-opened.<task>`. A pinned line is its tab's
+  // line's mirror (`mirrorLine`: what the rig said and what the page adds, `markLine`), and the
+  // editor's box **its original's mirror, never a second box** (the ledger's pin ruling: "one
+  // draft per setting, never two diverging copies"): it carries `data-pin` where its original
+  // carries `data-card`, outside the roots every box lookup reads (`CARDS`, `cardOf`), so a
+  // setting keeps one box, one draft and one act. What a person does in a copy -- typing, a tick,
+  // a segment, a swatch, −/+, Apply, Discard, Esc, Enter, *withdraw*, *hand back* -- is done to its
+  // original (`pinOf`, `twinOf`), and the copy is brought up to it node by node (`morph`), its own
+  // *more* left open or closed, so a press in it lands on a node no frame replaced.
+  var PINS_KEY = "wlx.pins.";
+  var PINNED_OPENED_KEY = "wlx.pinned-opened.";
+  var pinsHeld = {};
+  var TWINS = "input, select, textarea, button";
+  function pinTask() {
+    var summary = document.querySelector(inCards(".summary"));
+    return summary ? summary.getAttribute("data-task") || "" : "";
+  }
+  function readPins(task) {
+    if (!pinsHeld[task]) {
+      var list = [];
+      try {
+        var raw = window.localStorage.getItem(PINS_KEY + task);
+        var kept = raw ? JSON.parse(raw) : [];
+        if (Array.isArray(kept)) {
+          list = kept.filter(function (name) { return typeof name === "string"; });
+        }
+      } catch (e) { list = []; }
+      pinsHeld[task] = list;
+    }
+    return pinsHeld[task].slice();
+  }
+  function writePins(task, list) {
+    pinsHeld[task] = list.slice();
+    try { window.localStorage.setItem(PINS_KEY + task, JSON.stringify(list)); } catch (e) { /* kept for this page only */ }
+  }
+  function togglePin(name) {
+    var task = pinTask();
+    var list = readPins(task);
+    var at = list.indexOf(name);
+    if (at === -1) { list.push(name); } else { list.splice(at, 1); }
+    writePins(task, list);
+    mirrorPins(true);
+  }
+  function pinOf(node) {
+    return node && node.closest ? node.closest("#pinned-editing > .box[data-pin]") : null;
+  }
+  function pinnedLine(name) {
+    var strip = el("pinned");
+    return strip ? strip.querySelector(':scope > .line[data-open="' + CSS.escape(name) + '"]') : null;
+  }
+  function pinnedCopy(name) {
+    var holder = el("pinned-editing");
+    return holder ? holder.querySelector(':scope > .box[data-pin="' + CSS.escape(name) + '"]') : null;
+  }
+  // **A pinned line brought up to its tab's line** in place, its node kept (`patchLine`'s rule):
+  // every attribute but whether it is opened, which is Runtime's (`applyPinnedOpened`), and its
+  // tab's find marks, which are its tab's; and each part's text.
+  function mirrorLine(name) {
+    var line = pinnedLine(name);
+    var from = line ? linesOf(name)[0] : null;
+    if (!from) { return; }
+    var own = function (attr) { return attr === "aria-pressed"; };
+    Array.prototype.slice.call(line.attributes).forEach(function (attr) {
+      if (!own(attr.name) && !from.hasAttribute(attr.name)) { line.removeAttribute(attr.name); }
+    });
+    Array.prototype.forEach.call(from.attributes, function (attr) {
+      if (own(attr.name)) { return; }
+      var value = attr.name !== "class" ? attr.value : attr.value.split(" ").filter(function (word) {
+        return word !== "nofind" && word !== "found";
+      }).join(" ");
+      if (line.getAttribute(attr.name) !== value) { line.setAttribute(attr.name, value); }
+    });
+    Array.prototype.forEach.call(from.children, function (part, at) {
+      var have = line.children[at];
+      if (!have) { line.appendChild(part.cloneNode(true)); return; }
+      if (have.textContent !== part.textContent) { have.textContent = part.textContent; }
+    });
+  }
+  // **The pinned setting opened in Runtime's editor** (`#pinned-editing`), as a tab's is
+  // (`applyOpened`): its copy shown, every other hidden, the placeholder said while none is; one
+  // no longer pinned dropped.
+  function applyPinnedOpened() {
+    var holder = el("pinned-editing");
+    if (!holder) { return; }
+    var key = PINNED_OPENED_KEY + pinTask();
+    var name = readOpened(key);
+    var shown = name === null ? null : pinnedCopy(name);
+    if (name !== null && (!shown || !pinnedLine(name))) {
+      writeOpened(key, null);
+      name = null;
+      shown = null;
+    }
+    Array.prototype.forEach.call(holder.children, function (child) {
+      var hide = child.classList.contains("placeholder") ? shown !== null : child !== shown;
+      if (child.hidden !== hide) { child.hidden = hide; }
+    });
+    Array.prototype.forEach.call(el("pinned").children, function (one) {
+      var on = one.getAttribute("data-open") === name ? "true" : "false";
+      if (one.getAttribute("aria-pressed") !== on) { one.setAttribute("aria-pressed", on); }
+    });
+  }
+  function openPinned(name) {
+    if (!pinnedCopy(name)) { return; }
+    writeOpened(PINNED_OPENED_KEY + pinTask(), name);
+    applyPinnedOpened();
+  }
+  // A copy's control's twin in its original: the same place among the box's controls, which the
+  // copy shares with it node for node (`morph`).
+  function twinOf(copy, node) {
+    var original = cardOf(copy.getAttribute("data-pin"));
+    if (!original) { return null; }
+    var mine = copy.querySelectorAll(TWINS);
+    var theirs = original.querySelectorAll(TWINS);
+    var at = Array.prototype.indexOf.call(mine, node);
+    return at === -1 || mine.length !== theirs.length ? null : theirs[at];
+  }
+  function valuesOf(from, to) {
+    var given = from.querySelectorAll("input, select, textarea");
+    var have = to.querySelectorAll("input, select, textarea");
+    if (given.length !== have.length) { return; }
+    Array.prototype.forEach.call(given, function (control, at) {
+      var twin = have[at];
+      if (control.type === "checkbox" || control.type === "radio") {
+        if (twin.checked !== control.checked) { twin.checked = control.checked; }
+      } else if (twin.value !== control.value) { twin.value = control.value; }
+    });
+  }
+  function copyOf(node) {
+    var made = node.cloneNode(true);
+    if (made.nodeType === 1) {
+      made.removeAttribute("id");
+      Array.prototype.forEach.call(made.querySelectorAll("[id]"), function (one) { one.removeAttribute("id"); });
+      valuesOf(node, made);
+    }
+    return made;
+  }
+  // `to` brought up to `from` in place: each node kept where both have the same kind of node in the
+  // same place, its attributes and text set, else its children made again; a copy's `data-card`
+  // never taken, nor a `<details>`'s `open`, nor an id; and the values of the controls set last.
+  function morph(from, to, top) {
+    if (from.nodeType !== 1) {
+      if (to.data !== from.data) { to.data = from.data; }
+      return;
+    }
+    var keep = function (name) {
+      return name === "id" || (name === "open" && to.tagName === "DETAILS") ||
+        (top && (name === "data-card" || name === "data-pin" || name === "hidden"));
+    };
+    Array.prototype.slice.call(to.attributes).forEach(function (attr) {
+      if (!keep(attr.name) && !from.hasAttribute(attr.name)) { to.removeAttribute(attr.name); }
+    });
+    Array.prototype.forEach.call(from.attributes, function (attr) {
+      if (!keep(attr.name) && to.getAttribute(attr.name) !== attr.value) { to.setAttribute(attr.name, attr.value); }
+    });
+    var given = from.childNodes;
+    var have = to.childNodes;
+    var same = given.length === have.length && Array.prototype.every.call(given, function (node, at) {
+      return node.nodeType === have[at].nodeType && node.nodeName === have[at].nodeName;
+    });
+    if (same) {
+      Array.prototype.forEach.call(given, function (node, at) { morph(node, have[at], false); });
+    } else {
+      to.replaceChildren.apply(to, Array.prototype.map.call(given, copyOf));
+    }
+    if (top) {
+      // Found or not by the find box of its own tab, the copy is always shown.
+      to.classList.remove("nofind");
+      valuesOf(from, to);
+    }
+  }
+  // `now`: the copy's own press has been done to its original, so its copy is brought up at once,
+  // not at the press's end (it is the node pressed that the hold keeps; `morph` keeps it).
+  function mirrorOne(name, now) {
+    if (pressing() && !now) { return; }
+    var copy = pinnedCopy(name);
+    var original = copy ? cardOf(name) : null;
+    if (copy && original) { morph(original, copy, true); }
+  }
+  // `now`: a pin or an unpin, a deliberate press, shown at once.
+  function mirrorPins(now) {
+    var holder = el("pinned-editing");
+    var strip = el("pinned");
+    if (!holder || !strip) { return; }
+    var names = readPins(pinTask()).filter(function (name) {
+      return cardOf(name) !== null && linesOf(name).length > 0;
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(inCards("[data-pin-toggle]")), function (button) {
+      var on = names.indexOf(button.getAttribute("data-pin-toggle")) !== -1;
+      var said = on ? "unpin from Runtime" : "pin to Runtime";
+      if (button.textContent !== said) { button.textContent = said; }
+      button.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+    if (pressing() && !now) { return; }
+    Array.prototype.slice.call(holder.querySelectorAll(":scope > .box[data-pin]")).forEach(function (copy) {
+      if (names.indexOf(copy.getAttribute("data-pin")) === -1) { copy.remove(); }
+    });
+    Array.prototype.slice.call(strip.children).forEach(function (line) {
+      if (names.indexOf(line.getAttribute("data-open")) === -1) { line.remove(); }
+    });
+    var widest = 0;
+    names.forEach(function (name, at) {
+      var original = cardOf(name);
+      var from = linesOf(name)[0];
+      var line = pinnedLine(name);
+      if (!line) {
+        line = from.cloneNode(true);
+        line.removeAttribute("aria-pressed");
+        line.classList.remove("nofind", "found");
+      }
+      mirrorLine(name);
+      if (strip.children[at] !== line) { strip.insertBefore(line, strip.children[at] || null); }
+      // As wide as the widest of the summaries its lines are from (`web._line_width`).
+      var width = parseFloat(from.closest(".summary").style.columnWidth) || 0;
+      if (width > widest) { widest = width; }
+      var copy = pinnedCopy(name);
+      if (!copy) {
+        copy = copyOf(original);
+        copy.removeAttribute("data-card");
+        // Shown only while opened on Runtime, whether or not its original is opened on its tab
+        // (`applyPinnedOpened`, below).
+        copy.setAttribute("data-pin", name);
+        copy.classList.remove("nofind");
+        var more = copy.querySelector(":scope > details.more");
+        if (more) { more.open = false; }
+      } else { morph(original, copy, true); }
+      // After the placeholder, in the order pinned.
+      if (holder.children[at + 1] !== copy) { holder.insertBefore(copy, holder.children[at + 1] || null); }
+    });
+    var said = widest ? widest + "ch" : "";
+    if (strip.style.columnWidth !== said) { strip.style.columnWidth = said; }
+    applyPinnedOpened();
+    el("pinned-pane").hidden = names.length === 0;
+  }
+  if (el("pinned")) {
+    el("pinned").addEventListener("click", function (e) {
+      var line = e.target.closest("#pinned > .line[data-open]");
+      if (line) { openPinned(line.getAttribute("data-open")); }
+    });
+  }
+  if (el("pinned-editing")) {
+    el("pinned-editing").addEventListener("click", function (e) {
+      var copy = pinOf(e.target);
+      if (!copy) { return; }
+      e.stopPropagation();
+      // Its own *more* opens in place; a tick toggles itself and its `input` is passed on.
+      if (e.target.closest("summary")) { return; }
+      var button = e.target.closest("button");
+      var twin = button && copy.contains(button) ? twinOf(copy, button) : null;
+      // Only a button's press is passed here, the copy brought up after it. A click on anything
+      // else -- a tick above all, which the browser toggles before this runs and before its
+      // `input` -- is left to the `input` and `change` handlers below: mirrored now, the copy's
+      // tick was set back to its box's old state before its `input` passed it on (the
+      // whole-build review's I3).
+      if (!twin) { return; }
+      twin.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, shiftKey: e.shiftKey,
+                                                   detail: e.detail }));
+      mirrorOne(copy.getAttribute("data-pin"), true);
+      mirrorPins();
+    }, true);
+    ["input", "change"].forEach(function (type) {
+      el("pinned-editing").addEventListener(type, function (e) {
+        var copy = pinOf(e.target);
+        if (!copy) { return; }
+        e.stopPropagation();
+        var twin = twinOf(copy, e.target);
+        if (!twin) { return; }
+        if (twin.type === "checkbox" || twin.type === "radio") { twin.checked = e.target.checked; }
+        else { twin.value = e.target.value; }
+        twin.dispatchEvent(new Event(type, { bubbles: true }));
+        mirrorOne(copy.getAttribute("data-pin"), true);
+        mirrorPins();
+      }, true);
+    });
+    el("pinned-editing").addEventListener("keydown", function (e) {
+      var copy = pinOf(e.target);
+      if (!copy || !e.target.matches("input")) { return; }
+      var twin = twinOf(copy, e.target);
+      if (!twin) { return; }
+      e.stopPropagation();
+      fieldKeys(e, twin, e.target);
+      mirrorOne(copy.getAttribute("data-pin"), true);
+      mirrorPins();
+    }, true);
+  }
+  // **The session's details behind *session*** (the console interface design's call: "the
+  // session's details behind a *session* button"; the layout review's finding 4: "closed on the
+  // settings tabs"): hidden on the Task parameters and Training tabs, shown on the others, where a
+  // run is started and a session opened and ended; the button shows or hides them on the tab shown
+  // until another tab is chosen.
+  function sessionShown() { return getComputedStyle(el("session")).display !== "none"; }
+  function showSession() {
+    el("session-btn").setAttribute("aria-expanded", sessionShown() ? "true" : "false");
+  }
+  el("session-btn").addEventListener("click", function () {
+    var shown = sessionShown();
+    body.classList.toggle("session-open", !shown);
+    body.classList.toggle("session-shut", shown);
+    showSession();
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('input[name="tab"]'), function (radio) {
+    radio.addEventListener("change", function () {
+      body.classList.remove("session-open", "session-shut");
+      showSession();
+    });
+  });
+  showSession();
+  // **The demo's keys and limits, folded** (the console interface design's call: "fold to one line
+  // ("keys and demo limits"), open on the first visit only"): open the first time this browser
+  // shows a demo screen, remembered under `wlx.demo-keys-seen` the guarded way, every access
+  // inside `try` -- a store that throws makes every visit a first, so the limits are never folded
+  // away from someone who may not have read them -- and folded on each visit after, one click
+  // opening it.
+  var DEMO_SEEN_KEY = "wlx.demo-keys-seen";
+  var demoFolded = false;
+  function foldDemoKeys() {
+    if (demoFolded || el("demo-pane").hidden) { return; }
+    demoFolded = true;
+    var seen = false;
+    try { seen = window.localStorage.getItem(DEMO_SEEN_KEY) === "1"; } catch (e) { seen = false; }
+    el("demo-fold").open = !seen;
+    try { window.localStorage.setItem(DEMO_SEEN_KEY, "1"); } catch (e) { /* every visit is a first */ }
   }
   function swap(id, html) {
-    if (id === "params" && busy()) { heldParams = html; return; }
+    if (id === "params" || id === "training-params") {
+      patchCards(id, html);
+      applySignIn();
+      return;
+    }
     if (id === "moments" && pressing()) { heldMoments = html; return; }
     // A frame shown is the newest: an older one held meanwhile must never be written back over
     // it by a later release (fix round 3 of the C3 plan's Task 18).
-    if (id === "params") { heldParams = null; }
     if (id === "moments") { heldMoments = null; }
     var node = el(id);
     // The plan picker shows the plan its pre-flight was taken for, so a frame's choice stands.
@@ -3538,17 +7489,29 @@ _SCRIPT = """
     if (id === "demo-tag") { demoFrame(); }
     if (id === "dn-demo" || id === "dn-subject") { restoreDemoBox(); }
   }
+  // A press ended: the frames held under it shown, the newest of each; and every box made current.
   function release() {
-    if (heldParams !== null && !busy()) {
-      el("params").innerHTML = heldParams;
-      heldParams = null;
-      applySignIn();
-    }
-    if (heldMoments !== null && !pressing()) {
+    if (pressing()) { return; }
+    Object.keys(heldCards).forEach(function (id) {
+      var html = heldCards[id];
+      delete heldCards[id];
+      patchCards(id, html);
+    });
+    if (heldMoments !== null) {
       el("moments").innerHTML = heldMoments;
       heldMoments = null;
-      applySignIn();
     }
+    settle();
+  }
+  // The boxes as the page was served: each as `served`, its refusal tracked, the run noted.
+  function startBoxes() {
+    Array.prototype.forEach.call(boxes(), function (box) {
+      served[nameOf(box)] = box.cloneNode(true);
+      track(box);
+    });
+    var summary = document.querySelector(inCards(".summary"));
+    runKey = summary ? summary.getAttribute("data-run") : null;
+    settle();
   }
   function choose(select, value) {
     // A frame re-renders a select's options; the option a person chose stays chosen
@@ -3671,6 +7634,7 @@ _SCRIPT = """
     demo.steerable = Boolean(tag && tag.hasAttribute("data-steerable"));
     el("replica-pane").hidden = demo.on;
     el("demo-pane").hidden = !demo.on;
+    foldDemoKeys();
     if (!demo.steerable) { letGo(false); }
     if (!demo.on) { closeFull(); }
     else if (demo.wantFull) { demo.wantFull = false; openFull(); }
@@ -4003,8 +7967,15 @@ _SCRIPT = """
   }
   function onFrame(event) {
     var payload = JSON.parse(event.data);
+    framesSeen += 1;
     Object.keys(payload.frags).forEach(function (id) { swap(id, payload.frags[id]); });
-    markRanges();
+    // A frame whose boxes are as the last drew them sends none (`wlx serve` sends what changed), and
+    // is still one of the frames an act waits on for the rig's word (`ANSWER_FRAMES`).
+    if (!("params" in payload.frags) && !("training-params" in payload.frags) && !pressing() &&
+        (Object.keys(out).length || Object.keys(withdrawing).length)) {
+      judge();
+      settle();
+    }
     live = payload.live;
     baseline = payload.age === null ? null : performance.now() - payload.age * 1000;
     lost = false;
@@ -4048,6 +8019,8 @@ _SCRIPT = """
   function tell(text, tone) {
     var line = el("sent");
     line.textContent = text;
+    // The bar's one line, cut short: its whole in the title, so the bar never grows under a press.
+    line.title = text;
     line.className = "sent " + (tone || "");
     // Task 6's deferred point: the control bar's line is behind the dialog's scrim.
     if (!el("dlg-new").hidden) { el("dn-msg").textContent = text; }
@@ -4098,31 +8071,19 @@ _SCRIPT = """
       }
       else if (answer.reason === "signed_out" || answer.reason === "other_rig" ||
                answer.reason === "not_accepted" || answer.reason === "no_token") { forget(); }
-      if (then) { then(answer); }
-    }).catch(function () {
+      return answer;
+    }, function () {
       tell(command.kind === "reward" ? REWARD_LOST : "not delivered: this page could not reach wlx serve", "crit");
-    }).then(done);
+      return null;
+    }).then(function (answer) {
+      // The answer's handler outside the catch (the whole-build review's M4): a fault in it is the
+      // page's, thrown to the console, never said as a command not delivered. `done` runs either way.
+      try {
+        if (answer && then) { then(answer); }
+      } finally { done(); }
+    }, function (fault) { done(); throw fault; });
   }
   function decimals(step) { return (String(step).split(".")[1] || "").length; }
-  function send(input) {
-    input.classList.remove("pending");
-    var key = input.getAttribute("data-param");
-    var raw = input.value.trim();
-    var word = input.getAttribute("data-kind") === "word";
-    var value = word ? raw : Number(raw);
-    if (!word && (raw === "" || !isFinite(value))) {
-      tell("not sent: " + key + " needs a number", "crit");
-    } else {
-      post({ kind: "set", name: key, value: value });
-    }
-    release();
-  }
-  function schedule(input) {
-    var key = input.getAttribute("data-param");
-    clearTimeout(timers[key]);
-    input.classList.add("pending");
-    timers[key] = setTimeout(function () { delete timers[key]; send(input); }, debounceMs);
-  }
   function stepInput(input, dir) {
     var step = Number(input.getAttribute("data-step")) || 0.01;
     var lo = input.hasAttribute("data-min") ? Number(input.getAttribute("data-min")) : -Infinity;
@@ -4137,56 +8098,10 @@ _SCRIPT = """
     if (v <= lo) { input.value = input.getAttribute("data-min"); }
     else if (v >= hi) { input.value = input.getAttribute("data-max"); }
     else { input.value = v.toFixed(decimals(step)); }
-    schedule(input);
-  }
-  // A drawn range changed live (engine build C3; the PI, 2026-10-30, Q7b, "Yes, range changes
-  // live"): the numbers of the card's editor a person changed, by name, which the rig lays over
-  // those in force. A number that is not one, or none changed, is not sent, said as a setting's
-  // is; once sent, a second press is held as a clear's is.
-  function sendRange(button, detail) {
-    var key = button.getAttribute("data-name");
-    var numbers = {};
-    var bad = null;
-    var fields = button.closest(".param").querySelectorAll("input[data-number]");
-    Array.prototype.forEach.call(fields, function (input) {
-      var raw = input.value.trim();
-      var value = Number(raw);
-      if (raw === "" || !isFinite(value)) { bad = bad || input.getAttribute("data-number"); }
-      else if (value !== Number(input.defaultValue)) {
-        numbers[input.getAttribute("data-number")] = value;
-      }
-    });
-    if (bad !== null) {
-      tell("not sent: " + key + "'s " + bad + " needs a number", "crit");
-      return;
-    }
-    if (!Object.keys(numbers).length) {
-      tell("not sent: no number of " + key + "'s range was changed", "crit");
-      return;
-    }
-    // A double click's second press, or a second within the hold, is dropped first, as a clear's
-    // is: it reached the refusal below and said "not sent" in red until the rig answered, though
-    // the range was sent (the C3 plan's Task 18, its deferred minor).
-    if (!clearAllowed(detail, "range/" + key)) { return; }
-    // The rig answers a range at its next trial boundary: while one is out, a second press of
-    // the same card would send the same range again (fix round 3).
-    if (rangeOut[key]) {
-      tell("not sent: the range of " + key + " is still being sent; wait for its answer", "crit");
-      return;
-    }
-    // The text of each field as it is sent: a number typed while the press is out is not.
-    var sentText = Array.prototype.map.call(fields, function (input) { return input.value; });
-    rangeOut[key] = true;
-    post({ kind: "range", name: key, numbers: numbers }, function (answer) {
-      // Sent -- and only then (fix round 2): the numbers sent no longer hold the cards, and any
-      // frame held meanwhile is shown. A press the rig did not take can be sent again.
-      if (answer.status !== "sent") { return; }
-      Array.prototype.forEach.call(fields, function (input, i) {
-        input.defaultValue = sentText[i];
-      });
-      markRanges();
-      release();
-    }, function () { delete rangeOut[key]; });
+    // A draft, never a send (the console interface design's call: "−/+ wait for Apply, as typing
+    // does"; Shift steps ten times as far, `dir` then ±10).
+    var box = input.closest(".box");
+    if (box) { refresh(box); showBar(); }
   }
   function closeNote(note) {
     if (markNo === null) { return; }
@@ -4445,12 +8360,61 @@ _SCRIPT = """
   }
   document.addEventListener("click", function (e) {
     if (!e.target.closest) { return; }
+    keepMore(e);
+    // A summary line opens its setting in the editor below (`openSetting`).
+    var opening = e.target.closest(inCards(".summary .line[data-open]"));
+    if (opening) { openSetting(opening.getAttribute("data-open")); return; }
+    var pinning = e.target.closest(inCards("[data-pin-toggle]"));
+    if (pinning) { togglePin(pinning.getAttribute("data-pin-toggle")); return; }
     var answering = e.target.closest("[data-answer]");
     if (answering && !answering.disabled) { answerWarning(answering); return; }
     var resuming = e.target.closest("[data-resume]");
     if (resuming && !resuming.disabled) { post({ kind: "resume_session", session_id: resuming.getAttribute("data-resume") }); return; }
     var returning = e.target.closest("[data-return]");
     if (returning && !returning.disabled) { openReturn(returning.getAttribute("data-return")); return; }
+    // A box's Apply, Discard and *withdraw*, and the drafts bar's (the console interface
+    // rework's Task 6).
+    var applying = e.target.closest("[data-apply]");
+    if (applying && !applying.disabled) { applyBox(applying.getAttribute("data-apply")); return; }
+    var discarding = e.target.closest("[data-discard]");
+    if (discarding && !discarding.disabled) { discard(discarding.getAttribute("data-discard")); return; }
+    var taking = e.target.closest("[data-withdraw]");
+    if (taking && !taking.disabled) { withdraw(taking.getAttribute("data-withdraw"), e.detail); return; }
+    if (e.target.closest("#drafts-apply")) { if (!el("drafts-apply").disabled) { applyAll(); } return; }
+    if (e.target.closest("#drafts-discard")) { if (!el("drafts-discard").disabled) { discardAll(); } return; }
+    var switched = e.target.closest("[data-switch]");
+    if (switched && !switched.disabled) {
+      // A timing card's side: a draft of its box, sent by its Apply.
+      var swung = switched.closest(".box");
+      showSide(swung, switched.getAttribute("data-switch"));
+      refresh(swung);
+      showBar();
+      return;
+    }
+    // A color's hue swatch: a draft of its box, the swatch pressed, sent by its Apply (the
+    // console interface design's call: "a swatch or a tick is a draft").
+    var hue = e.target.closest(inCards(".box .hue[data-color]"));
+    if (hue && !hue.disabled) {
+      var colored = hue.closest(".box");
+      Array.prototype.forEach.call(colored.querySelectorAll(".hue[data-color]"), function (other) {
+        var on = other === hue;
+        other.classList.toggle("on", on);
+        other.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      refresh(colored);
+      showBar();
+      return;
+    }
+    // A choice among a setting's segments: a draft of its box, as a swatch is, sent by its Apply as
+    // a `choice` by its words (the pop-out revision's Task 5b).
+    var chosen = e.target.closest(inCards(".box .ch[data-choice]"));
+    if (chosen && !chosen.disabled) {
+      pressChoice(chosen.closest("[data-choices]"), chosen.getAttribute("data-choice"));
+      var picked = chosen.closest(".box");
+      refresh(picked);
+      showBar();
+      return;
+    }
     var button = e.target.closest("[data-cmd]");
     if (button && !button.disabled) {
       var cmd = button.getAttribute("data-cmd");
@@ -4480,16 +8444,34 @@ _SCRIPT = """
                on: button.getAttribute("data-on") === "1" });
         return;
       }
+      // The console settings build's Task 10 (the design's §8): the training switch's position.
+      if (cmd === "shaping") {
+        post({ kind: "shaping", position: button.getAttribute("data-position") });
+        return;
+      }
       // Engine build C3 (the PI, 2026-10-30, Q7a and Q7b; TSK-43): a setting handed back, a drawn
       // range changed live, and the run taken back to a moment, each naming what it is for; a
       // double click is one act, as a clear's is.
       if (cmd === "hand_back") {
         var named = button.getAttribute("data-name");
         if (!clearAllowed(e.detail, "hand_back/" + named)) { return; }
-        post({ kind: "hand_back", name: named });
+        // At once, a deliberate press (the console interface design's call), under a command id
+        // of its own, so its box says the hand-back waiting is this page's and offers *withdraw*.
+        post({ kind: "hand_back", name: named, cid: nextCid() });
         return;
       }
-      if (cmd === "range") { sendRange(button, e.detail); return; }
+      // A new color (the console settings build's Task 8): *preview* asks wlx serve and writes
+      // nothing; *save as a proposal* sends it to the rig, which writes the set's proposed file. A
+      // double click is one save, as a clear's is.
+      if (cmd === "preview_color") { previewColor(button); return; }
+      if (cmd === "define_color") {
+        var panel = button.closest("[data-newc]");
+        var defined = newColorCommand(panel);
+        if (!defined || !clearAllowed(e.detail, "define_color/" + panel.getAttribute("data-newc"))) { return; }
+        defined.kind = "define_color";
+        post(defined);
+        return;
+      }
       // The trainer's panel (the pop-out search build's Task 7): *Move up* or *Move back* confirms
       // the rig's suggestion, naming it, and *Hold* declines it, the whole prompt; *lock at* holds
       // the staircase's setting at its level, as a person's value does; *add* widens the pool by
@@ -4530,12 +8512,28 @@ _SCRIPT = """
     var arrow = e.target.closest("[data-dir]");
     if (arrow && !arrow.disabled) {
       var input = arrow.closest(".spin").querySelector("input[data-param]");
-      if (input && !input.disabled) { stepInput(input, Number(arrow.getAttribute("data-dir"))); }
+      if (input && !input.disabled) {
+        stepInput(input, Number(arrow.getAttribute("data-dir")) * (e.shiftKey ? 10 : 1));
+      }
     }
   });
   document.addEventListener("change", function (e) {
     if (!e.target.matches) { return; }
-    if (e.target.matches("input[data-param]")) { schedule(e.target); }
+    if (e.target.matches("select[data-shape]")) {
+      var shaped = e.target.closest(".box");
+      showShape(shaped, e.target.value);
+      refresh(shaped);
+      showBar();
+    }
+    else if (e.target.matches("select[data-colorset]")) {
+      colorSets[e.target.getAttribute("data-colorset")] = e.target.value;
+      showHues(e.target, e.target.value);
+    }
+    else if (e.target.closest("[data-newc]")) {
+      var changed = e.target.closest("[data-newc]");
+      newColorShow(changed);
+      newColorRead(changed);
+    }
     else if (e.target.matches("input[data-ack]")) { acked[e.target.getAttribute("data-ack")] = e.target.checked; }
     else if (e.target.id === "start-block") {
       picked.block = e.target.value;
@@ -4570,17 +8568,24 @@ _SCRIPT = """
   });
   document.addEventListener("focusout", function () { setTimeout(release, 0); });
   document.addEventListener("input", function (e) {
-    if (e.target && e.target.matches && e.target.matches("#params input[data-number]")) {
-      markRanges();
-      release();
-    }
+    // An edit in a box is a draft of it, judged as it is typed (the controls review's §2).
+    var edited = e.target && e.target.closest && !e.target.closest("[data-newc]") &&
+      e.target.closest(inCards(".box"));
+    if (edited) { refresh(edited); showBar(); }
+    // What is typed in a New color panel is kept, so a frame replacing the cards keeps it.
+    var typing = e.target && e.target.closest && e.target.closest("[data-newc]");
+    if (typing) { newColorShow(typing); newColorRead(typing); }
   });
+  // A New color panel opened or closed stays so across frames (`toggle` does not bubble).
+  document.addEventListener("toggle", function (e) {
+    if (e.target && e.target.matches && e.target.matches("[data-newc]")) { newColorRead(e.target); }
+  }, true);
   // The primary button only; the hold ends with the press -- its pointer going up, cancelled,
   // a context menu or a drag taking it over, the window losing focus -- or, a release the page
   // never sees, when the ten seconds are up, when the held frame is shown (fix round 3).
   document.addEventListener("pointerdown", function (e) {
     if (e.button === 0 && e.target && e.target.closest &&
-        e.target.closest("#params, #moments")) {
+        e.target.closest("#params, #training-params, #moments, #pinned-params")) {
       pressedAt = performance.now();
       setTimeout(release, PRESS_MS + 50);
     }
@@ -4609,6 +8614,141 @@ _SCRIPT = """
     }
     else if (k === "b" && keysLive()) { e.preventDefault(); gaze.b = true; placeDot(); changed(); }
     else if (k === "f" && demo.on) { e.preventDefault(); openFull(); }
+  });
+  // **The keys in a box's field** (the controls review's F7): Enter is Apply; Esc is Discard, and
+  // a second Esc, with no draft, leaves the field; ↑ and ↓ step it, Shift ten steps; and a whole
+  // setting's field takes no decimal point or comma (the console interface design's goal 6).
+  // `field` is the box's own field the keys act on; `typed`, the one typed in -- the same, or its
+  // pinned copy's (`pinKeys`), which keeps the focus.
+  // **A refused point's fraction** (the whole-build review's I5), by setting: after a `.` or `,`
+  // refused in a whole field, each digit after it is refused too -- "12.5" stays "12", never
+  // "125" -- and the box's draft cannot be sent while it stands (`draftOf`), saying *whole numbers
+  // only*. Any other key in the field, or the field left, ends it.
+  var fractions = {};
+  function fieldKeys(e, field, typed) {
+    var box = field.closest(".box");
+    var name = nameOf(box);
+    var plain = !e.metaKey && !e.ctrlKey && !e.altKey;
+    if (fractions[name]) {
+      if (plain && e.key.length === 1 && e.key >= "0" && e.key <= "9") {
+        e.preventDefault();
+        noted(box, WHOLE);
+        refresh(box);
+        return;
+      }
+      if (e.key !== "Enter" && e.key !== "Shift" && e.key !== "." && e.key !== ",") {
+        delete fractions[name];
+        refresh(box);
+      }
+    }
+    if (e.key === "Enter") { e.preventDefault(); applyBox(name); }
+    else if (e.key === "Escape") {
+      e.preventDefault();
+      var waited = out[name] && out[name].phase === "sending" && answeredLong(out[name]);
+      if (drafts[name] || waited) { discard(name, typed === field ? field : null); }
+      else {
+        typed.blur();
+        // A second Esc returns to the setting's summary line, a pinned copy's to its pinned line.
+        leftFrom = name;
+      }
+    }
+    else if ((e.key === "ArrowUp" || e.key === "ArrowDown") && field.hasAttribute("data-step")) {
+      e.preventDefault();
+      stepInput(field, (e.key === "ArrowUp" ? 1 : -1) * (e.shiftKey ? 10 : 1));
+    }
+    else if (field.hasAttribute("data-whole") && (e.key === "." || e.key === ",") && plain) {
+      e.preventDefault();
+      fractions[name] = true;
+      noted(box, WHOLE);
+      refresh(box);
+    }
+  }
+  document.addEventListener("focusout", function (e) {
+    var copy = pinOf(e.target);
+    // A pinned copy's field ends its box's fraction as the box's own does (the re-review's M-a).
+    var box = copy ? cardOf(copy.getAttribute("data-pin"))
+      : e.target && e.target.closest ? e.target.closest(".box") : null;
+    if (box && fractions[nameOf(box)]) {
+      delete fractions[nameOf(box)];
+      refresh(box);
+    }
+  });
+  document.addEventListener("keydown", function (e) {
+    var field = e.target;
+    if (!field || !field.matches || !field.matches(inCards(".box input")) || field.closest("[data-newc]")) {
+      return;
+    }
+    fieldKeys(e, field, field);
+  });
+  // **The summary at the keyboard** (the summary and editor design's goal 7): on a line, ↑ and ↓
+  // move to the line before or after it in the summary's order, past the lines the find box dims;
+  // Enter opens its setting and puts the editor's first field in focus (`firstField`). Esc in a
+  // field with no draft leaves the field (`fieldKeys`), and a second Esc returns to its line (the
+  // design's call), `leftFrom` the setting it left.
+  var leftFrom = null;
+  // **Esc in a box's `<select>`** (a drawn setting's shape; the pop-out revision's whole-build
+  // review, M3): it leaves the select, and a second Esc returns to the setting's line, as from a
+  // field (`fieldKeys`).
+  document.addEventListener("keydown", function (e) {
+    var field = e.target;
+    if (e.key !== "Escape" || !field || !field.matches || !field.matches(inCards(".box select"))) {
+      return;
+    }
+    e.preventDefault();
+    field.blur();
+    leftFrom = nameOf(field.closest(".box"));
+  });
+  function firstField(root) {
+    var editor = root.querySelector(":scope > .editing");
+    var shown = editor ? Array.prototype.filter.call(editor.children, function (child) {
+      return !child.hidden && !child.classList.contains("placeholder");
+    })[0] : null;
+    if (!shown) { return null; }
+    return Array.prototype.filter.call(shown.querySelectorAll("input, select, textarea"), function (one) {
+      return !one.disabled && one.type !== "hidden" && one.getClientRects().length > 0;
+    })[0] || null;
+  }
+  document.addEventListener("keydown", function (e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) { return; }
+    var line = e.target && e.target.closest ?
+      e.target.closest(inCards(".summary .line[data-open]") + ", #pinned > .line[data-open]") : null;
+    if (line && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      var summary = line.closest(".summary");
+      var lines = Array.prototype.filter.call(summary.querySelectorAll(".line[data-open]"), function (one) {
+        return one === line || !one.classList.contains("nofind");
+      });
+      var next = lines[lines.indexOf(line) + (e.key === "ArrowDown" ? 1 : -1)];
+      if (next) { next.focus(); }
+      return;
+    }
+    if (line && e.key === "Enter") {
+      e.preventDefault();
+      var name = line.getAttribute("data-open");
+      var pinned = line.parentNode === el("pinned");
+      if (pinned) { openPinned(name); } else { openSetting(name); }
+      var into = firstField(pinned ? el("pinned-params") : line.closest(CARDS.join(", ")));
+      if (into) { into.focus(); }
+      return;
+    }
+    // The second Esc, its target the page itself: the first, whose target was the field, has
+    // just left it (`fieldKeys`) and comes here too.
+    if (e.key === "Escape" && leftFrom !== null &&
+        (e.target === document.body || e.target === document.documentElement)) {
+      // Its line on the tab shown: Runtime's pinned line, or its own tab's.
+      var back = [pinnedLine(leftFrom)].concat(Array.prototype.slice.call(linesOf(leftFrom))).filter(
+        function (one) { return one && one.getClientRects().length; })[0];
+      leftFrom = null;
+      if (back && back.getClientRects().length) { e.preventDefault(); back.focus(); }
+    }
+  });
+  // **Closing the page with drafts asks once** (the console interface design's call): the
+  // browser's own question; nothing else keeps a draft past a reload.
+  window.addEventListener("beforeunload", function (e) {
+    if (!Object.keys(drafts).length) { return undefined; }
+    e.preventDefault();
+    e.returnValue = "";
+    return "";
   });
   el("mark-note").addEventListener("keydown", function (e) {
     if (e.key === "Enter") { e.preventDefault(); closeNote(el("mark-note").value.trim()); }
@@ -4716,6 +8856,7 @@ _SCRIPT = """
   }
   showName();
   demoFrame();
+  startBoxes();
   open();
 })();
 """
@@ -4765,13 +8906,22 @@ def page(
     demo's gaze endpoint, without which no page steers here (`data-can-gaze`); a page that may not
     write steers nothing and draws no dot. `GAZE_EVERY_MS` goes to the script as
     `data-gaze-every-ms`.
+    **Drafts (the console interface rework's Task 6)**: the bar the script shows while any box
+    holds an edit not sent, "N edits not sent: ... · Discard all · Apply all", is static, fixed at
+    the foot of the window so its coming and going moves nothing under the pointer; Apply all
+    sends at most `APPLY_ALL_LIMIT` changes as one act (`data-apply-all-limit`).
     """
     p = {key: parts[key] for key in FRAGMENT_IDS}
     demo = bool(p["demo-tag"])
+    # **Who the controls act as** (the console interface rework's Task 8): what can be done about
+    # it stands in the bar -- read-only, with *sign in* where there is one -- and who is signed in,
+    # or the box's name, with the session's details behind *session* (`who_session`).
+    who_session = ""
     if can_write:
         off = ""
         attrs = ""
-        who = (
+        who = ""
+        who_session = (
             '<span class="who">name <b id="who">not given yet</b> <button class="btn small" '
             'id="rename" type="button">change</button></span>'
         )
@@ -4793,9 +8943,11 @@ def page(
         else:
             who = (
                 '<span class="who" id="mode"><span class="so">read-only · <button class="btn small '
-                'primary" id="signin" type="button">sign in with wl.works</button></span><span '
-                'class="si">controls act as <b id="member"></b> · <button class="btn small" '
-                'id="signout" type="button">not you? sign out</button></span></span>'
+                'primary" id="signin" type="button">sign in with wl.works</button></span></span>'
+            )
+            who_session = (
+                '<span class="who"><span class="si">controls act as <b id="member"></b> · <button '
+                'class="btn small" id="signout" type="button">not you? sign out</button></span></span>'
             )
     else:
         why = CONTROLS_ELSEWHERE if https_page else CONTROLS_AT_THE_BOX
@@ -4825,54 +8977,65 @@ def page(
 <title>xcon console</title>
 <style>{_FONT_FACES}{_CSS}</style>
 </head>
-<body data-stale-after="{stale_after_s:g}" data-can-write="{int(can_write)}" data-debounce-ms="{DEBOUNCE_MS}" data-can-gaze="{int(can_gaze)}" data-gaze-every-ms="{GAZE_EVERY_MS}"{attrs}>
+<body data-stale-after="{stale_after_s:g}" data-can-write="{int(can_write)}" data-apply-all-limit="{APPLY_ALL_LIMIT}" data-can-gaze="{int(can_gaze)}" data-gaze-every-ms="{GAZE_EVERY_MS}"{attrs}>
 <div class="wrap">
-  <header class="head glass">
-    <span class="logo">{_LOGO}<span class="app">xcon</span></span>
-    <span id="demo-tag">{p['demo-tag']}</span>
-    <span id="state">{p['state']}</span>
-    <div class="id" id="head-id">{p['head-id']}</div>
-    <span class="spacer"></span>
-    <span class="presence" id="presence">{p['presence']}</span>
-    <button class="xbtn" id="close" type="button" aria-label="close this page's stream" title="close this page's stream · the session keeps running on the box"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+  <header class="topbar glass" id="bar" aria-label="the run">
+    <div class="barline">
+      <span class="logo">{_LOGO}<span class="app">xcon</span></span>
+      <span id="demo-tag">{p['demo-tag']}</span>
+      <span id="state">{p['state']}</span>
+      <span class="nums" id="bar-nums">{p['bar-nums']}</span>
+      <div class="ctlrow" id="controls">{p['controls']}</div>
+      {who}
+      <span class="sent" id="sent" role="status"></span>
+      <button class="btn small" id="session-btn" type="button" aria-controls="session" aria-expanded="false" title="{_e(SESSION_SAID)}">session ▾</button>
+      <button class="xbtn" id="close" type="button" aria-label="close this page's stream" title="close this page's stream · the session keeps running on the box"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+    </div>
+    <div class="banner" id="stream" role="status" hidden></div>
+    <div class="inline crit" id="stop-confirm" role="alertdialog" aria-label="confirm stop" hidden><span>stop at a trial boundary, after any commands already sent?</span><button class="btn danger" id="stop-yes" type="button">stop</button><button class="btn" id="stop-no" type="button">cancel</button></div>
+    <div class="inline info" id="mark-form" role="dialog" aria-label="mark note" hidden><span>mark sent · note</span><input id="mark-note" maxlength="500" autocomplete="off" placeholder="Enter attaches it · Esc leaves the mark bare" aria-label="mark note"></div>
   </header>
-  <div class="strip glass" role="region" aria-label="animal" id="strip">{p['strip']}</div>
-  <div class="banner" id="stream" role="status" hidden></div>{off_line}
+  <section class="session" id="session" aria-label="the session">
+    <div class="head glass">
+      <div class="id" id="head-id">{p['head-id']}</div>
+      <span class="spacer"></span>
+      {who_session}
+      <span class="presence" id="presence">{p['presence']}</span>
+    </div>
+    <div class="strip glass" role="region" aria-label="animal" id="strip">{p['strip']}</div>
+    <div class="controlbar glass" aria-label="the next run">
+      <label class="tsel" for="task-sel"><span class="k">Task</span><select id="task-sel" aria-label="task"{off}>{p['task-sel']}</select></label>
+      <label class="tsel" for="plan-sel"><span class="k">Plan</span><select id="plan-sel" aria-label="plan"{off}>{p['plan-sel']}</select></label>
+      <label class="tsel" for="run-trials"><span class="k">Trials</span><input class="field mono" id="run-trials" value="{RUN_TRIALS}" inputmode="numeric" autocomplete="off" aria-label="trials"{off}></label>
+      <span id="pf-pill">{p['pf-pill']}</span>
+      <span class="spacer"></span>
+      <div class="inline" id="sched-form"><span>scheduled stop</span><select id="sched-kind" aria-label="stop when"{off}><option value="clock">at HH:MM</option><option value="trials">after N more presentations, drummed tries included</option><option value="fluid">after mL this session</option></select><input id="sched-value" autocomplete="off" aria-label="stop at"{off}><button class="btn small" id="sched-set" type="button"{off}>set</button></div>
+    </div>
+  </section>{off_line}
   <div class="banners" id="banners">{p['banners']}</div>
   <div class="inline info" id="amend-form" role="dialog" aria-label="amend the departure" hidden><span>amend the departure · the corrected time</span><input id="amend-to" autocomplete="off" placeholder="HH:MM, or 2027-01-13T22:40" aria-label="the corrected departure"{off}><span>why</span><input id="amend-why" maxlength="500" autocomplete="off" aria-label="why it is amended"{off}><span class="nm">your name is recorded with it</span><button class="btn small primary" id="amend-yes" type="button"{off}>send amendment</button><button class="btn small" id="amend-no" type="button">cancel</button></div>
-  <section class="controlbar glass" aria-label="controls">
-    <label class="tsel" for="task-sel"><span class="k">Task</span><select id="task-sel" aria-label="task"{off}>{p['task-sel']}</select></label>
-    <label class="tsel" for="plan-sel"><span class="k">Plan</span><select id="plan-sel" aria-label="plan"{off}>{p['plan-sel']}</select></label>
-    <label class="tsel" for="run-trials"><span class="k">Trials</span><input class="field mono" id="run-trials" value="{RUN_TRIALS}" inputmode="numeric" autocomplete="off" aria-label="trials"{off}></label>
-    <span id="pf-pill">{p['pf-pill']}</span>
-    <span class="sep" aria-hidden="true"></span>
-    <div class="ctlrow" id="controls">{p['controls']}</div>
-    <span class="spacer"></span>
-    {who}
-    <span class="sent" id="sent" role="status"></span>
-  </section>
-  <div class="inline crit" id="stop-confirm" role="alertdialog" aria-label="confirm stop" hidden><span>stop at a trial boundary, after any commands already sent?</span><button class="btn danger" id="stop-yes" type="button">stop</button><button class="btn" id="stop-no" type="button">cancel</button></div>
-  <div class="inline info" id="mark-form" role="dialog" aria-label="mark note" hidden><span>mark sent · note</span><input id="mark-note" maxlength="500" autocomplete="off" placeholder="Enter attaches it · Esc leaves the mark bare" aria-label="mark note"></div>
-  <div class="inline" id="sched-form"><span>scheduled stop</span><select id="sched-kind" aria-label="stop when"{off}><option value="clock">at HH:MM</option><option value="trials">after N more presentations, drummed tries included</option><option value="fluid">after mL this session</option></select><input id="sched-value" autocomplete="off" aria-label="stop at"{off}><button class="btn small" id="sched-set" type="button"{off}>set</button></div>
   <div class="shell">
     <div class="main">
       <input type="radio" name="tab" id="t-runtime" checked>
       <input type="radio" name="tab" id="t-task">
+      <input type="radio" name="tab" id="t-training">
       <input type="radio" name="tab" id="t-setup">
       <input type="radio" name="tab" id="t-warn">
       <input type="radio" name="tab" id="t-end">
       <div class="tabs" aria-label="console sections">
         <label class="tab" for="t-runtime">Runtime</label>
         <label class="tab" for="t-task">Task parameters</label>
+        <label class="tab" for="t-training">Training</label>
         <label class="tab" for="t-setup">Setup</label>
         <label class="tab" for="t-warn">Warnings</label>
         <label class="tab" for="t-end">End of session</label>
       </div>
       <div class="panels">
         <div class="tabpanel" id="tp-runtime">
+          <section class="panel glass pins" id="pinned-pane" aria-label="pinned settings" hidden><div class="top"><h2>Pinned</h2><span class="sub">{_e(PINNED_SAID)}</span></div><div class="params" id="pinned-params"><div class="summary" id="pinned"></div><div class="editing" id="pinned-editing"><div class="placeholder">{_e(PINNED_EMPTY)}</div></div></div></section>
           <section class="panel glass"><div class="top"><h2>Trials</h2></div><div id="rt-trials">{p['rt-trials']}</div></section>
           <section class="panel glass"><div class="top"><h2>This run</h2></div><div id="rt-work">{p['rt-work']}</div></section>
-          <section class="panel glass train" id="rt-train" aria-label="training">{p['rt-train']}</section>
+          <div class="panel glass" id="rt-shaping">{p['rt-shaping']}</div>
           <div class="cols c3">
             <div class="stack">
               <section class="panel glass"><div class="top"><h2>Still needed</h2></div><div id="rt-need">{p['rt-need']}</div></section>
@@ -4882,10 +9045,15 @@ def page(
             <div class="stack"><section class="panel glass"><div class="top"><h2>Changes</h2></div><div class="feed" id="rt-changes">{p['rt-changes']}</div></section></div>
           </div>
         </div>
-        <div class="tabpanel" id="tp-task"><section class="panel glass"><div class="top"><h2>Task parameters</h2><span class="sub">staged until the next trial</span></div><div class="params" id="params">{p['params']}</div></section>
+        <div class="tabpanel" id="tp-task"><section class="panel glass"><div class="top tools"><input type="search" class="field find" id="pfind" placeholder="{_e(FIND_SAID)}" aria-label="{_e(FIND_SAID)}"><span class="nomatch" id="pfind-none" role="status" hidden>{_e(NO_MATCH)}</span><span class="sub">each box sends nothing until its Apply · staged until the next trial</span></div><div class="params" id="params">{p['params']}</div></section>
           <section class="panel glass"><div class="top"><h2>Moments of this run</h2>
             <span class="sub">a revert takes the task's settings and drawn ranges back to one</span>
             </div><div id="moments">{p['moments']}</div></section></div>
+        <div class="tabpanel" id="tp-training">
+          <section class="panel glass"><div class="top"><h2>Training</h2><span class="sub">on, frozen or the full task, staged until the next trial</span></div><div id="shaping">{p['shaping']}</div></section>
+          <section class="panel glass train" id="rt-train" aria-label="training">{p['rt-train']}</section>
+          <section class="panel glass"><div class="top tools"><h2>Training settings</h2><input type="search" class="field find" id="tfind" placeholder="{_e(FIND_SAID)}" aria-label="{_e(FIND_SAID)}"><span class="nomatch" id="tfind-none" role="status" hidden>{_e(NO_MATCH)}</span><span class="sub">staged until the next trial</span></div><div class="params" id="training-params">{p['training-params']}</div></section>
+        </div>
         <div class="tabpanel" id="tp-setup">
           <section class="panel glass" id="pf-panel"><div class="top"><h2>Pre-flight</h2><span id="pf-sum">{p['pf-sum']}</span></div><div id="preflight">{p['preflight']}</div></section>
           <section class="panel glass"><div class="top"><h2>Session</h2></div><div id="setup">{p['setup']}</div></section>
@@ -4907,7 +9075,7 @@ def page(
           <span class="demo-dot" id="demo-dot" hidden></span>
         </div>
         <div class="demo-bar"><span id="demo-under">{p['demo-under']}</span><span class="sent" id="demo-steer" role="status"></span><span class="sub demo-esc">Esc closes the full window</span></div>
-        {steers}<div class="demo-keys" id="demo-keys">{demo_keys(())}</div>
+        {steers}<details class="demo-fold" id="demo-fold"><summary>{_e(DEMO_FOLD_SAID)}</summary><div class="demo-keys" id="demo-keys">{demo_keys(())}</div></details>
       </section>
       <section class="panel glass"><div class="top"><h2>Subject display</h2></div><div class="screen">subject display · no source yet</div></section>
       <div class="duo">
@@ -4935,6 +9103,7 @@ def page(
     <div class="end"><button class="btn" id="dn-cancel" type="button">cancel</button><button class="btn primary" id="dn-ok" type="button"{off}>open session</button></div>
   </div>
 </div>
+<div class="drafts glass" id="drafts" role="status" aria-label="edits not sent" hidden><span class="say" id="drafts-say"></span><button class="btn small" id="drafts-discard" type="button">Discard all</button><button class="btn small primary" id="drafts-apply" type="button">Apply all</button></div>
 <div class="scrim" id="gone" role="dialog" aria-modal="true" aria-labelledby="gone-h" hidden>
   <div class="dialog glass">
     <h2 id="gone-h">Disconnected</h2>
