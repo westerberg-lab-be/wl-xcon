@@ -1933,7 +1933,14 @@ def test_every_suite_run_of_a_selected_mutant_carries_the_progress_file_and_the_
 def test_a_65_kb_id_reaches_the_plugin_by_file_not_argv(monkeypatch, tmp_path):
     """Review Focus 2. XC-331's bytes parameter made a 65,537-character id; selected
     for a mutant, it goes to the plugin in the select file, is collected and run, and
-    no argument pytest is given carries it."""
+    no argument pytest is given carries it.
+
+    The id is given with `ids=`, not left to pytest: from pytest 9.2.0 an auto-generated
+    id for a str or bytes value over 100 characters is the argument's name and index
+    (`blob0`), under the `parametrize_long_str_id_strategy` ini option, default `short`
+    (`_pytest/python.py`, `_apply_long_str_strategy`, read in 9.2.0 on 2026-11-24;
+    9.0.2 through 9.1.1 keep the value). An explicit id is kept whole in 9.2.0, so the
+    65 KB id this test needs exists on every pytest it runs under."""
     toy = _toy_selected(
         monkeypatch,
         tmp_path,
@@ -1941,7 +1948,7 @@ def test_a_65_kb_id_reaches_the_plugin_by_file_not_argv(monkeypatch, tmp_path):
             "test_big.py": (
                 "import pytest\n"
                 "from toy_target import covered\n"
-                f"@pytest.mark.parametrize('blob', ['x' * {65537}])\n"
+                f"@pytest.mark.parametrize('blob', [None], ids=['x' * {65537}])\n"
                 "def test_big(blob):\n"
                 "    assert covered() == [1]\n"
             )
@@ -1964,7 +1971,9 @@ def test_a_65_kb_id_reaches_the_plugin_by_file_not_argv(monkeypatch, tmp_path):
     caught, text = mutate_tool.mutate(toy.target, "covered", "[]", limit=60, of=1, selection=(big,))
 
     picked = toy.runs[0]
-    assert picked.selected == 1 and picked.ran == (big,), (picked.selected, len(picked.ran))
+    assert picked.selected == 1 and picked.ran == (big,), (
+        picked.wanted, picked.selected, len(picked.ran), picked.summary
+    )
     assert caught is True, text[:400]
     assert len(text) < 1024
     assert len(argv) == 2, argv
@@ -2160,7 +2169,8 @@ def test_main_gives_each_selected_run_its_tests_share_and_each_full_run_the_whol
 #: Two leaks, each the other's mirror, neither reaching `covered`: `test_needs` passes
 #: only after `test_sets` (it fails selected alone), and `test_clean` fails only after
 #: `test_spoils` (it passes selected alone). The third is the first with XC-331's 65 KB
-#: parameter on it.
+#: id on it, given with `ids=` because pytest 9.2.0 shortens an auto-generated one (see
+#: `test_a_65_kb_id_reaches_the_plugin_by_file_not_argv`).
 _BIG = "x" * 65537
 _LEAKS = {
     "failed-alone-passed-in-order": {"state.py": _ORDER_STATE, "test_order.py": _ORDER_TESTS},
@@ -2181,7 +2191,7 @@ _LEAKS = {
             "import state\n"
             "def test_sets():\n"
             "    state.READY = True\n"
-            f"@pytest.mark.parametrize('blob', ['x' * {len(_BIG)}])\n"
+            f"@pytest.mark.parametrize('blob', [None], ids=['x' * {len(_BIG)}])\n"
             "def test_needs(blob):\n"
             "    assert state.READY\n"
         ),
