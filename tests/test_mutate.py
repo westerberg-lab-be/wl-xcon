@@ -21,6 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 
@@ -30,6 +31,8 @@ _SPEC = importlib.util.spec_from_file_location(
 mutate_tool = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(mutate_tool)
 _already_inert = mutate_tool._already_inert
+#: Taken before any test replaces it, for `_wrap_suite`, whose `ROOT` is a toy.
+_CLEAR_PYCACHE = mutate_tool._clear_pycache
 
 
 # ---------------------------------------------------------------------------
@@ -798,7 +801,8 @@ def test_a_progress_line_cut_short_by_the_kill_is_dropped_and_only_that_one():
     seen = mutate_tool._read_progress(whole + '{"event": "fin', now=131.0)
 
     assert seen == mutate_tool.Progress(
-        failures=["FAILED t.py::a"], started=2, finished=1, running="t.py::b", running_for=30.0
+        failures=["FAILED t.py::a"], started=2, finished=1, running="t.py::b", running_for=30.0,
+        ran=("t.py::a", "t.py::b"),
     )
     with pytest.raises(json.JSONDecodeError):
         mutate_tool._read_progress('{"event": "fin\n' + whole, now=131.0)
@@ -1155,3 +1159,1244 @@ def test_a_mutant_failing_only_at_collection_is_caught_naming_at_most_three_file
     assert summary.startswith("3 errors in "), summary
     assert summary.endswith("  <- test_uses_1.py, test_uses_2.py, test_uses_3.py"), summary
     assert target.read_text() == _UNMUTATED
+
+
+# ---------------------------------------------------------------------------
+# The map (CI-time design §4.1, approved by the PI 2026-11-21): one run of the
+# suite under coverage, each test's lines filed under its node id, so a mutant
+# can run the tests that reach it first. Driven end to end on a toy tree that
+# mirrors the repository's layout (`wl_xcon/`, `tests/`; Call 10), so the shipped
+# rcfile and `tree_hash` run unchanged. Never against this repository.
+# ---------------------------------------------------------------------------
+
+_TOY_MODULE = (
+    "def reached():\n"
+    "    return 1\n"
+    "\n"
+    "\n"
+    "def at_import():\n"
+    "    return 2\n"
+    "\n"
+    "\n"
+    "AT_IMPORT = at_import()\n"
+    "\n"
+    "\n"
+    "def never_called():\n"
+    "    return 3\n"
+    "\n"
+    "\n"
+    "def in_child():\n"
+    "    return 4\n"
+    "\n"
+    "\n"
+    "def in_child_stripped():\n"
+    "    return 5\n"
+)
+
+_TOY_TESTS = (
+    "import os\n"
+    "import subprocess\n"
+    "import sys\n"
+    "\n"
+    "import pytest\n"
+    "\n"
+    "import wl_xcon.toy as toy\n"
+    "\n"
+    "\n"
+    "@pytest.mark.parametrize('n', [1, 2])\n"
+    "def test_reached(n):\n"
+    "    assert toy.reached() == 1\n"
+)
+
+#: The in-process toy, and two tests that each start a child Python: one inheriting the
+#: environment, one replacing it. The child imports `wl_xcon.toy`, so under it
+#: `at_import` really does run inside a test: these are kept out of the in-process toy.
+_TOY_CHILD_TESTS = _TOY_TESTS + (
+    "\n"
+    "\n"
+    "def test_child():\n"
+    "    subprocess.run(\n"
+    "        [sys.executable, '-c', 'import wl_xcon.toy as t; t.in_child()'], check=True\n"
+    "    )\n"
+    "\n"
+    "\n"
+    "def test_child_stripped():\n"
+    "    subprocess.run(\n"
+    "        [sys.executable, '-c', 'import wl_xcon.toy as t; t.in_child_stripped()'],\n"
+    "        check=True,\n"
+    "        env={'PATH': os.environ['PATH']},\n"
+    "    )\n"
+)
+
+_TOY_IDS = ("tests/test_toy.py::test_reached[1]", "tests/test_toy.py::test_reached[2]")
+
+
+def _toy_tree(tmp_path, tests_source=_TOY_TESTS) -> Path:
+    """A tree shaped like this repository: `wl_xcon/toy.py` and `tests/test_toy.py`."""
+    tree = tmp_path / "tree"
+    (tree / "wl_xcon").mkdir(parents=True)
+    (tree / "tests").mkdir()
+    (tree / "wl_xcon" / "__init__.py").write_text("")
+    (tree / "wl_xcon" / "toy.py").write_text(_TOY_MODULE)
+    (tree / "tests" / "test_toy.py").write_text(tests_source)
+    return tree
+
+
+@pytest.fixture
+def map_env(monkeypatch):
+    """What every map test needs: coverage importable (skipped without it only off CI;
+    in CI it must run), plugin autoload off so the toy's pytest starts fast, and the
+    pycache sweep kept off the real tree while this suite runs it."""
+    if importlib.util.find_spec("coverage") is None and not os.environ.get("CI"):
+        pytest.skip('coverage is not installed: pip install "coverage>=7.10"')
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.setattr(mutate_tool, "_clear_pycache", lambda: None)
+
+
+def _plugin():
+    spec = importlib.util.spec_from_file_location(
+        "wlx_suite_progress_for_test",
+        mutate_tool.PROGRESS_PLUGIN_DIR / f"{mutate_tool.PROGRESS_PLUGIN}.py",
+    )
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    return plugin
+
+
+def test_the_plugins_variable_names_are_the_ones_mutate_sets():
+    """`mutate.py` loads by path and cannot import the plugin, so each spells them."""
+    plugin = _plugin()
+    assert (plugin.ENV, plugin.CONTEXT_ENV, plugin.SELECT_ENV) == (
+        mutate_tool.PROGRESS_ENV,
+        mutate_tool.CONTEXT_ENV,
+        mutate_tool.SELECT_ENV,
+    )
+
+
+def test_the_coverage_rcfile_pins_what_the_design_says():
+    import configparser
+
+    rc = configparser.RawConfigParser()
+    assert rc.read(mutate_tool.COVERAGE_RC) == [str(mutate_tool.COVERAGE_RC)]
+    run = rc["run"]
+    assert run["core"] == "ctrace"
+    assert run["source"] == "wl_xcon"
+    assert run["patch"] == "subprocess"
+    assert run["context"] == "${WLX_COV_CONTEXT-}"
+
+
+def test_a_map_records_an_in_process_test_by_its_parametrized_node_id(
+    map_env, tmp_path, capsys
+):
+    """The id with its parameters, never the bare function name: a selection hands
+    pytest ids, and `test_reached` alone would collect nothing. Code that runs at import
+    falls under `""`, which is not a test, and a function nothing calls has none."""
+    tree = _toy_tree(tmp_path)
+    out = tmp_path / "map.json"
+
+    m = mutate_tool.build_map(out, tree)
+
+    assert m.tests_for("wl_xcon/toy.py", "reached") == _TOY_IDS, m
+    assert m.tests_for("wl_xcon/toy.py", "at_import") == (), m
+    assert m.tests_for("wl_xcon/toy.py", "never_called") == (), m
+    assert m.tests == _TOY_IDS, m
+    assert m.started == len(m.tests) == len(_TOY_IDS), m
+    assert m.summary.startswith(f"{len(_TOY_IDS)} passed"), m
+    assert mutate_tool.load_map(out, tree) == m
+    line = capsys.readouterr().out
+    assert line.startswith(f"map: {len(_TOY_IDS)} tests, 1 of 5 functions reached by a test"), line
+
+
+def test_a_map_records_a_test_whose_child_process_reaches_the_function(map_env, tmp_path):
+    """A child Python files its lines under the test that started it, and one that
+    replaced its environment is unmapped (it costs only speed). **This is the guard on
+    the one coverage internal the plugin relies on** (`_measure_children_by_their_own_
+    context`): coverage 7.17.4 hands a child the parent's context already filled in, and
+    the plugin points the child at the rcfile instead (the coordinator's ruling,
+    2026-11-21). An upgrade that changes that fails here, not quietly in the map."""
+    tree = _toy_tree(tmp_path, _TOY_CHILD_TESTS)
+
+    m = mutate_tool.build_map(tmp_path / "map.json", tree)
+
+    assert m.tests_for("wl_xcon/toy.py", "in_child") == ("tests/test_toy.py::test_child",), m
+    assert m.tests_for("wl_xcon/toy.py", "in_child_stripped") == (), m
+
+
+def test_a_map_from_another_tree_is_refused(map_env, tmp_path):
+    """Under Q2 no module has its own baseline, so a map is only as good as the tree
+    it was built from. What a test can import or read changes the hash; a file outside
+    `wl_xcon/` and `tests/`, or bytecode, does not."""
+    tree = _toy_tree(tmp_path)
+    out = tmp_path / "map.json"
+    mutate_tool.build_map(out, tree)
+
+    for edited in ("tests/test_toy.py", "wl_xcon/toy.py"):
+        path = tree / edited
+        original = path.read_text()
+        path.write_text(original + "# edited\n")
+        with pytest.raises(SystemExit, match="rebuild it with --build-map"):
+            mutate_tool.load_map(out, tree)
+        path.write_text(original)
+        mutate_tool.load_map(out, tree)
+
+    (tree / "README.md").write_text("not a test input\n")
+    (tree / "tests" / "__pycache__").mkdir(exist_ok=True)
+    (tree / "tests" / "__pycache__" / "x.pyc").write_bytes(b"\0")
+    mutate_tool.load_map(out, tree)
+
+
+def test_a_missing_or_corrupt_map_is_refused(tmp_path):
+    with pytest.raises(SystemExit, match="cannot read the map"):
+        mutate_tool.load_map(tmp_path / "absent.json", tmp_path)
+    (tmp_path / "corrupt.json").write_text("{not json")
+    with pytest.raises(SystemExit, match="cannot read the map"):
+        mutate_tool.load_map(tmp_path / "corrupt.json", tmp_path)
+
+
+def test_a_map_records_each_tests_own_time_and_refuses_times_that_do_not_match(
+    map_env, tmp_path
+):
+    """The whole-build review's I2: a selection's limit is its tests' share of the map's
+    run, so the map keeps each test's time, start to teardown, in `tests` order, from
+    the progress file's `start` and `finished` lines; a map whose times are not one a
+    test is refused, as a corrupt map is."""
+    tree = _toy_tree(
+        tmp_path,
+        _TOY_TESTS + "\n\ndef test_slow():\n    import time\n    time.sleep(0.5)\n",
+    )
+    out = tmp_path / "map.json"
+
+    m = mutate_tool.build_map(out, tree)
+
+    assert len(m.took) == len(m.tests) == 3, m
+    slow = m.tests.index("tests/test_toy.py::test_slow")
+    assert 0.5 <= m.took[slow] < m.seconds, m.took
+    assert all(0.0 <= seconds < 0.5 for n, seconds in enumerate(m.took) if n != slow), m.took
+    assert mutate_tool.load_map(out, tree).took == m.took
+    record = json.loads(out.read_text())
+    record["took"] = record["took"][:-1]
+    out.write_text(json.dumps(record))
+    with pytest.raises(SystemExit, match="cannot read the map .*2 test times for 3 tests"):
+        mutate_tool.load_map(out, tree)
+
+
+def test_a_selected_limit_is_its_tests_share_never_under_the_floor_nor_over_the_full_limit():
+    """`SuiteMap.selected_limit`: `LIMIT_FACTOR` x (the run's time no test held + the
+    selected tests' own times), at least `SUITE_TIMEOUT_SECONDS`, at most `limit`."""
+    made = mutate_tool.SuiteMap(
+        tree="", summary="", seconds=1000.0, started=3, tests=("a", "b", "c"),
+        functions={"m.py": {"quick": (0,), "slow": (2,), "all": (0, 1, 2), "none": ()}},
+        unmatched=0, took=(10.0, 90.0, 400.0),
+    )
+    limit = mutate_tool._mutant_limit(made.seconds)
+
+    assert limit == 2000.0
+    # 500 s that no test held, start-up and collection, is paid by every selection.
+    assert made.selected_limit("m.py", "slow", limit) == 2 * (500.0 + 400.0)
+    assert made.selected_limit("m.py", "quick", limit) == 2 * (500.0 + 10.0)
+    assert made.selected_limit("m.py", "all", limit) == limit
+    assert made.selected_limit("m.py", "all", 1500.0) == 1500.0
+    small = made._replace(seconds=20.0, took=(1.0, 1.0, 1.0))
+    assert small.selected_limit("m.py", "quick", 300.0) == mutate_tool.SUITE_TIMEOUT_SECONDS
+
+
+def test_a_suite_red_under_coverage_refuses_the_map(map_env, tmp_path):
+    """Review Focus 5. The map's run is the job's baseline, so a test that passes
+    plainly and fails under the tracer refuses the map by name, and none is written."""
+    tree = _toy_tree(
+        tmp_path, "import sys\n\n\ndef test_untraced():\n    assert sys.gettrace() is None\n"
+    )
+    out = tmp_path / "map.json"
+    plain = mutate_tool._run_suite(tree, timeout=60)
+    assert plain.passed, plain
+
+    with pytest.raises(SystemExit) as raised:
+        mutate_tool.build_map(out, tree)
+
+    message = str(raised.value)
+    assert message.startswith("suite is not green to begin with:"), message
+    assert "tests/test_toy.py::test_untraced" in message, message
+    assert not out.exists()
+
+
+def test_a_map_built_inside_a_measured_suite_starts_clean(map_env, monkeypatch, tmp_path):
+    """Review Focus 1. The nightly's map run executes this file, whose tests build toy
+    maps: a coverage run inside a coverage run. Every variable a measured test sees is
+    set here as the outer run sets it, and the inner map must be the one a clean build
+    makes. The ones coverage starts a child through are `COVERAGE_PROCESS_START` and
+    `COVERAGE_PROCESS_CONFIG` (coverage 7.17.4, `control.py:process_startup`, lines
+    1490-1491, and its `a1_coverage.pth`, read 2026-11-21); `COVERAGE_FILE` is where the
+    outer run's data goes (`config.py:713`); `WLX_COV_CONTEXT` is the outer test's id.
+    The toy includes the child tests, so a child of the nested run is checked as well."""
+    from coverage import Coverage
+
+    tree = _toy_tree(tmp_path, _TOY_CHILD_TESTS)
+    clean = mutate_tool.build_map(tmp_path / "clean.json", tree)
+    outer = tmp_path / "outer.coverage"
+    monkeypatch.setenv(mutate_tool.CONTEXT_ENV, "outer.py::test_outer")
+    monkeypatch.setenv("COVERAGE_FILE", str(outer))
+    monkeypatch.setenv("COVERAGE_PROCESS_START", str(mutate_tool.COVERAGE_RC))
+    # What `patch = subprocess` would leave for a child: the outer run's config,
+    # serialized with its context filled in (`patch.py:118`). Constructed, never started.
+    monkeypatch.setenv(
+        "COVERAGE_PROCESS_CONFIG", Coverage(config_file=str(mutate_tool.COVERAGE_RC)).config.serialize()
+    )
+
+    m = mutate_tool.build_map(tmp_path / "nested.json", tree)
+
+    def timeless(made):
+        return made._replace(seconds=0.0, summary=made.summary.split(" in ")[0], took=())
+
+    assert timeless(m) == timeless(clean), (m, clean)
+    assert m.tests_for("wl_xcon/toy.py", "in_child") == ("tests/test_toy.py::test_child",), m
+    assert "outer.py::test_outer" not in m.tests
+    assert not outer.exists()
+
+
+def _plugin_env(tmp_path):
+    """An environment for a toy pytest with only the plugin: nothing a measured outer
+    run set, so these read the same under the nightly's map run as anywhere else."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("COVERAGE_")
+        and key not in (mutate_tool.PROGRESS_ENV, mutate_tool.CONTEXT_ENV, mutate_tool.SELECT_ENV)
+    }
+    env["PYTHONPATH"] = str(mutate_tool.PROGRESS_PLUGIN_DIR)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+_PLUGIN_ARGV = [
+    sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+    "-p", mutate_tool.PROGRESS_PLUGIN,
+]
+
+
+def test_the_progress_plugin_deselects_to_the_ids_its_file_names_and_records_how_many(
+    tmp_path,
+):
+    """The selected run's ids arrive by file (§4.3): only those start, the rest are
+    deselected, and one line says how many were wanted and how many were found -- an id
+    not collected is counted, never fatal (Review Focus 3)."""
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_toy.py").write_text(
+        "def test_a():\n    pass\n" "def test_b():\n    pass\n" "def test_c():\n    pass\n"
+    )
+    env = _plugin_env(tmp_path)
+    progress = tmp_path / "progress.jsonl"
+    env[mutate_tool.PROGRESS_ENV] = str(progress)
+    chosen = tmp_path / "select.json"
+    chosen.write_text(
+        json.dumps(["test_toy.py::test_c", "test_toy.py::test_a", "test_toy.py::test_gone"])
+    )
+    env[mutate_tool.SELECT_ENV] = str(chosen)
+
+    picked = subprocess.run(
+        _PLUGIN_ARGV, cwd=suite, env=env, capture_output=True, text=True, timeout=60
+    )
+
+    assert picked.returncode == 0, picked.stdout + picked.stderr
+    assert "2 passed, 1 deselected" in picked.stdout, picked.stdout
+    events = [json.loads(line) for line in progress.read_text().splitlines()]
+    assert [e["nodeid"] for e in events if e["event"] == "start"] == [
+        "test_toy.py::test_a",
+        "test_toy.py::test_c",
+    ]
+    assert [e for e in events if e["event"] == "selected"] == [
+        {"event": "selected", "wanted": 3, "found": 2}
+    ]
+    seen = mutate_tool._read_progress(progress.read_text(), now=0.0)
+    assert (seen.wanted, seen.selected) == (3, 2), seen
+
+    progress.unlink()
+    del env[mutate_tool.SELECT_ENV]
+    subprocess.run(_PLUGIN_ARGV, cwd=suite, env=env, capture_output=True, text=True, timeout=60)
+    events = [json.loads(line) for line in progress.read_text().splitlines()]
+    assert [e["nodeid"] for e in events if e["event"] == "start"] == [
+        "test_toy.py::test_a",
+        "test_toy.py::test_b",
+        "test_toy.py::test_c",
+    ]
+    assert not [e for e in events if e["event"] == "selected"]
+
+
+def test_the_plugin_sets_no_context_without_coverage(tmp_path):
+    """Inert unless coverage is running: a suite merely loading the plugin must not see
+    a context variable appear. The progress file shows the plugin did load."""
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_toy.py").write_text(
+        "import os\n"
+        "def test_no_context():\n"
+        "    assert 'WLX_COV_CONTEXT' not in os.environ\n"
+        "    assert 'COVERAGE_PROCESS_START' not in os.environ\n"
+    )
+    env = _plugin_env(tmp_path)
+    progress = tmp_path / "progress.jsonl"
+    env[mutate_tool.PROGRESS_ENV] = str(progress)
+
+    run = subprocess.run(_PLUGIN_ARGV, cwd=suite, env=env, capture_output=True, text=True, timeout=60)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "1 passed" in run.stdout, run.stdout
+    assert '"start"' in progress.read_text()
+
+
+# ---------------------------------------------------------------------------
+# A mutant's likely tests first, each catch confirmed (CI-time design §4.3-4.4 and
+# §6; the PI's Q1 "Confirm each catch" and Q2 "In this build", 2026-11-21). A
+# selected catch fails with the mutant and passes without it, in the same selected
+# order, and every other outcome runs the full suite as `mutate` without a map runs
+# it. A leaky test whose catch the full order masks is the one way that can differ
+# from the full suite (the PI accepted it, and asked to look for leaks, 2026-11-22). Driven end to end on toy suites, the real `_run_suite`, plugin and
+# progress reader, with only the directory moved off the repository.
+# ---------------------------------------------------------------------------
+
+#: Reaches `covered` and fails under the mutation.
+_REACHES = (
+    "from toy_target import covered\n"
+    "def test_uses():\n"
+    "    assert covered() == [1]\n"
+)
+#: Never reaches anything: passes mutated or not.
+_BYSTANDER = "def test_bystander():\n    pass\n"
+
+
+class _Selected(NamedTuple):
+    target: Path
+    calls: list
+    runs: list
+
+
+def _toy_selected(monkeypatch, tmp_path, files: dict[str, str]) -> _Selected:
+    """`mutate` and `main` end to end on a toy suite, as `_collection_mutant`: the
+    target `toy_target.py` sits beside the test files `files` names, and `_run_suite`
+    runs in the toy dir, each call's keyword arguments appended to `calls` and its
+    `SuiteRun` to `runs`. `ROOT` is the toy dir, so `main`'s hash and relative path
+    resolve there."""
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    for name, source in files.items():
+        (suite / name).write_text(source)
+    target = suite / "toy_target.py"
+    target.write_text(_UNMUTATED)
+    return _wrap_suite(monkeypatch, tmp_path, suite, target)
+
+
+#: The one modification time every write of a `_wrap_suite` target carries.
+_PINNED_MTIME = 1_700_000_000
+
+
+def _wrap_suite(monkeypatch, tmp_path, suite: Path, target: Path) -> _Selected:
+    """`ROOT` moved to the toy `suite`, `_run_suite` recorded, and the toy's bytecode
+    cleared by the real `_clear_pycache`, which now sweeps only the toy.
+
+    **The real sweep, because a no-op one let mutants run each other's bytecode.** A
+    `.pyc` is reused while its source's size and modification time, in whole seconds,
+    match (`importlib._bootstrap_external._validate_timestamp_pyc`). Every mutant of a
+    module inserts the same `return ...` line, so all are one size; under `--all`, with
+    no sweep, a mutant written in the same second as the one before it, whose `.pyc` was
+    still on disk, ran that one's code. `test_a_function_reached_only_in_a_child_...`
+    failed so in 5 of about 31 CI shards (run 45355914942, 2026-11-24): `in_child`'s
+    selected run executed `at_import`'s mutant, passed, and the full run caught
+    `at_import` instead. A runner fast enough fit four suite runs in that second. The
+    Mac's full suite, under `-n auto`, never failed it, though the test alone failed
+    there in 9 of 20 runs. `PYTHONDONTWRITEBYTECODE` did not prevent it (13 of 20 with it set): the
+    child that replaces its environment drops the variable and writes the `.pyc` that
+    the next mutant's run then reads. That stale bytecode is the whole reason
+    `mutate.py` exists (its docstring), and the test had turned its cure off.
+
+    **So every toy process writes bytecode, as on CI, and every write of `target`
+    carries `_PINNED_MTIME`**: each run is the fastest runner's worst case, every time.
+    With the sweep the verdicts cannot depend on the clock, and without it they are
+    wrong on every machine, not one run in six."""
+    monkeypatch.setattr(mutate_tool, "SENTINEL", tmp_path / "sentinel.json")
+    monkeypatch.setattr(mutate_tool, "_clear_pycache", _CLEAR_PYCACHE)
+    monkeypatch.setattr(mutate_tool, "ROOT", suite)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    hold, release = mutate_tool._hold, mutate_tool._release
+
+    def held(path, original, mutated):
+        hold(path, original, mutated)
+        os.utime(path, (_PINNED_MTIME, _PINNED_MTIME))
+
+    def released(path, original):
+        release(path, original)
+        os.utime(path, (_PINNED_MTIME, _PINNED_MTIME))
+
+    monkeypatch.setattr(mutate_tool, "_hold", held)
+    monkeypatch.setattr(mutate_tool, "_release", released)
+    os.utime(target, (_PINNED_MTIME, _PINNED_MTIME))
+    real = mutate_tool._run_suite
+    calls: list = []
+    runs: list = []
+
+    def run(**kwargs):
+        calls.append(kwargs)
+        kwargs.pop("cwd", None)
+        made = real(suite, **kwargs)
+        runs.append(made)
+        return made
+
+    monkeypatch.setattr(mutate_tool, "_run_suite", run)
+    return _Selected(target, calls, runs)
+
+
+def _hand_map(root: Path, functions: dict[str, dict[str, tuple[str, ...]]], *,
+              tests: tuple[str, ...], seconds: float = 1.0,
+              took: tuple[float, ...] | None = None) -> Path:
+    """A `SuiteMap` saved by hand for `root`'s tree, mapping each function to `tests`'
+    ids given; written outside `root` so it is no input to the hash. Each test's time
+    is `took`'s, or by default an equal part of `seconds`."""
+    out = root.parent / "map.json"
+    if took is None:
+        took = tuple(seconds / len(tests) for _ in tests)
+    mutate_tool.SuiteMap(
+        tree=mutate_tool.tree_hash(root),
+        summary=f"{len(tests)} passed in {seconds}s",
+        seconds=seconds,
+        started=len(tests),
+        tests=tests,
+        functions={
+            module: {name: tuple(tests.index(t) for t in ids) for name, ids in names.items()}
+            for module, names in functions.items()
+        },
+        unmatched=0,
+        took=took,
+    ).save(out)
+    return out
+
+
+def _main(monkeypatch, *argv: str) -> int:
+    monkeypatch.setattr("sys.argv", ["mutate.py", *argv])
+    return mutate_tool.main()
+
+
+def _verdict_line(out: str, name: str) -> str:
+    return next(line for line in out.splitlines() if line[12:].split(" ", 1)[0] == name)
+
+
+def test_a_selected_failure_is_caught_without_the_full_suite(monkeypatch, tmp_path):
+    """§6's test 1. The selected run fails naming its test, the confirmation passes on
+    the unbroken code, and the full suite never runs: two calls, counted at
+    `_run_suite`."""
+    toy = _toy_selected(
+        monkeypatch, tmp_path, {"test_reaches.py": _REACHES, "test_other.py": _BYSTANDER}
+    )
+    chosen = "test_reaches.py::test_uses"
+
+    caught, text = mutate_tool.mutate(
+        toy.target, "covered", "[]", limit=60, of=2, selection=(chosen,)
+    )
+
+    assert toy.calls == [
+        {"timeout": 60, "maxfail": 3, "paths": ["test_reaches.py"], "select": [chosen]},
+        {"timeout": 60, "paths": ["test_reaches.py"], "select": [chosen]},
+    ], toy.calls
+    assert caught is True, text
+    assert text.startswith("[selected 1 of 2] 1 failed"), text
+    assert text.endswith(f"<- {chosen}"), text
+    assert toy.runs[1].passed and toy.runs[1].ran == (chosen,), toy.runs[1]
+    assert toy.target.read_text() == _UNMUTATED
+    assert not mutate_tool.SENTINEL.exists()
+
+
+@pytest.mark.parametrize(
+    ("unselected", "verdict"),
+    [(_REACHES, True), (_BYSTANDER.replace("bystander", "also_bystander"), False)],
+    ids=["an-unselected-test-catches", "nothing-catches"],
+)
+def test_a_mutant_the_selection_misses_goes_to_the_full_suite(
+    monkeypatch, tmp_path, unselected, verdict
+):
+    """§6's test 2. The selected tests pass under the mutant, so the full suite runs
+    as a run without a map does: caught there by an unselected test, it reads caught
+    with the selection's tag; caught by nothing, it is a survivor. (Two runs: no
+    confirmation follows a selection that caught nothing.)"""
+    toy = _toy_selected(
+        monkeypatch, tmp_path, {"test_a_other.py": _BYSTANDER, "test_b_unselected.py": unselected}
+    )
+
+    caught, text = mutate_tool.mutate(
+        toy.target, "covered", "[]", limit=60, of=2,
+        selection=("test_a_other.py::test_bystander",),
+    )
+
+    assert caught is verdict, text
+    assert text.startswith("[full, after 1 selected passed in "), text
+    assert len(toy.calls) == 2, toy.calls
+    assert toy.calls[-1] == {"timeout": 60, "maxfail": 3}, toy.calls
+    if verdict:
+        assert text.endswith("<- test_b_unselected.py::test_uses"), text
+    assert toy.target.read_text() == _UNMUTATED
+
+
+def test_a_function_with_no_test_in_the_map_runs_the_full_suite_at_once(
+    monkeypatch, tmp_path
+):
+    """§6's test 3: nothing to select, so no selected run of nothing first."""
+    toy = _toy_selected(monkeypatch, tmp_path, {"test_reaches.py": _REACHES})
+
+    caught, text = mutate_tool.mutate(toy.target, "covered", "[]", limit=60, of=1, selection=())
+
+    assert toy.calls == [{"timeout": 60, "maxfail": 3}], toy.calls
+    assert caught is True, text
+    assert text.startswith("[full: no test in the map] 1 failed"), text
+
+
+#: Every function of `_TOY_MODULE` caught by some test, two of them only from a child:
+#: one inheriting the environment (mapped), one replacing it (unmapped).
+_TOY_ALL_CAUGHT_TESTS = (
+    "import os\n"
+    "import subprocess\n"
+    "import sys\n"
+    "\n"
+    "import wl_xcon.toy as toy\n"
+    "\n"
+    "\n"
+    "def test_reached():\n"
+    "    assert toy.reached() == 1\n"
+    "\n"
+    "\n"
+    "def test_at_import():\n"
+    "    assert toy.AT_IMPORT == 2\n"
+    "\n"
+    "\n"
+    "def test_never_called():\n"
+    "    assert toy.never_called() == 3\n"
+    "\n"
+    "\n"
+    "def test_child():\n"
+    "    subprocess.run(\n"
+    "        [sys.executable, '-c', 'import wl_xcon.toy as t; assert t.in_child() == 4'],\n"
+    "        check=True,\n"
+    "    )\n"
+    "\n"
+    "\n"
+    "def test_child_stripped():\n"
+    "    subprocess.run(\n"
+    "        [sys.executable, '-c',\n"
+    "         'import wl_xcon.toy as t; assert t.in_child_stripped() == 5'],\n"
+    "        check=True,\n"
+    "        env={'PATH': os.environ['PATH']},\n"
+    "    )\n"
+)
+
+
+def test_a_function_reached_only_in_a_child_is_caught_by_the_selected_run_and_unmapped_still_by_the_full_one(
+    map_env, monkeypatch, tmp_path, capsys
+):
+    """§6's test 4, through `main` with a map `build_map` made of the same toy tree. A
+    child that kept its environment filed its lines under its test, which the
+    selection then runs; one that replaced it went unmapped, and the full suite still
+    catches its function."""
+    tree = _toy_tree(tmp_path, _TOY_ALL_CAUGHT_TESTS)
+    out = tmp_path / "map.json"
+    mutate_tool.build_map(out, tree)
+    _wrap_suite(monkeypatch, tmp_path, tree, tree / "wl_xcon" / "toy.py")
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+
+    assert _main(monkeypatch, "--all", "--map", str(out), "wl_xcon/toy.py") == 0
+
+    printed = capsys.readouterr().out
+    assert "  caught    in_child " in printed, printed
+    assert "[selected 1 of 5]" in _verdict_line(printed, "in_child"), printed
+    assert "[full: no test in the map]" in _verdict_line(printed, "in_child_stripped"), printed
+    assert _verdict_line(printed, "in_child_stripped").startswith("  caught    "), printed
+    assert (tree / "wl_xcon" / "toy.py").read_text() == _TOY_MODULE
+
+
+_ORDER_STATE = "READY = False\n"
+_ORDER_TESTS = (
+    "import state\n"
+    "def test_sets():\n"
+    "    state.READY = True\n"
+    "def test_needs():\n"
+    "    assert state.READY\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("reaching", "verb", "status"),
+    [({}, "SURVIVED", 1), ({"test_reaches.py": _REACHES}, "caught", 0)],
+    ids=["nothing-else-reaches-it", "an-unselected-test-reaches-it"],
+)
+def test_an_order_dependent_selected_failure_is_never_a_catch(
+    monkeypatch, tmp_path, capsys, reaching, verb, status
+):
+    """§6's test 5, the one the whole argument rests on. `test_needs` passes in file
+    order, after `test_sets`, and fails on its own; a map that wrongly selects it for
+    `covered`, which it never reaches, sees it fail under the mutant. The
+    confirmation sees it fail unmutated too, so it is no catch: the full suite
+    decides, and a mutant nothing reaches survives."""
+    toy = _toy_selected(
+        monkeypatch, tmp_path, {"state.py": _ORDER_STATE, "test_order.py": _ORDER_TESTS, **reaching}
+    )
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    out = _hand_map(
+        toy.target.parent,
+        {"toy_target.py": {"covered": ("test_order.py::test_needs",)}},
+        tests=("test_order.py::test_sets", "test_order.py::test_needs"),
+    )
+
+    assert _main(monkeypatch, "--map", str(out), "toy_target.py", "covered") == status
+
+    printed = capsys.readouterr().out
+    line = _verdict_line(printed, "covered")
+    assert line.startswith(f"  {verb:9} covered "), printed
+    assert "[full: selected failed unmutated too]" in line, printed
+    assert "SELECTION NOT INDEPENDENT: covered (test_order.py::test_needs)" in printed, printed
+    assert ("NOT COVERED: covered" in printed) is (verb == "SURVIVED"), printed
+    assert [len(call.get("select", ())) for call in toy.calls] == [1, 1, 0], toy.calls
+
+
+def test_a_selected_run_stopped_before_any_failure_goes_to_the_full_suite(
+    monkeypatch, tmp_path
+):
+    """§6's test 6, its first half. The selected test outlasts the limit with nothing
+    failed: not a catch, and never `TIMED OUT` on its own -- the full suite, whose
+    first file catches the mutant before it reaches the same sleep, decides."""
+    toy = _toy_selected(
+        monkeypatch,
+        tmp_path,
+        {
+            "test_a_catches.py": _REACHES,
+            "test_z_sleeps.py": f"import time\ndef test_sleeps():\n    time.sleep({_TOY_SLEEP})\n",
+        },
+    )
+
+    caught, text = mutate_tool.mutate(
+        toy.target, "covered", "[]", limit=_TOY_LIMIT, of=2,
+        selection=("test_z_sleeps.py::test_sleeps",),
+    )
+
+    assert caught is not mutate_tool.TIMED_OUT, text
+    assert caught is True, text
+    assert text.startswith("[full, after 1 selected timed out in "), text
+    assert "<- test_a_catches.py::test_uses" in text, text
+    assert len(toy.calls) == 2, toy.calls
+
+
+@pytest.mark.parametrize("catcher", [True, False], ids=["an-unselected-catcher", "no-catcher"])
+@pytest.mark.parametrize(
+    ("chosen", "code"),
+    [("test_gone.py::test_x", 4), ("{file}::test_absent", 5)],
+    ids=["an-id-in-a-missing-file", "an-id-absent-from-its-file"],
+)
+def test_a_selected_run_that_names_no_failure_is_not_a_catch(
+    monkeypatch, tmp_path, catcher, chosen, code
+):
+    """§6's test 6, its second half. A selected run can end non-zero with no test
+    failing: a usage error (exit 4, a file not found) or nothing collected (exit 5).
+    That is the harness, not a test noticing, so the full suite decides, with no
+    confirmation of a catch there never was."""
+    holder = "test_reaches.py" if catcher else "test_other.py"
+    toy = _toy_selected(
+        monkeypatch, tmp_path, {holder: _REACHES if catcher else _BYSTANDER}
+    )
+    chosen = chosen.format(file=holder)
+
+    caught, text = mutate_tool.mutate(
+        toy.target, "covered", "[]", limit=60, of=1, selection=(chosen,)
+    )
+
+    picked = toy.runs[0]
+    assert (picked.returncode, picked.failures) == (code, []), picked
+    if code == 5:
+        assert picked.selected == 0, picked
+    assert caught is catcher, text
+    assert text.startswith(f"[full, after 0 selected ended with no test named (exit {code}) in "), text
+    assert len(toy.calls) == 2 and toy.calls[-1] == {"timeout": 60, "maxfail": 3}, toy.calls
+
+
+def test_every_suite_run_of_a_selected_mutant_carries_the_progress_file_and_the_sentinel_only_while_mutated(
+    monkeypatch, tmp_path
+):
+    """§6's test 8, read at the subprocess as `test_only_a_mutants_suite_is_stopped_at_
+    its_third_failure` reads it. The selected run and the confirmation both fail, so
+    three commands run: selected, confirmation, full. Each carries the progress file;
+    only the first two a selection; the module is mutated, with its sentinel on disk,
+    exactly through the first and the third; and no id is ever on argv."""
+    target = tmp_path / "module.py"
+    target.write_text(_UNMUTATED)
+    monkeypatch.setattr(mutate_tool, "SENTINEL", tmp_path / "sentinel.json")
+    monkeypatch.setattr(mutate_tool, "_clear_pycache", lambda: None)
+    chosen = "t.py::a"
+    seen = []
+
+    def run(command, *, env, **_):
+        seen.append(
+            (
+                target.read_text() != _UNMUTATED,
+                mutate_tool.SENTINEL.exists(),
+                mutate_tool.PROGRESS_ENV in env,
+                mutate_tool.SELECT_ENV in env,
+                command,
+            )
+        )
+        with open(env[mutate_tool.PROGRESS_ENV], "a", encoding="utf-8") as out:
+            if mutate_tool.SELECT_ENV in env:
+                out.write(json.dumps({"event": "selected", "wanted": 1, "found": 1}) + "\n")
+            out.write(json.dumps({"event": "start", "nodeid": chosen, "at": 0.0}) + "\n")
+            out.write(json.dumps({"event": "failed", "nodeid": chosen, "when": "call"}) + "\n")
+            out.write(json.dumps({"event": "finished", "nodeid": chosen}) + "\n")
+        stdout = (
+            "=========================== short test summary info ============================\n"
+            f"FAILED {chosen} - assert False\n"
+            "1 failed in 0.01s\n"
+        )
+        return subprocess.CompletedProcess(command, 1, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(
+        mutate_tool,
+        "subprocess",
+        SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired),
+    )
+    tally = mutate_tool.Tally()
+
+    caught, text = mutate_tool.mutate(
+        target, "covered", "[]", limit=60, of=1, selection=(chosen,), tally=tally
+    )
+
+    assert [entry[:2] for entry in seen] == [(True, True), (False, False), (True, True)], seen
+    assert all(entry[2] for entry in seen), seen
+    assert [entry[3] for entry in seen] == [True, True, False], seen
+    assert not any(chosen in arg for entry in seen for arg in entry[4]), seen
+    assert caught is True and text.startswith("[full: selected failed unmutated too] "), text
+    assert tally.not_independent == [f"covered ({chosen})"], tally.not_independent
+    assert target.read_text() == _UNMUTATED
+    assert not mutate_tool.SENTINEL.exists()
+
+
+def test_a_65_kb_id_reaches_the_plugin_by_file_not_argv(monkeypatch, tmp_path):
+    """Review Focus 2. XC-331's bytes parameter made a 65,537-character id; selected
+    for a mutant, it goes to the plugin in the select file, is collected and run, and
+    no argument pytest is given carries it.
+
+    The id is given with `ids=`, not left to pytest: from pytest 9.2.0 an auto-generated
+    id for a str or bytes value over 100 characters is the argument's name and index
+    (`blob0`), under the `parametrize_long_str_id_strategy` ini option, default `short`
+    (`_pytest/python.py`, `_apply_long_str_strategy`, read in 9.2.0 on 2026-11-24;
+    9.0.2 through 9.1.1 keep the value). An explicit id is kept whole in 9.2.0, so the
+    65 KB id this test needs exists on every pytest it runs under."""
+    toy = _toy_selected(
+        monkeypatch,
+        tmp_path,
+        {
+            "test_big.py": (
+                "import pytest\n"
+                "from toy_target import covered\n"
+                f"@pytest.mark.parametrize('blob', [None], ids=['x' * {65537}])\n"
+                "def test_big(blob):\n"
+                "    assert covered() == [1]\n"
+            )
+        },
+    )
+    big = f"test_big.py::test_big[{'x' * 65537}]"
+    argv = []
+    real_run = subprocess.run
+
+    def recording(command, **kwargs):
+        argv.append(list(command))
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(
+        mutate_tool,
+        "subprocess",
+        SimpleNamespace(run=recording, TimeoutExpired=subprocess.TimeoutExpired),
+    )
+
+    caught, text = mutate_tool.mutate(toy.target, "covered", "[]", limit=60, of=1, selection=(big,))
+
+    picked = toy.runs[0]
+    assert picked.selected == 1 and picked.ran == (big,), (
+        picked.wanted, picked.selected, len(picked.ran), picked.summary
+    )
+    assert caught is True, text[:400]
+    assert len(text) < 1024
+    assert len(argv) == 2, argv
+    assert max(len(arg) for command in argv for arg in command) < 4096
+
+
+def test_a_selected_id_not_collected_is_counted_never_fatal(monkeypatch, tmp_path, capsys):
+    """Review Focus 3. One of two ids is not collected (renamed since the map, or an id
+    that differs between runs): the run is judged on the one that is, and the other is
+    counted in the tally."""
+    toy = _toy_selected(monkeypatch, tmp_path, {"test_reaches.py": _REACHES})
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    ids = ("test_reaches.py::test_uses", "test_reaches.py::test_renamed")
+    out = _hand_map(toy.target.parent, {"toy_target.py": {"covered": ids}}, tests=ids)
+
+    assert _main(monkeypatch, "--map", str(out), "toy_target.py", "covered") == 0
+
+    picked = toy.runs[0]
+    assert (picked.wanted, picked.selected, picked.ran) == (2, 1, ids[:1]), picked
+    printed = capsys.readouterr().out
+    assert "[selected 1 of 2]" in _verdict_line(printed, "covered"), printed
+    assert "  selected ids not collected: 1" in printed.splitlines(), printed
+
+
+@pytest.mark.parametrize(
+    "spoil", ["edit-a-package-file", "missing-map", "map-not-json"]
+)
+def test_a_tree_changed_since_the_map_is_refused_before_any_mutant(
+    monkeypatch, tmp_path, spoil
+):
+    """Review Focus 4. Under Q2 no module has its own baseline, so a tree changed
+    since the map -- an edit, or a mutation the heal declined to restore -- or a map
+    file missing or corrupt is refused before any suite runs, never swept."""
+    tree = _toy_tree(tmp_path)
+    out = _hand_map(tree, {"wl_xcon/toy.py": {"reached": _TOY_IDS}}, tests=_TOY_IDS)
+    toy = _wrap_suite(monkeypatch, tmp_path, tree, tree / "wl_xcon" / "toy.py")
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    if spoil == "edit-a-package-file":
+        (tree / "wl_xcon" / "toy.py").write_text(_TOY_MODULE + "# edited\n")
+    elif spoil == "missing-map":
+        out.unlink()
+    else:
+        out.write_text("{not json")
+
+    with pytest.raises(SystemExit, match="rebuild it with --build-map|cannot read the map"):
+        _main(monkeypatch, "--map", str(out), "wl_xcon/toy.py", "reached")
+
+    assert toy.calls == []
+
+
+_THREE_KINDS = (
+    "def covered():\n"
+    "    return [1]\n"
+    "def untested():\n"
+    "    return [2]\n"
+    "def missed():\n"
+    "    return [3]\n"
+)
+
+
+def test_with_a_map_main_runs_no_baseline_and_no_restored_suite_and_tallies_each_kind(
+    monkeypatch, tmp_path, capsys
+):
+    """Q2: the map's run is this call's baseline and the caller runs the one restored
+    suite, so only the mutants' runs happen -- two for a selected catch, one for a
+    function with no test, two for one the selection misses. The limit is the map's
+    run's (Call 2), and the tally counts each kind."""
+    toy = _toy_selected(
+        monkeypatch,
+        tmp_path,
+        {
+            "test_reaches.py": _REACHES,
+            "test_other.py": _BYSTANDER,
+            "test_rest.py": (
+                "from toy_target import untested, missed\n"
+                "def test_untested():\n    assert untested() == [2]\n"
+                "def test_missed():\n    assert missed() == [3]\n"
+            ),
+        },
+    )
+    toy.target.write_text(_THREE_KINDS)
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    tests = (
+        "test_other.py::test_bystander",
+        "test_reaches.py::test_uses",
+        "test_rest.py::test_untested",
+        "test_rest.py::test_missed",
+    )
+    out = _hand_map(
+        toy.target.parent,
+        {"toy_target.py": {"covered": (tests[1],), "missed": (tests[0],)}},
+        tests=tests,
+        seconds=100.0,
+    )
+
+    assert _main(monkeypatch, "--all", "--map", str(out), "toy_target.py") == 0
+
+    assert [sorted(call) for call in toy.calls] == [
+        ["maxfail", "paths", "select", "timeout"],
+        ["paths", "select", "timeout"],
+        ["maxfail", "timeout"],
+        ["maxfail", "paths", "select", "timeout"],
+        ["maxfail", "timeout"],
+    ], toy.calls
+    assert {call["timeout"] for call in toy.calls} == {300}, toy.calls
+    printed = capsys.readouterr().out
+    baseline = next(line for line in printed.splitlines() if line.startswith("baseline:"))
+    assert "(the map's run, under coverage, 100s)" in baseline, baseline
+    assert "mutants stopped after 300s" in baseline, baseline
+    assert "restored: left to the caller (--map)" in printed, printed
+    lines = printed.splitlines()
+    for kind in ("selected: 1 in ", "full: no test in the map: 1 in ", "full, after selected: 1 in "):
+        assert any(line.startswith(f"  {kind}") and line.endswith("s") for line in lines), printed
+    assert "  full: selected failed unmutated too: 0 in 0s" in lines, printed
+    assert "SELECTION NOT INDEPENDENT" not in printed, printed
+
+
+#: Under the mutant, waits for `covered` to come back, bounded so a harness that failed
+#: to kill would make the test fail, never hang: XC-140's class, a mutant that hangs the
+#: very tests the map selects for it.
+_HANGS_WHEN_MUTATED = (
+    "import time\n"
+    "from toy_target import covered\n"
+    "def test_waits():\n"
+    f"    end = time.monotonic() + {_TOY_SLEEP}\n"
+    "    while covered() != [1] and time.monotonic() < end:\n"
+    "        time.sleep(0.05)\n"
+    "    assert covered() == [1]\n"
+)
+
+
+@pytest.mark.parametrize("catcher", [True, False], ids=["an-unselected-catcher", "no-catcher"])
+def test_a_selected_hang_falls_through_at_the_scaled_limit_and_the_full_run_judges(
+    monkeypatch, tmp_path, catcher
+):
+    """The whole-build review's I2. The selected test hangs under the mutant, so the
+    selected run stops at its own limit, the selection's share, not the full run's; it
+    names no failure, so it falls through, and the full run, at the whole limit, gives
+    today's verdict: caught by the unselected test before the same hang, or, with
+    none, `TIMED OUT` -- from the full run, never from the selection."""
+    files = {"test_z_waits.py": _HANGS_WHEN_MUTATED}
+    if catcher:
+        files["test_a_catches.py"] = _REACHES
+    toy = _toy_selected(monkeypatch, tmp_path, files)
+    quick, whole = _TOY_LIMIT, 2 * _TOY_LIMIT
+
+    caught, text = mutate_tool.mutate(
+        toy.target, "covered", "[]", limit=whole, of=len(files),
+        selection=("test_z_waits.py::test_waits",), selected_limit=quick,
+    )
+
+    assert [call["timeout"] for call in toy.calls] == [quick, whole], toy.calls
+    assert "select" in toy.calls[0] and "select" not in toy.calls[1], toy.calls
+    picked, final = toy.runs
+    assert picked.timed_out and picked.seconds < whole, picked
+    assert text.startswith(f"[full, after 1 selected timed out in {quick}s] "), text
+    assert final.timed_out, final
+    if catcher:
+        assert caught is True, text
+        assert f"timed out after {whole}s, 1 failed before it" in text, text
+        assert text.endswith("<- test_a_catches.py::test_uses"), text
+    else:
+        assert caught is mutate_tool.TIMED_OUT, text
+        assert f"timed out after {whole}s, no test failed before it" in text, text
+    assert toy.target.read_text() == _UNMUTATED
+
+
+def test_main_gives_each_selected_run_its_tests_share_and_each_full_run_the_whole_limit(
+    monkeypatch, tmp_path, capsys
+):
+    """Through `main`: the map's run took 1000 s, 800 of them in its two tests, so the
+    full run's limit is 2000 s and a selection of the 100-s test gets 2 x (200 + 100)."""
+    toy = _toy_selected(
+        monkeypatch, tmp_path, {"test_other.py": _BYSTANDER, "test_reaches.py": _REACHES}
+    )
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    tests = ("test_other.py::test_bystander", "test_reaches.py::test_uses")
+    out = _hand_map(
+        toy.target.parent, {"toy_target.py": {"covered": tests[:1]}},
+        tests=tests, seconds=1000.0, took=(100.0, 700.0),
+    )
+
+    assert _main(monkeypatch, "--map", str(out), "toy_target.py", "covered") == 0
+
+    assert [(call["timeout"], "select" in call) for call in toy.calls] == [
+        (600.0, True), (2000.0, False)
+    ], toy.calls
+    printed = capsys.readouterr().out
+    assert "mutants stopped after 2000s" in printed, printed
+    assert "its tests' share of the map's run, never under 300s" in printed, printed
+
+
+#: Two leaks, each the other's mirror, neither reaching `covered`: `test_needs` passes
+#: only after `test_sets` (it fails selected alone), and `test_clean` fails only after
+#: `test_spoils` (it passes selected alone). The third is the first with XC-331's 65 KB
+#: id on it, given with `ids=` because pytest 9.2.0 shortens an auto-generated one (see
+#: `test_a_65_kb_id_reaches_the_plugin_by_file_not_argv`).
+_BIG = "x" * 65537
+_LEAKS = {
+    "failed-alone-passed-in-order": {"state.py": _ORDER_STATE, "test_order.py": _ORDER_TESTS},
+    "passed-alone-failed-in-order": {
+        "state.py": "SPOILED = False\n",
+        "test_spoiled.py": (
+            "import state\n"
+            "def test_spoils():\n"
+            "    state.SPOILED = True\n"
+            "def test_clean():\n"
+            "    assert not state.SPOILED\n"
+        ),
+    },
+    "a-65-kb-id": {
+        "state.py": _ORDER_STATE,
+        "test_big.py": (
+            "import pytest\n"
+            "import state\n"
+            "def test_sets():\n"
+            "    state.READY = True\n"
+            f"@pytest.mark.parametrize('blob', [None], ids=['x' * {len(_BIG)}])\n"
+            "def test_needs(blob):\n"
+            "    assert state.READY\n"
+        ),
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("case", "order", "results", "verb"),
+    [
+        ("failed-alone-passed-in-order",
+         ("test_order.py::test_sets", "test_order.py::test_needs"),
+         "selected: failed, full: passed", "SURVIVED"),
+        ("passed-alone-failed-in-order",
+         ("test_spoiled.py::test_spoils", "test_spoiled.py::test_clean"),
+         "selected: passed, full: failed", "caught"),
+        ("a-65-kb-id",
+         ("test_big.py::test_sets", f"test_big.py::test_needs[{_BIG}]"),
+         "selected: failed, full: passed", "SURVIVED"),
+    ],
+    ids=list(_LEAKS),
+)
+def test_a_selected_test_the_full_run_contradicts_is_listed_and_the_verdict_is_the_full_runs(
+    monkeypatch, tmp_path, capsys, case, order, results, verb
+):
+    """Looking for leaks (the PI, 2026-11-22, "Accept, and look for leaks"). A mutant
+    that falls through to the full run has each selected test's result compared across
+    the two runs, both mutated: one that disagrees depends on what ran before it, and
+    is listed under `QUICK AND FULL DISAGREE` and counted in the tally. It changes no
+    verdict: the full run's stands, a survivor where nothing fails in the full order,
+    caught where the leak makes a test fail there. The list keeps a 65 KB id short
+    (XC-331)."""
+    toy = _toy_selected(monkeypatch, tmp_path, _LEAKS[case])
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    selected = order[1]
+    out = _hand_map(toy.target.parent, {"toy_target.py": {"covered": (selected,)}}, tests=order)
+
+    status = _main(monkeypatch, "--map", str(out), "toy_target.py", "covered")
+
+    printed = capsys.readouterr().out
+    assert status == (0 if verb == "caught" else 1), printed[-3000:]
+    assert _verdict_line(printed, "covered").startswith(f"  {verb:9} covered "), printed[-3000:]
+    assert "select" not in toy.calls[-1], toy.calls
+    listed = next(
+        (row for row in printed.splitlines() if row.startswith("QUICK AND FULL DISAGREE: ")), None
+    )
+    assert listed is not None, printed[-3000:]
+    assert listed == (
+        f"QUICK AND FULL DISAGREE: {mutate_tool._short(selected)} ({results}; mutating covered)"
+    ), listed[:400]
+    assert len(listed) < 1024, len(listed)
+    assert "  quick and full disagree: 1" in printed.splitlines(), printed[-3000:]
+
+
+@pytest.mark.parametrize(
+    ("files", "selected"),
+    [
+        ({"test_a_other.py": _BYSTANDER, "test_b_reaches.py": _REACHES},
+         "test_a_other.py::test_bystander"),
+        ({"test_broken.py": "def test_broken():\n    assert False\n"},
+         "test_broken.py::test_broken"),
+    ],
+    ids=["passed-both-ways", "failed-both-ways"],
+)
+def test_a_selected_test_with_the_same_result_both_ways_is_not_listed(
+    monkeypatch, tmp_path, capsys, files, selected
+):
+    """The other half: a mutant that falls through with each selected test giving the
+    same result in both runs -- passed, or failed in each (a broken test, so the
+    confirmation fails too) -- lists nothing, and the tally counts none."""
+    toy = _toy_selected(monkeypatch, tmp_path, files)
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
+    order = tuple(
+        f"{name}::{line[4:].split('(')[0]}"
+        for name, source in sorted(files.items())
+        for line in source.splitlines()
+        if line.startswith("def test_")
+    )
+    out = _hand_map(toy.target.parent, {"toy_target.py": {"covered": (selected,)}}, tests=order)
+
+    assert _main(monkeypatch, "--map", str(out), "toy_target.py", "covered") == 0
+
+    printed = capsys.readouterr().out
+    assert len(toy.calls) >= 2 and "select" not in toy.calls[-1], toy.calls
+    assert "QUICK AND FULL DISAGREE" not in printed, printed
+    assert "  quick and full disagree: 0" in printed.splitlines(), printed
+
+
+#: An id that differs between collections, as a non-deterministic parameter would: each
+#: collection counts itself in `count.txt` beside the test, so the map's run named
+#: `[run0]`, the mutant's selected run collects `[run0]` too, and the confirmation finds
+#: `[run1]`, not the id it was given.
+_SHIFTING = (
+    "from pathlib import Path\n"
+    "import pytest\n"
+    "from toy_target import covered\n"
+    "_SEEN = Path(__file__).with_name('count.txt')\n"
+    "_N = int(_SEEN.read_text()) if _SEEN.exists() else 0\n"
+    "_SEEN.write_text(str(_N + 1))\n"
+    "@pytest.mark.parametrize('n', [_N], ids=[f'run{_N}'])\n"
+    "def test_shifts(n):\n"
+    "    assert covered() == [1]\n"
+)
+
+
+@pytest.mark.parametrize("neighbor", [True, False], ids=["green-without-it", "collects-nothing"])
+def test_a_confirmation_that_did_not_rerun_the_failed_test_is_not_a_catch(
+    monkeypatch, tmp_path, neighbor
+):
+    """The whole-build review's M3. The selected run's failing test is not collected by
+    the confirmation, so the confirmation asked it nothing: green on a neighbor alone,
+    or nothing collected (exit 5). Neither confirms; the full run decides, and the
+    test is listed as not run unmutated."""
+    files = {"test_shifts.py": _SHIFTING}
+    if neighbor:
+        files["test_a_passes.py"] = "def test_passes():\n    pass\n"
+    toy = _toy_selected(monkeypatch, tmp_path, files)
+    shifting = "test_shifts.py::test_shifts[run0]"
+    selection = (("test_a_passes.py::test_passes",) if neighbor else ()) + (shifting,)
+    tally = mutate_tool.Tally()
+
+    caught, text = mutate_tool.mutate(
+        toy.target, "covered", "[]", limit=60, of=len(selection),
+        selection=selection, tally=tally,
+    )
+
+    assert len(toy.runs) == 3, (caught, text, toy.calls)
+    picked, confirm, final = toy.runs
+    assert shifting in picked.ran and picked.failures, picked
+    assert shifting not in confirm.ran, confirm
+    assert confirm.passed is neighbor and confirm.returncode == (0 if neighbor else 5), confirm
+    assert "select" not in toy.calls[2], toy.calls
+    assert caught is True and "<- test_shifts.py::test_shifts[run2]" in text, text
+    if neighbor:
+        assert text.startswith("[full: selected failure not rerun unmutated] "), text
+        assert tally.not_independent == [f"covered ({shifting} not run unmutated)"], tally
+    else:
+        assert tally.not_independent == [f"covered ({shifting} not run unmutated, exit 5)"], tally
+    assert tally.count[mutate_tool.SELECTED] == 0, tally.count
+    assert tally.count[mutate_tool.FULL_NOT_INDEPENDENT] == 1, tally.count
+
+
+@pytest.mark.parametrize("green", [True, False], ids=["green", "red"])
+def test_restored_runs_one_unmutated_suite_and_fails_on_red(monkeypatch, capsys, green):
+    """`--restored`: the one restored suite a job runs after its last module (Q2)."""
+    calls = []
+    monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: calls.append("heal"))
+
+    def suite(**kwargs):
+        calls.append(kwargs)
+        if green:
+            return mutate_tool.SuiteRun(True, "10 passed in 1.0s", [], started=10)
+        return mutate_tool.SuiteRun(
+            False, "1 failed, 9 passed in 1.0s", ["FAILED tests/test_x.py::test_y - boom"]
+        )
+
+    monkeypatch.setattr(mutate_tool, "_run_suite", suite)
+
+    assert _main(monkeypatch, "--restored") == (0 if green else 1)
+
+    assert calls[0] == "heal" and len(calls) == 2, calls
+    assert calls[1]["timeout"] == mutate_tool.BASELINE_TIMEOUT_SECONDS, calls
+    printed = capsys.readouterr().out
+    assert "restored: 10 passed" in printed if green else "restored: 1 failed" in printed, printed
+    if not green:
+        assert "FAILED tests/test_x.py::test_y - boom" in printed, printed

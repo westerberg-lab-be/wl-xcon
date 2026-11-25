@@ -100,6 +100,7 @@ def test_documentation_alone_selects_nothing():
         "tests/_builds.py",
         "tools/mutate.py",
         "tools/suite_progress/wlx_suite_progress.py",
+        "tools/suite_progress/coverage.ini",
         "pyproject.toml",
         ".github/workflows/ci.yml",
     ],
@@ -482,37 +483,172 @@ def test_dry_run_prints_each_module_of_the_shard_and_the_functions_it_would_run(
     assert f"shard {k}/12" in out
     for module, names in plan:
         assert f"    {module} ({len(names)}): {', '.join(names)}" in out
+    count = sum(len(names) for _, names in plan)
+    assert count >= _MAP_FROM, "a push's shard of the real package is under MAP_FROM"
+    assert f"map: would build for {count} function(s) (MAP_FROM = {_MAP_FROM})" in out
 
 
-def test_a_shard_runs_each_of_its_modules_with_only_its_functions(monkeypatch, capsys):
-    """The commands themselves: one `mutate.py --all --only` per module in the
-    chunk, in order, with that module's `--returns` exactly as `RETURNS` has it."""
-    k, plan = _spanning_shard(12)
-    commands = []
+# ---------------------------------------------------------------------------
+# One map and one restored suite a job (CI-time design §4.2 and §4.5; the PI's Q2,
+# "In this build", 2026-11-21): a job of at least MAP_FROM functions builds one map,
+# passes it to every module, and runs one restored suite; a smaller one runs exactly
+# as it did before the map.
+# ---------------------------------------------------------------------------
 
+#: Written out rather than read from the gate, so a test that compares against it
+#: does not agree with the gate by construction; the 14 / 15 test pins the two equal.
+_MAP_FROM = 15
+
+_MUTATE = [sys.executable, "-u", "tools/mutate.py"]
+
+
+def _module_command(module: str, names: list[str] | None, mapped: str | None = None):
+    """Today's `mutate.py --all` for `module`, with `--map M` just before the path."""
+    return [
+        *_MUTATE,
+        "--all",
+        *([] if names is None else ["--only", ",".join(names)]),
+        *([] if gate.RETURNS[module] == "[]" else ["--returns", gate.RETURNS[module]]),
+        *([] if mapped is None else ["--map", mapped]),
+        f"{gate.PACKAGE}/{module}.py",
+    ]
+
+
+def _recorder(commands: list[list[str]], fails=lambda command: False):
     def record(command, cwd):
+        assert cwd == gate.ROOT
         commands.append(command)
-        return subprocess.CompletedProcess(command, 0)
+        return subprocess.CompletedProcess(command, 1 if fails(command) else 0)
 
-    monkeypatch.setattr(gate.subprocess, "run", record)
+    return record
+
+
+def test_a_shard_of_at_least_map_from_functions_builds_one_map_and_passes_it_to_every_module(
+    monkeypatch, capsys
+):
+    """The commands themselves: one map built, then one `mutate.py --all --only` per
+    module in the chunk, in order, with that module's `--returns` exactly as
+    `RETURNS` has it and `--map` naming the one map, then one restored suite. The
+    map lives in a fresh temporary directory outside the repository, which is gone
+    once the gate returns."""
+    k, plan = _spanning_shard(12)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(gate.subprocess, "run", _recorder(commands))
     monkeypatch.setattr(sys, "argv", ["mutation_gate.py", "--all", "--shard", f"{k}/12"])
 
     assert gate.main() == 0
 
+    assert commands[0][:4] == [*_MUTATE, "--build-map"] and len(commands[0]) == 5
+    mapped = commands[0][4]
     assert commands == [
-        [
-            sys.executable,
-            "-u",
-            "tools/mutate.py",
-            "--all",
-            "--only",
-            ",".join(names),
-            *([] if gate.RETURNS[module] == "[]" else ["--returns", gate.RETURNS[module]]),
-            f"{gate.PACKAGE}/{module}.py",
-        ]
-        for module, names in plan
+        [*_MUTATE, "--build-map", mapped],
+        *(_module_command(module, names, mapped) for module, names in plan),
+        [*_MUTATE, "--restored"],
     ]
-    assert "mutation gate passed" in capsys.readouterr().out
+    where = Path(mapped)
+    assert where.is_absolute()
+    assert not where.resolve().is_relative_to(gate.ROOT.resolve()), where
+    assert not where.exists() and not where.parent.exists(), "the map's directory was left"
+    out = capsys.readouterr().out
+    count = sum(len(names) for _, names in plan)
+    assert f"map: building for {count} function(s) (MAP_FROM = {_MAP_FROM})" in out
+    assert "map: built" not in out, "the gate claimed a map before mutate.py built it"
+    assert "mutation gate passed" in out
+
+
+def _toy_package(tmp_path, monkeypatch, sizes: dict[str, int]) -> None:
+    """`wl_xcon/<module>.py` with `sizes[module]` functions each, under a `ROOT` of
+    `tmp_path`, as in `test_a_selected_module_with_no_functions_fails_every_shard`."""
+    (tmp_path / gate.PACKAGE).mkdir()
+    for module, size in sizes.items():
+        (tmp_path / gate.PACKAGE / f"{module}.py").write_text(
+            "".join(f"def {module}_{i}():\n    return {i}\n" for i in range(size))
+        )
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    monkeypatch.setattr(gate, "RETURNS", {module: "None" for module in sizes})
+    monkeypatch.setattr(gate, "EXEMPT", {})
+
+
+@pytest.mark.parametrize("total", [14, 15])
+def test_a_shard_under_map_from_runs_exactly_as_before(
+    tmp_path, monkeypatch, capsys, total
+):
+    """Fourteen functions over two whole modules (`--all`, unsharded, so each entry
+    is `None` and its functions are counted from the module): the commands are
+    exactly the gate's before the map, with no map and no `--restored`, since each
+    module still runs its own baseline and restored suite. Fifteen builds the map:
+    the count is the job's, across its modules, and the bound is inclusive."""
+    assert getattr(gate, "MAP_FROM", None) == _MAP_FROM
+    _toy_package(tmp_path, monkeypatch, {"first": 7, "second": total - 7})
+    commands: list[list[str]] = []
+    monkeypatch.setattr(gate.subprocess, "run", _recorder(commands))
+    monkeypatch.setattr(sys, "argv", ["mutation_gate.py", "--all"])
+
+    assert gate.main() == 0
+
+    out = capsys.readouterr().out
+    if total < _MAP_FROM:
+        assert commands == [
+            _module_command("first", None),
+            _module_command("second", None),
+        ]
+        assert (
+            f"no map: {total} function(s), under MAP_FROM = {_MAP_FROM}; "
+            f"each module runs its own baseline and restored suite"
+        ) in out
+    else:
+        assert commands[0][:4] == [*_MUTATE, "--build-map"]
+        mapped = commands[0][4]
+        assert commands == [
+            [*_MUTATE, "--build-map", mapped],
+            _module_command("first", None, mapped),
+            _module_command("second", None, mapped),
+            [*_MUTATE, "--restored"],
+        ]
+        assert f"map: building for {total} function(s) (MAP_FROM = {_MAP_FROM})" in out
+
+
+def test_a_failed_map_build_fails_the_job_and_runs_no_mutant(monkeypatch, capsys):
+    """Loudly (§4.5): a job whose map could not be built has no baseline, so no
+    module is swept, and the gate fails rather than falling back to a sweep the
+    map's absence would make slower and the log would not explain."""
+    k, _ = _spanning_shard(12)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        gate.subprocess,
+        "run",
+        _recorder(commands, fails=lambda command: "--build-map" in command),
+    )
+    monkeypatch.setattr(sys, "argv", ["mutation_gate.py", "--all", "--shard", f"{k}/12"])
+
+    assert gate.main() == 1
+
+    assert len(commands) == 1 and "--build-map" in commands[0], commands
+    out = capsys.readouterr().out
+    assert "MAP BUILD FAILED" in out
+    assert "\nMUTATION GATE FAILED: map build\n" in out, out
+    assert "mutation gate passed" not in out
+
+
+def test_a_red_restored_suite_fails_the_job(monkeypatch, capsys):
+    """Under the map no module runs its own restored suite, so the job's one is the
+    only check that the mutants left the tree as they found it."""
+    k, _ = _spanning_shard(12)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        gate.subprocess,
+        "run",
+        _recorder(commands, fails=lambda command: command == [*_MUTATE, "--restored"]),
+    )
+    monkeypatch.setattr(sys, "argv", ["mutation_gate.py", "--all", "--shard", f"{k}/12"])
+
+    assert gate.main() == 1
+
+    assert commands[-1] == [*_MUTATE, "--restored"]
+    out = capsys.readouterr().out
+    assert "MUTATION GATE FAILED: restored suite" in out
+    assert "RESTORED SUITE RED: this job's verdicts are void." in out, out
+    assert "mutation gate passed" not in out
 
 
 def test_a_failing_part_fails_the_shard_and_names_its_module(monkeypatch, capsys):
@@ -537,19 +673,26 @@ def test_the_shard_counts_ci_runs_through_mutate_run_every_function_exactly_once
     monkeypatch, n
 ):
     """Test the path, not the piece. Each shard's real commands are handed to
-    `tools/mutate.py`'s own `main()` -- its `--only` parsing and refusal included --
-    with only the suite runs and the neutering stubbed. Across the `n`, every
-    function the package has is mutated once, in order, and every call brackets
-    its part with one baseline and one restored suite. Twelve is a push's count and
-    thirty-six the nightly's since 2026-11-09 (twenty-four from 2026-10-22); `test_each_mutation_job_runs_...`
-    holds the workflow to both."""
+    `tools/mutate.py`'s own `main()` -- its `--only` parsing and refusal, `--map`'s
+    `load_map` and its tree hash, and `--restored`, included -- with only the suite
+    runs, the map's coverage run and the neutering stubbed. Across the `n`, every
+    function the package has is mutated once, in order. A shard of at least
+    `MAP_FROM` functions builds one map, every mutant under it is handed that map's
+    selection, and the shard runs one restored suite; a call without a map brackets
+    its part with one baseline and one restored suite, as before. Twelve is a push's
+    count and thirty-six the nightly's since 2026-11-09 (twenty-four from
+    2026-10-22); `test_each_mutation_job_runs_...` holds the workflow to both."""
     spec = importlib.util.spec_from_file_location(
         "wlx_mutate_for_gate_test", gate.ROOT / "tools" / "mutate.py"
     )
     mutate_tool = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mutate_tool)
     mutated: list[tuple[str, str]] = []
+    handed: list[tuple[bool, object]] = []
     suites = []
+    maps: list[Path] = []
+    calls: list[list[str]] = []
+    unset = object()
     monkeypatch.setattr(mutate_tool, "_restore_any_interrupted_run", lambda: None)
     monkeypatch.setattr(
         mutate_tool,
@@ -557,16 +700,34 @@ def test_the_shard_counts_ci_runs_through_mutate_run_every_function_exactly_once
         lambda **_: suites.append(1)
         or mutate_tool.SuiteRun(True, "1 passed in 0.01s", [], started=1),
     )
-    monkeypatch.setattr(
-        mutate_tool,
-        "mutate",
-        lambda path, name, returns, **_: mutated.append((path.stem, name))
-        or (True, "1 failed in 0.01s"),
-    )
-    calls = []
+
+    def build_map(out, cwd=gate.ROOT):
+        # The map's coverage run is the one thing stubbed: a map of this tree that
+        # reaches no function, saved where the gate asked, for the real `load_map`.
+        maps.append(out)
+        made = mutate_tool.SuiteMap(
+            tree=mutate_tool.tree_hash(gate.ROOT),
+            summary="1 passed in 0.01s",
+            seconds=0.01,
+            started=1,
+            tests=(),
+            functions={},
+            unmatched=0,
+        )
+        made.save(out)
+        return made
+
+    monkeypatch.setattr(mutate_tool, "build_map", build_map)
+
+    def fake_mutate(path, name, returns, **kwargs):
+        mutated.append((path.stem, name))
+        handed.append(("--map" in calls[-1], kwargs.get("selection", unset)))
+        return True, "1 failed in 0.01s"
+
+    monkeypatch.setattr(mutate_tool, "mutate", fake_mutate)
 
     def through_mutate(command, cwd):
-        assert command[:3] == [sys.executable, "-u", "tools/mutate.py"]
+        assert command[:3] == _MUTATE
         calls.append(command)
         monkeypatch.setattr(sys, "argv", ["mutate.py", *command[3:]])
         return subprocess.CompletedProcess(command, mutate_tool.main())
@@ -577,7 +738,22 @@ def test_the_shard_counts_ci_runs_through_mutate_run_every_function_exactly_once
         assert gate.main() == 0, k
 
     assert mutated == _targets()
-    assert len(suites) == 2 * len(calls)
+    under_map = [selection for mapped, selection in handed if mapped]
+    assert under_map, "no mutant ran under a map"
+    assert all(selection == () for selection in under_map), set(map(repr, under_map))
+    assert all(selection is unset for mapped, selection in handed if not mapped)
+    sizes = [
+        sum(len(names) for _, names in gate.shard_plan(_MODULES, k, n, _functions()))
+        for k in range(1, n + 1)
+    ]
+    assert len(maps) == sum(size >= _MAP_FROM for size in sizes)
+    restored_calls = sum(command == [*_MUTATE, "--restored"] for command in calls)
+    assert restored_calls == len(maps)
+    unmapped_module_calls = sum(
+        "--build-map" not in command and "--restored" not in command and "--map" not in command
+        for command in calls
+    )
+    assert len(suites) == restored_calls + 2 * unmapped_module_calls
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +800,189 @@ def test_each_mutation_job_runs_every_shard_of_its_own_count_once(job, n):
     the PI, 2026-11-09: "36 jobs, re-run first"), and 12 for a push ("Push runs
     stay at 12")."""
     assert _gate_shards(job) == [(k, n) for k in range(1, n + 1)]
+
+
+# ---------------------------------------------------------------------------
+# The CI-time build's wiring (the PI, 2026-11-21: a cap on mutation jobs at once,
+# and a night on which nothing changed skipped; Q3, "All three unchanged"). Each
+# piece is a line of YAML that nothing else reads, so a dropped `if` or `needs`
+# would be silent: a skip on a dispatch, a pass saved before every shard ran.
+# ---------------------------------------------------------------------------
+
+_NEIGHBORS = {"preproc": "westerberg-lab-be/wl-preproc", "xtasks": "westerberg-lab-be/wl-xtasks"}
+_KEY = ".mutation-full-passed"
+
+
+def _jobs() -> dict:
+    import yaml  # the `contract` extra, which every CI job installs
+
+    return yaml.safe_load(_WORKFLOW.read_text())["jobs"]
+
+
+def _workflow() -> dict:
+    import yaml
+
+    return yaml.safe_load(_WORKFLOW.read_text())
+
+
+def _step(job: dict, **match) -> dict:
+    """The one step of `job` whose keys (or, for `repository`, whose `with`) match."""
+    found = [
+        step
+        for step in job["steps"]
+        if all(
+            (step.get("with", {}).get(k) if k == "repository" else step.get(k)) == v
+            for k, v in match.items()
+        )
+    ]
+    assert len(found) == 1, (match, found)
+    return found[0]
+
+
+def _needs(job: dict) -> list[str]:
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def test_the_mutation_jobs_are_capped_at_8_nightly_and_4_a_push():
+    """The PI's cap (2026-11-21): the check "is holding up other repos on
+    occasion". The nightly's 36 jobs run 8 at a time, a push's 12 run 4."""
+    jobs = _jobs()
+    assert jobs["mutation-full"]["strategy"]["max-parallel"] == 8
+    assert jobs["mutation"]["strategy"]["max-parallel"] == 4
+
+
+def test_every_nightly_shard_checks_out_the_neighbors_nightly_plan_pinned():
+    """With 8 at a time the last wave starts hours after the first, so each shard
+    reading the neighbors' heads for itself would sweep different trees in one
+    run, and the skip's key would name SHAs some shards never saw."""
+    jobs = _jobs()
+    plan = jobs["nightly-plan"]
+    pins = _step(plan, id="pins")
+    for name, repository in _NEIGHBORS.items():
+        assert (
+            f"git ls-remote https://github.com/{repository}.git refs/heads/main" in pins["run"]
+        ), repository
+        assert plan["outputs"][name] == f"${{{{ steps.pins.outputs.{name} }}}}"
+    (key_line,) = [line for line in pins["run"].splitlines() if "key=" in line]
+    assert "mutation-full-passed-${{ github.sha }}-" in key_line
+    assert "$preproc" in key_line and "$xtasks" in key_line
+    assert plan["outputs"]["key"] == "${{ steps.pins.outputs.key }}"
+
+    full = jobs["mutation-full"]
+    assert "nightly-plan" in _needs(full)
+    for name, repository in _NEIGHBORS.items():
+        checkout = _step(full, repository=repository)
+        assert checkout["with"]["ref"] == f"${{{{ needs.nightly-plan.outputs.{name} }}}}"
+
+
+def _run_pins(tmp_path, heads: dict[str, str]) -> tuple[subprocess.CompletedProcess, str]:
+    """The `pins` step's script, run by bash as a runner would (`bash -e`), with
+    `${{ github.sha }}` filled in and a stand-in `git` that answers `ls-remote`
+    for each repository in `heads` with what it is given, and nothing for any
+    other URL."""
+    script = _step(_jobs()["nightly-plan"], id="pins")["run"]
+    script = script.replace("${{ github.sha }}", "a" * 40)
+    assert "${{" not in script, script
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    answers = "\n".join(
+        f'  "https://github.com/{_NEIGHBORS[name]}.git refs/heads/main") '
+        f"printf '%s\\trefs/heads/main\\n' {shlex.quote(sha)} ;;"
+        for name, sha in heads.items()
+    )
+    fake = bin_dir / "git"
+    fake.write_text(
+        '#!/bin/sh\n[ "$1" = ls-remote ] || exit 2\ncase "$2 $3" in\n'
+        f"{answers}\n  *) exit 0 ;;\nesac\n"
+    )
+    fake.chmod(0o755)
+    output = tmp_path / "github_output"
+    output.write_text("")
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+           "GITHUB_OUTPUT": str(output)}
+    done = subprocess.run(
+        ["bash", "-e", "-c", script], env=env, capture_output=True, text=True, timeout=30
+    )
+    return done, output.read_text()
+
+
+def test_the_pins_step_outputs_both_heads_and_the_key_and_refuses_anything_else(tmp_path):
+    """Two good heads give the three outputs; a head that is not 40 hex
+    characters (an empty answer, a moved repository, an error page) fails the
+    step and writes nothing, so no shard checks out a guess."""
+    preproc, xtasks = "1" * 40, "2" * 40
+    done, written = _run_pins(tmp_path, {"preproc": preproc, "xtasks": xtasks})
+    assert done.returncode == 0, done.stderr
+    assert written.splitlines() == [
+        f"preproc={preproc}",
+        f"xtasks={xtasks}",
+        f"key=mutation-full-passed-{'a' * 40}-{preproc}-{xtasks}",
+    ]
+
+    for heads in ({"preproc": preproc}, {"preproc": preproc, "xtasks": "main"}):
+        bad = tmp_path / str(len(heads)) / heads.get("xtasks", "none")
+        bad.mkdir(parents=True)
+        done, written = _run_pins(bad, heads)
+        assert done.returncode != 0, heads
+        assert written == "", heads
+
+
+def test_a_quiet_night_is_looked_up_on_a_schedule_only_and_fails_closed():
+    """Looked up on `schedule` alone, so a hand dispatch always sweeps; and an
+    error in the lookup is not a failed plan (`continue-on-error`) but an empty
+    `cache-hit`, which is not `'true'`, so the sweep runs."""
+    jobs = _jobs()
+    plan = jobs["nightly-plan"]
+    assert "github.event_name == 'schedule'" in plan["if"]
+    assert "github.event_name == 'workflow_dispatch'" in plan["if"]
+    passed = _step(plan, id="passed")
+    assert passed["uses"] == "actions/cache/restore@v6"
+    assert passed["continue-on-error"] is True
+    assert passed["if"] == "github.event_name == 'schedule'"
+    assert passed["with"]["lookup-only"] is True
+    assert passed["with"]["key"] == "${{ steps.pins.outputs.key }}"
+    assert passed["with"]["path"] == _KEY
+    assert plan["outputs"]["hit"] == "${{ steps.passed.outputs.cache-hit }}"
+
+    full = jobs["mutation-full"]
+    assert "needs.nightly-plan.outputs.hit != 'true'" in full["if"]
+    assert "github.event_name == 'schedule'" in full["if"]
+    assert "github.event_name == 'workflow_dispatch'" in full["if"]
+
+
+def test_the_pass_is_saved_only_after_every_shard_of_a_scheduled_sweep():
+    """A key saved after a partial sweep would skip the next night on a tree
+    nobody fully checked. The save needs every shard (`mutation-full`'s result)
+    and runs on `schedule` alone, at the key the lookup reads."""
+    jobs = _jobs()
+    saved = jobs["mutation-full-passed"]
+    assert saved["needs"] == ["nightly-plan", "mutation-full"]
+    assert "github.event_name == 'schedule'" in saved["if"]
+    assert "needs.mutation-full.result == 'success'" in saved["if"]
+    save = _step(saved, uses="actions/cache/save@v6")
+    assert save["with"]["key"] == "${{ needs.nightly-plan.outputs.key }}"
+    restore = _step(jobs["nightly-plan"], id="passed")
+    assert save["with"]["path"] == restore["with"]["path"] == _KEY
+    before = saved["steps"][: saved["steps"].index(save)]
+    assert any(_KEY in step.get("run", "") for step in before), before
+
+
+def test_scheduled_runs_queue_behind_each_other():
+    """A nightly still running when the next one fires: the second waits rather
+    than cancelling the first, and so sees the first's pass if it saved one."""
+    concurrency = _workflow()["concurrency"]
+    assert concurrency["cancel-in-progress"] is False
+    assert "github.event_name == 'schedule'" in concurrency["group"]
+
+
+def test_the_test_job_still_runs_every_night():
+    """The suite on three Pythons is cheap, and on a skipped night it is what still
+    sees the neighbors drift. Neither it nor the push gate waits on the plan."""
+    jobs = _jobs()
+    assert "if" not in jobs["test"]
+    assert "needs" not in jobs["test"]
+    assert "needs" not in jobs["mutation"]
 
 
 def test_main_with_a_shard_past_the_function_count_says_so_and_passes(monkeypatch, capsys):
