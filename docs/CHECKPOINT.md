@@ -1,6 +1,6 @@
 # Where this build is
 
-**Last updated 2026-11-21**, at the commit this file was committed in (`git log -1 -- docs/CHECKPOINT.md`). **This page
+**Last updated 2026-11-25**, at the commit this file was committed in (`git log -1 -- docs/CHECKPOINT.md`). **This page
 is the current state only, and stays one page** (the PI, 2026-11-07, after a whole-project audit). Every earlier
 entry, 2026-08-31 to 2026-11-07, is in `docs/CHECKPOINT-history-2026-08-31-to-2026-11-07.md`, unchanged: read one
 there only when this page or a backlog line sends you to it. A session ends by updating this page (CLAUDE.md).
@@ -19,7 +19,7 @@ from then). **Hardware verified: none.**
 |---|---|
 | DIO out | `dio.py`: the card's protocol, `Simulated` and `Absent` (refuses); no driver until the card is on the bench (pitfall P10). |
 | Gaze in | UDP ingest, replay, calibration and online saccade detection (version 11, in step with wl-preproc's), no hardware. |
-| Frame on screen | **Not built**: build E, the display process. Spike S: `docs/measurements/wh-dws0/2026-10-08-vulkan-timing/`. |
+| Frame on screen | **Built on the `build-e` branch, unmerged**: the display process, its 120 Hz proof passed on wh-dws0's G8 with the GPU clocks locked (`docs/measurements/wh-dws0/2026-11-24-display-proof/` on that branch). |
 | Reward out | End to end to a simulated pump, the day's total and its floor accounted; no pump calibration until the rig. |
 
 **The session number** comes from the sync box (wl-sync's `/session` routes, since 2026-10-19); the PI, 2026-11-07:
@@ -27,31 +27,32 @@ if the box cannot be reached the rig refuses to open and says why. Its client is
 
 ## Where the branches are
 **The repositories moved** to the `westerberg-lab-be` organization on 2026-11-21 (`f637bc99`; old URLs redirect).
-- **`main` is the console build's merge** (this page's commit), merged 2026-11-21 on the PI's "Merge it": the console
-  settings build, the console interface rework (each setting a box with its own Apply, groups, percents, find and
-  pins, telemetry schema 23), the summary-and-editor layout, the pop-out revision (TSK-78 to TSK-80, codes
-  4139-4145), the pop-out mouse flake fix (pitfall P29), one whole-build review and its fix wave, and the PI's
-  Safari try-out answers ("ring" everywhere; a too-dim panel starts at its reachable top with a warning; the
-  Special trials line never cuts). Evidence: push CI 44954599943 clean; full sweep 44746169158 read to every
-  shard's end (4 survivors, all fixed); the 97 changed functions no shard reached broken by hand, one at a time, all
-  caught, each confirmed alone (`.superpowers/handbreak-web-2026-11-21/`); welfare diff against `89f7b94` all SAME.
-  **wl-xtasks' main is `3de82c2`** (the revised pop-out); CI checks out its main again.
-- **Built, unmerged, local** (each also bundled in `.superpowers/migration-2026-11-21/`; ledgers in each worktree's
-  `.superpowers/sdd/`). Each merges the new main in before it is pushed:
-  - **`xc505-warning`** (`7d53d9de`) and **`nightly-flakes`** (`cf256b5c`): built and reviewed; merge next, in that
-    order, each on the PI's yes after CI (nightly-flakes at its merge: pitfall P30's number, its backlog line).
-  - **`rig-readings`** (XC-434/435; `ab451a73`): every animal has an ID (element-animal's `subject`, at most 8
-    lowercase) and a Nickname (at most 64), the PI's ruling of 2026-11-21; `/health` readings for wl.works. Built,
-    reviewed, fix wave re-reviewed clean. Its push sweeps every module (it edits `mutation_gate.py`), so it is
-    pushed only after the CI-time build. At its merge: `out_since` to the PI as a numbered welfare item.
-  - **`build-e`** (the display process; plan `docs/superpowers/plans/2026-11-20-build-e.md` on the branch): Tasks
-    1-7 done on OrbStack's Linux (lavapipe), standing in for wh-dws0. The PI, 2026-11-21: wh-dws0 may be used over
-    SSH for off-screen tests; ask him again before any on-screen run. Next: Task 8, `direct` and `window` on
-    wh-dws0.
-  - **Telemetry schema**: build-e and rig-readings each take `link.SCHEMA` 24; the second to merge renumbers to 25.
-- **The CI-time build** (the PI, 2026-11-21: "holding up other repos"; he chose likely tests first, a cap on machines
-  at once, and skipping unchanged nights): design and plan approved, in `.superpowers/migration-2026-11-21/`
-  (`ci-time-design.md`, `ci-time-plan.md`); cut `ci-time` from this main and build it next.
+- **`main` is the CI-time build's merge** (this page's commit), on the PI's "Merge once quick CI passes"
+  (2026-11-25). The mutation gate builds one coverage map per job of 15 functions or more, runs each mutant's likely
+  tests first (each quick catch confirmed unmutated), caps the sweep at 8 machines, and skips a quiet night
+  (`nightly-plan`). Evidence: full sweep 45458320469 on `bb70e7b2` read to every shard's closing line: 35 of 36
+  clean, maps 1336-2428 s, shards median 112 min and at most 221; shard 35 found `web._rest_said` and `web._rest`
+  (console-build functions) checked only by browser tests, which the sweep skips; pinned by two `test_web` tests
+  (`0315b21b`), each hand-broken in a scratch copy and caught; push CI on `0315b21b` clean. Welfare diff against
+  `89f7b94`: nothing to read. Before it: the console build (`293a66e1`, 2026-11-21).
+  **wl-xtasks' main is `3de82c2`**; **wl-preproc's is `b75cc85`** (it accepts build E's `system` actor and counts
+  the rig's pauses apart, `training_records.system_pauses`).
+- **Built, unmerged, local, each already up to date with `293a66e1`** (merged 2026-11-24, each behind a full suite;
+  ledgers in each worktree's `.superpowers/sdd/`). Each merges this main in, is pushed for CI, and merges on the PI's
+  yes by name:
+  - **`xc505-warning`** (`267ae16d`), then **`nightly-flakes`** (`2e164ef8`; at its merge its pitfall P30 is
+    renumbered after this main's P30, and its backlog line added).
+  - **`rig-readings`** (XC-434/435; `ba7ee97d`): animal ID and Nickname, `/health` readings for wl.works. At its
+    merge: `out_since` to the PI as a numbered welfare item, the REFERENCE/demo line, M7 as a question, and the
+    dialog's screenshots (`.superpowers/sdd/2026-11-21-rig-readings/merge-ask-shots/` in its worktree).
+  - **`build-e`** (the display process; `77f030f8`): complete. 120 Hz proof passed, the fallback seen on screen,
+    the PI's welfare approval of its ten items (2026-11-24; the `_hold` docstring corrected, no code changed). At
+    its merge: the renumbers its `fix-report.md` lists, and wl-preproc pulled to `b75cc85` first.
+  - **`drawings`** (the setting drawings; spec `docs/superpowers/specs/2026-11-20-setting-drawings-design.md` and
+    plan on the branch): 15 tasks built, whole-build review APPROVE WITH FIXES, its fix wave running (the PI
+    2026-11-25: the rig's draft check is made fast or turned off, never delaying a Stop or reward while paused).
+  - **Numbers taken twice**: `link.SCHEMA` 24 (build-e, rig-readings, drawings), pitfall P30 and backlog IDs from
+    XC-555 (rig-readings, build-e, nightly-flakes, drawings): each later merge renumbers past what main holds.
 
 ## What exists
 - **Tasks**: the task object and its load check (`task.py`, `check.py`), engine builds A1 to C3; five reference
@@ -75,13 +76,11 @@ if the box cannot be reached the rig refuses to open and says why. Its client is
 
 ## What is next (the PI, 2026-11-07 to 2026-11-21)
 In order:
-1. **The CI-time build**, then the merges of **xc505-warning** and **nightly-flakes**, then **rig-readings**; each
-   merge on his yes by name after clean CI.
-2. **Build E, the display**: Task 8 onward (`direct` on wh-dws0, the fault path with its welfare review, the desktop
-   proof at 120 Hz); "done" includes a real screen.
-3. **The setting drawings** (his ask in the try-out: a small schematic beside the setting opened; mock-up
-   `.superpowers/brainstorm/71253-1795178057/`, notes `.superpowers/brainstorm/drawings-2026-11-20-notes.md`): a
-   design with him, element by element. Then **lab time: XC-391, XC-392, XC-393**.
+1. **The merges**, each on his yes by name after clean CI: xc505-warning, nightly-flakes, rig-readings, build-e,
+   then the drawings once its fix wave and re-review are done and he has tried it.
+2. **Lab time: XC-391, XC-392, XC-393** (design approved, `.superpowers/brainstorm/lab-time-draft.md` in the main
+   checkout).
+3. **The XC-505 warning**'s follow-ups, if any, after its merge.
 4. **Paradigms above tasks**, designed with wl.works.
 5. **Side work on the January path**: the sync-box client (XC-460), the operator's guide (XC-014), the default limits
    file (XC-459, a welfare design with the PI), wl-preproc's C3 fixture (XC-510).
@@ -94,11 +93,15 @@ is settled from his stated principles and told to him in one line; every merge w
 ## Working here
 - **Suite**: `WLX_REQUIRE_PREPROC=1 WLX_REQUIRE_BROWSER=1 WLX_REQUIRE_XTASKS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p
   no:cacheprovider -n auto` (a `wl-preproc` checkout or link at the root, at `d8fe06b` or later, and a `wl-xtasks`
-  one, git-ignored at `/wl-xtasks`; wl-sync at the commit `wl-preproc/pyproject.toml` pins). **6660 passed on
+  one, git-ignored at `/wl-xtasks`; wl-sync at the commit `wl-preproc/pyproject.toml` pins). **6717 passed on
   `main`**; none skipped.
-- **CI**: each push sweeps the changed modules with mutants (`tools/mutation_gate.py`), the nightly all, in 36 shards;
-  a big branch runs that sweep by hand before its merge (`gh workflow run ci.yml --ref <branch>`). Read every shard's
-  log to its closing line; the run's summary can be wrong.
+- **CI**: each push sweeps the changed modules with mutants (`tools/mutation_gate.py`), the nightly all, in 36 shards,
+  8 at once, skipping a night on which our `main`, wl-preproc and wl-xtasks are unchanged since the last full pass.
+  A job of 15 functions or more builds one coverage map first, runs each mutant's mapped tests before the full suite
+  (each quick catch confirmed unmutated) and one restored suite at its end; its tally, `SELECTION NOT INDEPENDENT`
+  and `QUICK AND FULL DISAGREE` lists say how each verdict was reached (`tools/mutate.py --map`). A big branch runs
+  the sweep by hand before its merge (`gh workflow run ci.yml --ref <branch>`). Read every shard's log to its closing
+  line; the run's summary can be wrong.
 - **The neighbors** are read weekly, by their handover files (the PI, 2026-11-07): wl-preproc, wl-sync, wl-works,
   wl-xtasks. Last read: 2026-11-07, by the audit; wl-preproc answered XC-491 and XC-502 on 2026-11-14 and its
   handover was read at `d8fe06b`. Open asks of each: `docs/pending-*-amendments.md`.

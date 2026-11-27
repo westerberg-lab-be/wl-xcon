@@ -19,7 +19,9 @@ dependencies = ["pydantic>=2", "numpy>=1.24"]
 wlx = "wl_xcon.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+# coverage: per-test line contexts, so a mutant runs the tests that reach it first
+# (`tools/mutate.py --build-map`); no pytest-cov (ADR-0004 inventory).
+dev = ["pytest>=8", "coverage>=7.10"]
 # What the CONTRACT tests need in order to import wl-preproc's own modules -- not
 # what this package needs. Their `eye/xcon.py` reads YAML, so proving our
 # writer against their reader means having their reader importable. Deliberately the
