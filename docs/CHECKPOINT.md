@@ -1,6 +1,6 @@
 # Where this build is
 
-**Last updated 2026-11-25**, at the commit this file was committed in (`git log -1 -- docs/CHECKPOINT.md`). **This page
+**Last updated 2026-11-28**, at the commit this file was committed in (`git log -1 -- docs/CHECKPOINT.md`). **This page
 is the current state only, and stays one page** (the PI, 2026-11-07, after a whole-project audit). Every earlier
 entry, 2026-08-31 to 2026-11-07, is in `docs/CHECKPOINT-history-2026-08-31-to-2026-11-07.md`, unchanged: read one
 there only when this page or a backlog line sends you to it. A session ends by updating this page (CLAUDE.md).
@@ -27,8 +27,11 @@ if the box cannot be reached the rig refuses to open and says why. Its client is
 
 ## Where the branches are
 **The repositories moved** to the `westerberg-lab-be` organization on 2026-11-21 (`f637bc99`; old URLs redirect).
-- **`main` is the CI-time build's merge** (this page's commit), on the PI's "Merge once quick CI passes"
-  (2026-11-25). The mutation gate builds one coverage map per job of 15 functions or more, runs each mutant's likely
+- **`main` is xc505-warning's merge** (this page's commit), on the PI's "Merge it" (2026-11-28): the warning that
+  an answer can come inside the saccade detector's first frames (XC-505; `answer-inside-saccade-warmup`), its two
+  follow-ups XC-559 and XC-560. Evidence: push CI 45975481312 on `516d6c96`, tests on 3.11-3.13 and its 12
+  mutation jobs read to their closing lines, all clean; welfare diff against `89f7b94`: nothing to read.
+  Before it, **the CI-time build's merge** (`93b4cb05`, the PI's "Merge once quick CI passes", 2026-11-25). The mutation gate builds one coverage map per job of 15 functions or more, runs each mutant's likely
   tests first (each quick catch confirmed unmutated), caps the sweep at 8 machines, and skips a quiet night
   (`nightly-plan`). Evidence: full sweep 45458320469 on `bb70e7b2` read to every shard's closing line: 35 of 36
   clean, maps 1336-2428 s, shards median 112 min and at most 221; shard 35 found `web._rest_said` and `web._rest`
@@ -40,7 +43,7 @@ if the box cannot be reached the rig refuses to open and says why. Its client is
 - **Built, unmerged, local, each already up to date with `293a66e1`** (merged 2026-11-24, each behind a full suite;
   ledgers in each worktree's `.superpowers/sdd/`). Each merges this main in, is pushed for CI, and merges on the PI's
   yes by name:
-  - **`xc505-warning`** (`267ae16d`), then **`nightly-flakes`** (`2e164ef8`; at its merge its pitfall P30 is
+  - **`nightly-flakes`** (`2e164ef8`; at its merge its pitfall P30 is
     renumbered after this main's P30, and its backlog line added).
   - **`rig-readings`** (XC-434/435; `ba7ee97d`): animal ID and Nickname, `/health` readings for wl.works. At its
     merge: `out_since` to the PI as a numbered welfare item, the REFERENCE/demo line, M7 as a question, and the
@@ -76,7 +79,7 @@ if the box cannot be reached the rig refuses to open and says why. Its client is
 
 ## What is next (the PI, 2026-11-07 to 2026-11-21)
 In order:
-1. **The merges**, each on his yes by name after clean CI: xc505-warning, nightly-flakes, rig-readings, build-e,
+1. **The merges**, each on his yes by name after clean CI: nightly-flakes, rig-readings, build-e,
    then the drawings once its fix wave and re-review are done and he has tried it.
 2. **Lab time: XC-391, XC-392, XC-393** (design approved, `.superpowers/brainstorm/lab-time-draft.md` in the main
    checkout).

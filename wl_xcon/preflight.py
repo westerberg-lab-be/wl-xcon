@@ -82,7 +82,8 @@ def _said(refused: SystemExit, path: Path) -> str:
 
 def task(path: Path, allocation, geometry, calibration, deployment=None,
          plan: str | None = None,
-         start_block: str | None = None) -> tuple[PreflightItem, Task | None, list]:
+         start_block: str | None = None,
+         frame_period: float | None = None) -> tuple[PreflightItem, Task | None, list]:
     """The task's load-time checks in the session's setup: **fail** if it will not load -- a file
     with trials and no task object among them (engine build C1) --, if its checks do not finish,
     or if any finding blocks (`check.check_task`: each structure's and the task object's own).
@@ -98,7 +99,8 @@ def task(path: Path, allocation, geometry, calibration, deployment=None,
     item's fail (engine spec §20.1; XC-277; the PI, 2026-10-11). **A plan the task does not
     declare fails it too** (engine build C2b), so `gate` refuses a start naming one unchanged;
     **and a block of it the run cannot start at** (`start_block`; `check.unstarted`; the pop-out
-    search build's Task 6)."""
+    search build's Task 6). **Timings are counted in the session's frames** (`frame_period`,
+    `check.FRAME_PERIOD` where none is named; XC-505's warning)."""
     try:
         loaded = _load_task(path)
     except SystemExit as refused:
@@ -113,7 +115,7 @@ def task(path: Path, allocation, geometry, calibration, deployment=None,
         )
     try:
         findings = check_task(loaded, allocation, geometry=geometry, calibration=calibration,
-                              deployment=deployment, source=path)
+                              deployment=deployment, source=path, frame_period=frame_period)
         blocking = [f for f in findings if f.blocking]
     except Exception as broken:  # noqa: BLE001 -- the checks run on code; their fault is this item's
         # Fix round 1 of Task 8: `check` can raise on a task shape it does not expect (it did,
@@ -251,7 +253,7 @@ def beyond(task: Task | None, given: dict, allocation, geometry, calibration, de
 
 
 def laid_out(task: Task | None, given: dict, plan: str | None, allocation, geometry, calibration,
-             deployment) -> list:
+             deployment, frame_period: float | None = None) -> list:
     """**The layout at the run's values** (the console settings design's §4: "warnings come from
     the layout actually set"; `check.laid_out`): at its starting values (`starting`), for each
     block and condition it plays, the condition's values over them, and each setting a draw gives
@@ -263,7 +265,8 @@ def laid_out(task: Task | None, given: dict, plan: str | None, allocation, geome
     block and condition where the run first meets it, and one met at several said once. A check
     that raises is a blocking finding saying it could not be run (`LAYOUT_UNJUDGED`). Returns the
     findings, as
-    `beyond` does. Between runs, never in a frame."""
+    `beyond` does. Timings are counted in the session's frames (`frame_period`; XC-505's
+    warning). Between runs, never in a frame."""
     if task is None:
         return []
     try:
@@ -292,7 +295,7 @@ def laid_out(task: Task | None, given: dict, plan: str | None, allocation, geome
                 if key not in asked:
                     asked[key] = check_laid_out(task, values, allocation=allocation,
                                                 geometry=geometry, calibration=calibration,
-                                                deployment=deployment)
+                                                deployment=deployment, frame_period=frame_period)
                 where = ("the plain run" if plan is None else
                          f"plan {plan!r}, block {block.name!r}, condition {condition.name!r}")
                 for finding in asked[key]:
