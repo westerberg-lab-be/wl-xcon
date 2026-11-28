@@ -1182,7 +1182,12 @@ drummed repeats one, and its `presentations` the lines written.
    gain `framework-code`, a `Mark` of a code the allocation gives an event the framework strobes
    itself (`codes.FRAMEWORK_EVENTS`: a pause, a manual reward, a run's start and the rest), which
    no controls or change row explains and which leaves wl-preproc's timing of the rows carrying
-   that code, by their `event_code`, a strobe too many.
+   that code, by their `event_code`, a strobe too many. *XC-505, 2026-11-20* (the PI, 2026-11-14,
+   "Warn when settings allow it"): `answer-inside-saccade-warmup`, accepted in every kind, at load
+   and at the values set (a run's pre-flight, a live change): a state waiting on a saccade that a
+   trial can enter, each wait on the way at its value (a draw at its lowest), before the saccade
+   detector's per-trial warm-up is over, so an answer that early goes unseen and is scored as the
+   task's error; at load over the plain run and every plan's blocks and conditions.
 3. **Accepted once per session**, at open, recorded. **A warning appearing during a run that its kinds do
    not accept pauses the run at the next trial**, for the operator to accept (recorded) or stop (N§R6).
    Today's unknowns keep the 2026-09-19 rule: proceed on a recorded acknowledgment.

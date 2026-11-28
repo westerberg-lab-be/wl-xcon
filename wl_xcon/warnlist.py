@@ -45,7 +45,9 @@ an event the framework strobes itself, `codes.FRAMEWORK_EVENTS`, which no contro
 explains), `color-set-desaturated` and `color-set-without-spectra` (the pop-out search build,
 2026-11-07: a color set the panel shows only with every color moved toward its apex, by the share
 it names; one held in macaque luminance through wl-style's sRGB model on a calibration measured
-without spectra)
+without spectra), `answer-inside-saccade-warmup` (XC-505, the PI's "Warn when settings allow
+it" of 2026-11-14: a state waiting on a saccade that a trial can enter before the saccade
+detector's per-trial warm-up is over, at load and at the values set, a live change's included)
 and, for a value outside its declared range at a run's start or live, `outside-range` and, for a
 wait longer than any the task declares, `longer-than-declared`, by his answer of 2026-10-12);
 and today's pre-flight unknowns, the pump calibration and the eye tracker (S9a §10). **What

@@ -5665,3 +5665,44 @@ def test_a_looks_line_says_its_segment_and_its_words_in_its_title():
     short = ParamRow.of("side", "word", None, None, "left", False, choices=("left", "right"),
                         source="task")
     assert web._summary_value(short) == "left"
+
+
+def test_a_special_trials_groups_rest_says_normal_search_below_at_and_past_100():
+    """`web._rest_said` without a browser: CI's sweep runs no browser test, so the page test's
+    asserts on it (tests/test_page_browser.py) never caught a mutant there (sweep 45458320469,
+    shard 35: NOT COVERED)."""
+    from wl_xcon.check import IN_PROPORTION
+
+    assert web._rest_said(0) == "100 normal search"
+    assert web._rest_said(30) == "70 normal search"
+    assert web._rest_said(99.5) == "0.5 normal search"
+    assert web._rest_said(100) == "none normal search"
+    assert web._rest_said(105) == f"none normal search: {IN_PROPORTION}"
+
+
+def test_a_groups_rest_line_names_its_shares_and_sums_them_as_the_draw_reads_them():
+    """`web._rest` without a browser (same sweep, same shard): the line names each share in
+    `data-shares`, carries the words the script needs, and sums the shares as `check.special_share`
+    reads them (a bool, a word or a negative counts 0); a group holding no share says nothing."""
+    from html import unescape
+
+    from wl_xcon.check import IN_PROPORTION
+    from wl_xcon.task import SPECIAL_UNIT
+
+    rows = [ParamRow("absent", SPECIAL_UNIT, 0.0, 100.0, 20.0, False),
+            ParamRow("alone", SPECIAL_UNIT, 0.0, 100.0, 15.0, False),
+            ParamRow("broken", SPECIAL_UNIT, 0.0, 100.0, True, False),
+            ParamRow("words", SPECIAL_UNIT, 0.0, 100.0, "some", False),
+            ParamRow("below", SPECIAL_UNIT, 0.0, 100.0, -5.0, False),
+            ParamRow("catch_hold", "s", 0.0, 5.0, 1.5, False)]
+    line = web._rest(rows)
+    assert line.startswith('<div class="gr" ') and line.endswith("</div>")
+    assert 'data-shares="absent alone broken words below"' in line
+    assert f'data-words="{web.NORMAL_REST}"' in line
+    assert unescape(line.split('data-over="')[1].split('"')[0]) == IN_PROPORTION
+    assert unescape(line.split(">", 1)[1].rsplit("<", 1)[0]) == "65 normal search"
+    over = [ParamRow("a", SPECIAL_UNIT, 0.0, 100.0, 60.0, False),
+            ParamRow("b", SPECIAL_UNIT, 0.0, 100.0, 50.0, False)]
+    assert unescape(web._rest(over).split(">", 1)[1].rsplit("<", 1)[0]) == web._rest_said(110)
+    assert web._rest([ParamRow("catch_hold", "s", 0.0, 5.0, 1.5, False)]) == ""
+    assert web._rest([]) == ""

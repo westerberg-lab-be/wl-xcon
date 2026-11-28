@@ -2693,7 +2693,8 @@ class Session:
         `shaping` `"full"`, the full task's block too** (`_full_judged`), its pool's value over
         the values. **Once per
         distinct set of values**; a finding met in several places is listed once, naming the
-        first. Before a run has a plan, the session's own values alone, naming none."""
+        first. Before a run has a plan, the session's own values alone, naming none. Timings are
+        counted in this session's frames (`SessionSpec.frame_period`; XC-505's warning)."""
         task, declared = self._task, self._declared
         turned = variation.directions(task)
 
@@ -2752,7 +2753,8 @@ class Session:
             for finding in laid_out(task, these, allocation=self.allocation,
                                     geometry=self.spec.geometry,
                                     calibration=self.spec.calibration,
-                                    deployment=self.spec.deployment, fixed=fixed):
+                                    deployment=self.spec.deployment, fixed=fixed,
+                                    frame_period=self.spec.frame_period):
                 if any(_among(finding, [one]) for one, _ in found):
                     continue
                 found.append((finding, where))
@@ -7597,7 +7599,8 @@ class Session:
         task = _load_task(Path(run.task))
         findings = check_task(task, self.allocation, geometry=self.spec.geometry,
                               calibration=self.spec.calibration,
-                              deployment=self.spec.deployment)
+                              deployment=self.spec.deployment,
+                              frame_period=self.spec.frame_period)
         # **By the session's kind** (engine spec §19.2): a warning outside its kinds refuses,
         # here too, as the backstop for a caller that took no pre-flight.
         blocking = [f for f in findings if f.refuses(self.spec.session_kind)]

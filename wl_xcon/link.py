@@ -4640,7 +4640,7 @@ REPLY_GRACE_S = 0.1
 #: waits the whole bound only for a console connected and not reading, which then misses
 #: the frame, as it would have; and a console so far behind that the connection's
 #: buffers are full can still lose the tail, since libzmq holds the connection until its
-#: queue is taken, not written (`docs/pitfalls.md` P30). A whole second is chosen as a
+#: queue is taken, not written (`docs/pitfalls.md` P31). A whole second is chosen as a
 #: bound, not from a measurement of a rig: in six two-CPU Linux containers on one loaded development host
 #: (2026-11-20), the end-to-end tests that lost the frame lost it in 7 of 960 runs at
 #: `linger=0` and in none of 1,920 with this bound (counts, not a measurement of this system's
@@ -5172,7 +5172,7 @@ class ZmqLink:
                 # **The frames already published go on first** (`PUBLISH_LINGER_S`): the
                 # last says how the session ended. Closed here with a linger, so the
                 # `destroy` in `_release` skips it and its `term` waits, at most that
-                # long, for the connection to take them (pitfall P30 has what that does
+                # long, for the connection to take them (pitfall P31 has what that does
                 # not cover). `getattr`: a constructor that failed before its PUB
                 # existed closes through here too.
                 pub = getattr(self, "_pub", None)
